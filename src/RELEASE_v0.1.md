@@ -1,0 +1,133 @@
+# Equinox OS v0.1 Beta — Release Notes
+
+**Date:** 2026-09-17
+**Artifact:** `equinox.iso` (bootable, GRUB multiboot)
+
+This is the first release under the **Equinox OS** name (v0.1 Beta).
+The kernel, userland, network stack and DOOM port are fully working;
+the version number restarts at 0.1 to reflect the new project identity.
+
+---
+
+## What is new in v0.1 Beta
+
+### 1. Rebrand: MorphOS -> Equinox OS
+- The OS is now **Equinox OS** everywhere: boot banner, shell, `info`,
+  `help`, the GUI demo, the `httpd` status page, the in-OS compiler
+  banner, and all documentation.
+- RAMFS system paths renamed: `/morph/tools` -> `/equinox/tools`,
+  `/morph/games` -> `/equinox/games` (ISO layout `boot/equinox/...`
+  follows automatically through the module routing).
+- ISO artifact renamed: `dist/equinox.iso`.
+
+### 2. New boot experience
+- Linux-style boot log: every init step is prefixed with a green
+  `[ OK ]` marker; the banner header is rendered in Equinox purple.
+- **The boot log lists every included file**: each GRUB module gets
+  one line with its full RAMFS path, human-readable size and staging
+  mode, e.g.
+  `[ OK ] /equinox/games/doom.mrp  (693.7 KB, zero-copy staged)`.
+- The shell intro was reduced to the essentials: the Equinox emblem
+  (ASCII art, purple/white gradient), the wordmark `EQUINOX OS` and
+  `v0.1 Beta` — then the shell prompt. RAM/heap/uptime/CPU banners
+  were removed (details remain available via `info` and `memmap`).
+
+### 3. Critical fix: user-program exit path (inherited v10.14 bug)
+- The v10.14 English rewrite accidentally deleted one instruction
+  (`movw $0x10, %ax`) from the `user3_killed` landing pad in
+  `kernel/library/usermode.cpp`. Every ring-3 program EXIT (mtcc,
+  crash tests, DOOM quit, ...) landed there with a garbage DS
+  selector and triggered a kernel General Protection Fault.
+- v0.1 Beta restores the kernel data-selector load; both kill paths
+  (normal exit + fault kill) are verified back to working.
+
+### 4. 24-bit console text colors
+- New `set_fg_rgb()` console API: exact RGB foreground on the VESA
+  framebuffer (VGA text mode snaps to the nearest palette entry).
+- The Equinox emblem uses a symmetric white -> purple -> white
+  vertical gradient rendered per line with integer lerp.
+
+### 5. TLS 1.2 for mget — https:// support (BearSSL 0.6)
+- `mget` now fetches `https://` URLs: `mget https://github.com/...`
+  works end-to-end (live-tested against example.com,
+  raw.githubusercontent.com and github.com from inside QEMU).
+- **BearSSL 0.6** (MIT) is vendored at `third_party/bearssl` and
+  compiled into the kernel with the portable constant-time
+  implementations only (the auto-enabled SSE2/AES-NI paths are
+  forced off with `-DBR_SSE2=0 -DBR_AES_X86NI=0` — they use XMM
+  registers and an unaligned `movaps` crashed the kernel with #GP
+  the first time a server negotiated ChaCha20-SSE2).
+- **Architecture**: lwIP callbacks only memcpy raw TCP bytes into a
+  16 KB ring (no crypto in interrupt context); the shell task drives
+  the BearSSL engine (handshake, records, app data) under the
+  `net_lock()` cli/sti guard. The TCP window is acknowledged on
+  CONSUMPTION, not on arrival — acknowledging on arrival made fast
+  senders overflow the 8 KB NE2000 buffer while the task was
+  mid-decryption with IF=0, and github.com reset the connection
+  ~5 KB into a page. With consume-side ACKs a 229 KB page now
+  streams at ~250 KB/s.
+- **Verification policy**: strict chain validation first, against 9
+  embedded Mozilla root CAs (the subset with RSA / ECDSA P-256
+  keys: DigiCert Global Root CA + G2, ISRG Root X1, GTS Root R1,
+  Amazon Root CA 1 + 3, USERTrust RSA, AAA Certificate Services,
+  GlobalSign Root CA — generated with the upstream `brssl ta` tool,
+  see `third_party/bearssl/anchors/`). If the chain cannot be
+  verified (unknown root, or a P-384 ECDSA hierarchy such as
+  github.com's current Sectigo chain), the transfer automatically
+  retries in parse-only mode with a clear
+  `ENCRYPTED but NOT VERIFIED` warning; a server-name mismatch
+  never falls back. Certificate validity windows are checked
+  against the CMOS RTC clock (BearSSL's X.509 epoch is days since
+  1 Jan 0 AD — 719,528 days after the Unix epoch).
+- **Entropy**: RDRAND when the CPU offers it, an RDTSC/PIT jitter
+  mix otherwise, injected via `br_ssl_engine_inject_entropy()`
+  (plus BearSSL's own runtime RDRAND seeder when available).
+- Redirects work across schemes and hosts (http <-> https); `-port`
+  and `:port` overrides apply to both schemes (defaults 80/443).
+
+### 6. Carried over (working, unchanged behavior)
+- `mget <url> [-port <n>]` HTTP client with URL parsing, redirect
+  following, Content-Type reporting (v0.1 keeps everything from the
+  last MorphOS network releases).
+- lwIP TCP/IP stack (DHCP, DNS, ICMP, TCP), NE2000 driver, `httpd`.
+- Ring-3 userland, MRP loader, `mtcc` in-OS C compiler, LVGL file
+  manager + code editor, DOOM (shareware WAD), snake/breakout/pong.
+
+## Verification (this release)
+- Build: 0 errors, 0 warnings (host g++ -m32 freestanding).
+- **TLS live suite (`scripts/equinox_tls_test.py`): 5/5 PASS** —
+  boot; `mget` usage documents https;
+  `mget https://example.com/` -> TLS 1.2 + HTTP 200 + saved;
+  `mget https://raw.githubusercontent.com/torvalds/linux/master/README`
+  -> **chain verified** against ISRG Root X1 + saved;
+  `mget https://github.com/octocat/Hello-World` -> warned fallback
+  (P-384 chain) + HTTP 200 + 229 KB saved (~250 KB/s).
+- QEMU smoke suite (`scripts/qemu_mget_test.py`): **10/10 PASS**
+  (boot, version, mget URL + `-port`, clean TLS error against a
+  plain-HTTP server, usage, help).
+- QEMU final smoke (boot, `/equinox` layout, in-OS `mtcc` compile &
+  run, help): **5/5 PASS**.
+- QEMU kill-path smoke (crash kill, normal exit, shell survival):
+  **4/4 PASS**.
+- Host compiler suite (`scripts/tcc_host_test/run_tests.py`): **35/35
+  PASS**.
+- Visual check: boot log + emblem + TLS demo screenshots verified
+  (see `equinox_boot_filelist.png`, `equinox_intro_art.png`,
+  `equinox_tls_demo.png`).
+
+## Known limitations
+- TLS is client-side TLS 1.2 only (no TLS 1.3, no server side);
+  sites requiring TLS 1.3-only handshakes cannot be fetched.
+- Chains rooted in P-384 ECDSA or Ed25519 roots (e.g. github.com's
+  current hierarchy) cannot be fully verified on i386 — those
+  transfers fall back to the warned parse-only mode.
+- On a VM without RDRAND the TLS entropy is a timing-jitter mix —
+  fine for a hobby OS, not a hardened secret.
+- ICMP echo to the internet is not relayed by QEMU user-mode
+  networking (use `tcpping` for connectivity checks).
+- `doom1.wad` (shareware) must be supplied manually for DOOM.
+
+## Artifacts
+- `equinox_os_v0.1_beta.iso` — bootable ISO
+- `equinox_os_v0.1_beta_FULL.zip` — source + build + dist (incl. ISO)
+- `equinox_os_v0.1_beta_SOURCE.zip` — source only

@@ -19,6 +19,7 @@
 
 #include "net.h"
 #include "ne2000.h"
+#include "tls_client.h"              /* v0.1: mget https:// (BearSSL) */
 
 #include "library/header/stdio.h"
 #include "library/header/libstring.h"
@@ -502,11 +503,17 @@ void net_get_info(uint32_t* w) {
 //  the shell task prints the result after the transfer ends.
 //
 //  Syntax:  mget <url> [-port <n>]
-//    url   : http://host[:port]/path   explicit scheme
-//            host[:port]/path          http:// assumed
-//            https://...               rejected (no TLS stack)
+//    url   : http://host[:port]/path    explicit scheme
+//            https://host[:port]/path   TLS 1.2 (BearSSL, v0.1)
+//            host[:port]/path           http:// assumed
 //    -port : force the destination port, overriding the URL
-//  Port priority: -port option > ":port" in the URL > 80.
+//  Port priority: -port option > ":port" in the URL > scheme
+//  default (80 http / 443 https).
+//  HTTPS: strict chain validation against the embedded Mozilla
+//  root subset first; if the chain cannot be verified (unknown
+//  root / unsupported curve, e.g. github.com's P-384 Sectigo
+//  chain) the transfer automatically retries in parse-only
+//  mode with a clear warning (see tls_client.c).
 //  The body is saved to the current directory under the URL's
 //  basename, preserving the file format (.json, .png, ...).
 //  Redirects (301/302/303/307/308) are followed, max 3 hops.
@@ -530,6 +537,34 @@ struct mget_ctx {
     char            path[128];
 };
 
+/* Scan the accumulated response bytes for the header end
+ * (\r\n\r\n) and, once found, lift out the HTTP status code.
+ * Shared by the plain-HTTP recv callback (IRQ context) and the
+ * HTTPS task-side reader — pure memory access, no console
+ * output, so it is safe from either context. */
+static void mget_scan_hdrs(struct mget_ctx* c) {
+    if (c->got_hdr) return;
+    for (uint32_t i = 0; i + 3 < c->len; i++) {
+        if (c->buf[i]     == 0x0D && c->buf[i + 1] == 0x0A &&
+            c->buf[i + 2] == 0x0D && c->buf[i + 3] == 0x0A) {
+            c->hdr_end = i + 4;
+            c->got_hdr = 1;
+            /* "HTTP/1.x NNN" — status in bytes [9..11] */
+            if (c->len >= 12 &&
+                c->buf[9]  >= '0' && c->buf[9]  <= '9' &&
+                c->buf[10] >= '0' && c->buf[10] <= '9' &&
+                c->buf[11] >= '0' && c->buf[11] <= '9') {
+                c->http_status = (c->buf[9]  - '0') * 100
+                               + (c->buf[10] - '0') * 10
+                               + (c->buf[11] - '0');
+                if (c->http_status == 200)
+                    c->http_ok = 1;
+            }
+            return;
+        }
+    }
+}
+
 static err_t mget_recv_cb(void* arg, struct tcp_pcb* pcb,
                           struct pbuf* p, err_t err) {
     struct mget_ctx* c = (struct mget_ctx*)arg;
@@ -552,27 +587,7 @@ static err_t mget_recv_cb(void* arg, struct tcp_pcb* pcb,
         pbuf_copy_partial(p, c->buf + c->len, tot, 0);
         c->len += tot;
 
-        if (!c->got_hdr) {                 /* look for the header end */
-            for (uint32_t i = 0; i + 3 < c->len; i++) {
-                if (c->buf[i]     == 0x0D && c->buf[i + 1] == 0x0A &&
-                    c->buf[i + 2] == 0x0D && c->buf[i + 3] == 0x0A) {
-                    c->hdr_end = i + 4;
-                    c->got_hdr = 1;
-                    /* "HTTP/1.x NNN" — status in bytes [9..11] */
-                    if (c->len >= 12 &&
-                        c->buf[9]  >= '0' && c->buf[9]  <= '9' &&
-                        c->buf[10] >= '0' && c->buf[10] <= '9' &&
-                        c->buf[11] >= '0' && c->buf[11] <= '9') {
-                        c->http_status = (c->buf[9]  - '0') * 100
-                                       + (c->buf[10] - '0') * 10
-                                       + (c->buf[11] - '0');
-                        if (c->http_status == 200)
-                            c->http_ok = 1;
-                    }
-                    break;
-                }
-            }
-        }
+        mget_scan_hdrs(c);                 /* find header end + status */
         tcp_recved(pcb, (u16_t)tot);
     }
     pbuf_free(p);
@@ -637,6 +652,64 @@ static int mget_hdr_value(const uint8_t* hdr, uint32_t hlen,
     return 0;
 }
 
+/* ---- HTTPS transfer over a BearSSL session ----
+ * Runs entirely in task context (the engine never executes in
+ * IRQ context): connect + handshake, send the request, pump
+ * decrypted app data into c->buf until EOF / error. Fills the
+ * same mget_ctx fields the callback path produces, so result
+ * reporting, redirect following and saving stay shared. */
+static int mget_https_transfer(struct mget_ctx* c, const char* host,
+                               ip_addr_t* dst, int port) {
+    struct tls_sess* tls = tls_connect_auto(host, dst, port);
+    if (!tls) { c->state = -1; return 0; }
+    c->connected = 1;
+
+    char req[320];
+    int n = sprintf(req,
+                    "GET %s HTTP/1.0\r\n"
+                    "Host: %s\r\n"
+                    "User-Agent: equinox-mget/0.1\r\n"
+                    "\r\n", c->path, c->host);
+    if (tls_write_all(tls, req, n) != 0) {
+        printf("mget: TLS write failed\n");
+        tls_close(tls);
+        c->state = -1;
+        return 0;
+    }
+
+    for (;;) {
+        if (c->len >= c->cap) {
+            printf("mget: response too large (%u KB limit)\n",
+                   (unsigned)(c->cap / 1024));
+            c->state = -1;
+            break;
+        }
+        int r = tls_read(tls, c->buf + c->len,
+                         (int)(c->cap - c->len));
+        if (r > 0) {
+            c->len += (uint32_t)r;
+            mget_scan_hdrs(c);
+            continue;
+        }
+        if (r == 0 || r == -1) {
+            /* clean close_notify, or abrupt FIN — both count as
+             * complete when a 200 header arrived (mirrors the
+             * HTTP path's "slow close still counts" rule) */
+            c->state = (c->got_hdr && c->http_ok) ? 1 : -1;
+            break;
+        }
+        if (r == -3)
+            printf("mget: TLS transfer timed out\n");
+        else
+            printf("mget: TLS error during transfer (code %d)\n",
+                   tls_last_error(tls));
+        c->state = -1;
+        break;
+    }
+    tls_close(tls);
+    return c->state == 1;
+}
+
 int net_cmd_mget(const char* args, struct fs_node* save_dir) {
     if (!net_up) { printf("net: down (no NIC)\n"); return 0; }
     if (!save_dir) save_dir = fs_get_root();
@@ -679,13 +752,15 @@ int net_cmd_mget(const char* args, struct fs_node* save_dir) {
     }
     if (url_len == 0) {
         printf("usage: mget <url> [-port <n>]\n");
-        printf("  url   : http://host[:port]/path    (https not supported - no TLS)\n");
-        printf("          host[:port]/path           (http:// assumed)\n");
+        printf("  url   : http://host[:port]/path     plain HTTP\n");
+        printf("          https://host[:port]/path    TLS 1.2 (BearSSL)\n");
+        printf("          host[:port]/path            http:// assumed\n");
         printf("  -port : force the destination port (overrides the URL)\n");
         printf("  saves : <basename> into the current directory (any file type)\n");
         printf("examples:\n");
         printf("  mget http://10.0.2.2:8022/data.json\n");
-        printf("  mget example.com/file.json -port 8080\n");
+        printf("  mget https://raw.githubusercontent.com/torvalds/linux/master/README\n");
+        printf("  mget https://github.com/octocat/Hello-World -port 443\n");
         return 0;
     }
     if (port_override < 0 || port_override > 65535) {
@@ -706,15 +781,11 @@ int net_cmd_mget(const char* args, struct fs_node* save_dir) {
     sbuf[0] = 0;
 
     for (int hop = 0; hop <= MGET_MAX_REDIRECTS; hop++) {
-        /* ---- parse URL: [http://]host[:port]/path ---- */
+        /* ---- parse URL: [http://|https://]host[:port]/path ---- */
         const char* p = url;
-        if (memcmp(p, "https://", 8) == 0) {
-            printf("mget: https is not supported (Equinox OS has no TLS stack)\n");
-            printf("      use the http:// version of this URL\n");
-            free(buf);
-            return 0;
-        }
-        if (memcmp(p, "http://", 7) == 0) p += 7;
+        int is_tls = 0;
+        if (memcmp(p, "https://", 8) == 0) { is_tls = 1; p += 8; }
+        else if (memcmp(p, "http://", 7) == 0) p += 7;
 
         int hl = 0;
         while (*p && *p != '/' && *p != ':' && hl < 63) host[hl++] = *p++;
@@ -725,7 +796,7 @@ int net_cmd_mget(const char* args, struct fs_node* save_dir) {
             return 0;
         }
 
-        int port = 80;                /* auto: http default        */
+        int port = is_tls ? 443 : 80;  /* default by scheme       */
         if (*p == ':') {              /* ":port" inside the URL    */
             p++;
             port = 0;
@@ -783,7 +854,8 @@ int net_cmd_mget(const char* args, struct fs_node* save_dir) {
             printf("mget: %s -> %s\n", host, rip);
             dstip = rip;              /* display the IP, Host keeps the name */
         }
-        printf("mget: http://%s:%d%s -> %s\n", dstip, port, pbuf, sbuf);
+        printf("mget: %s://%s:%d%s -> %s\n",
+               is_tls ? "https" : "http", dstip, port, pbuf, sbuf);
 
         struct mget_ctx c;
         c.state = 0; c.got_hdr = 0; c.http_ok = 0; c.len = 0;
@@ -798,46 +870,55 @@ int net_cmd_mget(const char* args, struct fs_node* save_dir) {
             c.path[i] = 0;
         }
 
-        uint32_t f = net_lock();
-        struct tcp_pcb* pcb = tcp_new();
-        if (!pcb) {
-            net_unlock(f);
-            free(buf);
-            printf("mget: out of PCBs\n");
-            return 0;
-        }
-        c.pcb = pcb;
-        tcp_arg(pcb, &c);
-        tcp_err(pcb, mget_err_cb);
-        tcp_recv(pcb, mget_recv_cb);
+        uint32_t t0 = sys_now();
+        int ok;
         ip_addr_t d;
         *(ip_2_ip4(&d)) = dst;
-        err_t e = tcp_connect(pcb, &d, (u16_t)port, mget_connected_cb);
-        net_unlock(f);
-        if (e != ERR_OK) {
-            f = net_lock();
-            tcp_close(pcb);
+
+        if (is_tls) {
+            /* ---- HTTPS: BearSSL session in task context ---- */
+            ok = mget_https_transfer(&c, host, &d, port);
+        } else {
+            /* ---- plain HTTP: callback path (IRQ0 driven) ---- */
+            uint32_t f = net_lock();
+            struct tcp_pcb* pcb = tcp_new();
+            if (!pcb) {
+                net_unlock(f);
+                free(buf);
+                printf("mget: out of PCBs\n");
+                return 0;
+            }
+            c.pcb = pcb;
+            tcp_arg(pcb, &c);
+            tcp_err(pcb, mget_err_cb);
+            tcp_recv(pcb, mget_recv_cb);
+            err_t e = tcp_connect(pcb, &d, (u16_t)port,
+                                  mget_connected_cb);
             net_unlock(f);
-            free(buf);
-            printf("mget: connect failed (%d)\n", (int)e);
-            return 0;
-        }
+            if (e != ERR_OK) {
+                f = net_lock();
+                tcp_close(pcb);
+                net_unlock(f);
+                free(buf);
+                printf("mget: connect failed (%d)\n", (int)e);
+                return 0;
+            }
 
-        uint32_t t0 = sys_now();
-        while (c.state == 0 && (sys_now() - t0) < MGET_TIMEOUT_MS) { }
+            while (c.state == 0 && (sys_now() - t0) < MGET_TIMEOUT_MS) { }
 
-        /* a slow server close still counts if the data is complete */
-        int ok;
-        if (c.state == 1) ok = 1;
-        else if (c.state == 0 && c.got_hdr && c.http_ok && c.len > c.hdr_end)
-            ok = 1;
-        else ok = 0;
+            /* a slow server close still counts if the data is complete */
+            if (c.state == 1) ok = 1;
+            else if (c.state == 0 && c.got_hdr && c.http_ok &&
+                     c.len > c.hdr_end)
+                ok = 1;
+            else ok = 0;
 
-        if (c.pcb) {
-            f = net_lock();
-            tcp_abort(c.pcb);
-            c.pcb = NULL;
-            net_unlock(f);
+            if (c.pcb) {
+                f = net_lock();
+                tcp_abort(c.pcb);
+                c.pcb = NULL;
+                net_unlock(f);
+            }
         }
 
         /* report the status honestly whenever a header arrived */
@@ -866,7 +947,8 @@ int net_cmd_mget(const char* args, struct fs_node* save_dir) {
                 memcmp(loc, "https://", 8) == 0) {
                 snprintf(next, sizeof(next), "%s", loc);
             } else if (loc[0] == '/') {
-                snprintf(next, sizeof(next), "http://%s%s", host, loc);
+                snprintf(next, sizeof(next), "%s%s%s",
+                         is_tls ? "https://" : "http://", host, loc);
             } else {
                 /* relative: replace the last path component */
                 char dir[130];
@@ -877,7 +959,8 @@ int net_cmd_mget(const char* args, struct fs_node* save_dir) {
                 for (int i = 0; i <= last && i < 127; i++)
                     dir[di++] = pbuf[i];
                 dir[di] = 0;
-                snprintf(next, sizeof(next), "http://%s%s%s",
+                snprintf(next, sizeof(next), "%s%s%s%s",
+                         is_tls ? "https://" : "http://",
                          host, dir, loc);
             }
             printf("mget: following redirect -> %s\n", next);
@@ -886,7 +969,11 @@ int net_cmd_mget(const char* args, struct fs_node* save_dir) {
         }
 
         if (!ok) {
-            if (!c.connected) {
+            if (is_tls && !c.connected) {
+                /* TCP or handshake failure — the TLS layer (task
+                 * context) already printed the detailed reason. */
+                printf("mget: TLS connection failed - see the TLS messages above\n");
+            } else if (!c.connected) {
                 printf("mget: connect failed - no response or refused (state %d).\n",
                        c.state);
                 printf("      check the host and port; a firewall may reject it.\n");

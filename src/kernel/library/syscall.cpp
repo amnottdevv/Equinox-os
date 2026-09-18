@@ -295,6 +295,9 @@ static uint32_t sys_read(uint32_t fd, uint32_t buf_, uint32_t len) {
 
     struct fs_node* f = fd_table[fd].node;
     if (f->is_dir)  return (uint32_t)SYS_EISDIR;
+    /* v0.2: FAT32-backed files lazy-load on first read (sys_open
+     * normally did it already; this also covers pre-v0.2 fds). */
+    if (fs_ensure_content(f) != 0) return (uint32_t)SYS_EIO;
     if (!f->content) return 0;              // empty file = EOF
 
     uint32_t pos = fd_table[fd].pos;
@@ -317,6 +320,9 @@ static uint32_t sys_open(uint32_t path_, uint32_t a2, uint32_t a3) {
     struct fs_node* node = syscall_resolve(path);
     if (!node)        return (uint32_t)SYS_ENOENT;
     if (node->is_dir) return (uint32_t)SYS_EISDIR;
+    /* v0.2: pull the content of a FAT32-backed file into the cache
+     * at open time (the doom -iwad path relies on this). */
+    if (fs_ensure_content(node) != 0) return (uint32_t)SYS_EIO;
 
     /* Find a free fd slot (3..MAX-1). */
     for (uint32_t fd = 3; fd < SYS_MAX_FDS; fd++) {
@@ -504,6 +510,8 @@ static uint32_t sys_readfile(uint32_t path_, uint32_t buf_, uint32_t maxlen) {
     struct fs_node* node = syscall_resolve(path);
     if (!node)        return (uint32_t)SYS_ENOENT;
     if (node->is_dir) return (uint32_t)SYS_EISDIR;
+    /* v0.2: lazy FAT32 content load before reading */
+    if (fs_ensure_content(node) != 0) return (uint32_t)SYS_EIO;
     if (!node->content || node->size == 0) return 0;   // empty file
 
     uint32_t n = (node->size < maxlen) ? node->size : maxlen;

@@ -83,16 +83,22 @@ int      net_httpd_running(void);
 uint32_t net_httpd_hits(void);
 uint32_t net_httpd_bytes(void);
 
-// ---- mget — HTTP client (blocking, shell context) ----
+// ---- mget — HTTP(S) client (blocking, shell context) ----
 // v10.14 (was "wget"): URL-based downloads.
 //   args: "<url> [-port <n>]"
-//     url : http://host[:port]/path | host[:port]/path
-//           https:// is rejected (no TLS stack)
-//   -port overrides the port from the URL; default 80.
+//     url : http://host[:port]/path | https://host[:port]/path
+//           host[:port]/path (http:// assumed)
+//   -port overrides the port from the URL; defaults are 80
+//   (http) and 443 (https).
+// HTTPS rides on BearSSL 0.6 (third_party/bearssl, TLS 1.2):
+// strict chain validation against 9 embedded Mozilla roots,
+// with an automatic parse-only retry (clearly warned) when the
+// server's chain cannot be verified (unknown root / P-384).
 // The response body is saved via fs_write_binary into save_dir
 // (the shell cwd) under the URL's basename — the file format
 // (.json, .png, ...) is preserved byte-exact.
-// Redirects (301/302/303/307/308) are followed, max 3 hops.
+// Redirects (301/302/303/307/308) are followed, max 3 hops,
+// across schemes and hosts.
 // return 1 success (file saved), 0 failure.
 int  net_cmd_mget(const char* args, struct fs_node* save_dir);
 

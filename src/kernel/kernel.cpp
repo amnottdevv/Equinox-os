@@ -26,6 +26,8 @@
 #include "library/header/syscall.h"
 #include "library/header/paging.h"     // paging_init (v10.7 ring 3)
 #include "library/header/usermode.h"   // tss_init / memmap (v10.7 ring 3)
+#include "library/header/ata.h"        // v0.2: ATA/IDE PIO driver
+#include "library/header/fs_fat32.h"   // v0.2: FAT32 read/write mount
 #include <stdint.h>
 
 // LVGL (compiled when LVGL source tree is present)
@@ -312,7 +314,7 @@ static void boot_log_replay(void) {
     /* Purple banner — matches the Equinox emblem palette.
      * set_fg_rgb() snaps to light magenta in the VGA fallback. */
     set_fg_rgb(0xB794FFu);
-    printf("Equinox OS v0.1 Beta - booting\n\n");
+    printf("Equinox OS v0.2 Beta - booting\n\n");
     for (int i = 0; i < bootlog_count; i++) {
         boot_log_line(bootlog_lines[i]);
     }
@@ -401,7 +403,7 @@ static void print_intro() {
      * was removed on purpose: after the banner the user lands
      * straight in the shell. */
     const char* wordmark = "E Q U I N O X   O S";
-    const char* version  = "v 0 . 1   B E T A";
+    const char* version  = "v 0 . 2   B E T A";
     printf("\n");
     int wpad = (cols - (int)strlen(wordmark)) / 2;
     if (wpad < 0) wpad = 0;
@@ -778,6 +780,7 @@ static void shell() {
             printf("  cdir <name>   - create directory\n");
             printf("  cfile <name>  - create empty file\n");
             printf("  ccfile <name> << \"content\" - create file with content\n");
+            printf("  save <name> << \"content\" - create OR overwrite a file\n");
             printf("  cat <name>    - display file content\n");
             printf("  run <path.mrp> [args] - run an .mrp (subpaths ok, falls back to system path)\n");
             printf("  ./name.mrp [args]     - shortcut for 'run name.mrp' (subpaths ok)\n");
@@ -805,8 +808,11 @@ static void shell() {
             printf("  ping <host>   - ICMP ping 4x; host = IP/hostname\n");
             printf("  tcpping <host> [port] - TCP probe (works under QEMU user-net)\n");
             printf("  dns <hostname>   - resolve a domain name via 10.0.2.3\n");
-            printf("  mget <url> [-port <n>] - HTTP download to RAMFS\n");
+            printf("  mget <url> [-port <n>] - HTTP/HTTPS download to RAMFS\n");
             printf("  httpd         - mini web server :80 / status\n");
+            printf("  diskinfo      - ATA drives + FAT32 volume details\n");
+            printf("  mount/umount  - attach/detach the FAT32 disk at /mnt\n");
+            printf("  xxd <file> [n]- hex dump first n bytes (default 64)\n");
             printf("  ringstats     - ring buffer stats (kbd/mouse/audio)\n");
             printf("  memmap        - memory map + ring 3 status\n");
             printf("  ring          - show current privilege level (ring 0 vs 3)\n");
@@ -829,7 +835,7 @@ static void shell() {
             printf("You said: %s\n", buf);
         }
         else if (strcmp(input, "info") == 0) {
-            printf("Equinox OS v0.1 Beta (32-bit, i686)\n");
+            printf("Equinox OS v0.2 Beta (32-bit, i686)\n");
             printf("Build: %s %s\n", __DATE__, __TIME__);
             printf("RAM: 16 MB (simulated)\n");
             /* FIX(K1/M8): heap size comes from malloc.cpp (2 MB),
@@ -874,6 +880,62 @@ static void shell() {
         }
         else if (strcmp(input, "malloc") == 0) {
             malloc_stats();
+        }
+        else if (strcmp(input, "diskinfo") == 0) {
+            /* v0.2: ATA drives + mounted FAT32 volume details. */
+            fat32_diskinfo();
+        }
+        else if (strcmp(input, "mount") == 0) {
+            fat32_mount_cmd();
+        }
+        else if (strcmp(input, "umount") == 0) {
+            fat32_unmount_cmd();
+        }
+        else if (starts_with(input, "xxd ")) {
+            /* v0.2: hex dump — also proves FAT32 binary reads are
+             * byte-exact (first N bytes of any file, disk-backed or
+             * RAMFS). Usage: xxd <file> [n]  (default 64 bytes) */
+            const char* rest = input + 4;
+            while (*rest == ' ') rest++;
+            char name[80];
+            int i = 0;
+            while (rest[i] && rest[i] != ' ' && i < (int)sizeof(name) - 1) {
+                name[i] = rest[i];
+                i++;
+            }
+            name[i] = '\0';
+            int cnt = 64;
+            if (rest[i] == ' ') cnt = atoi(rest + i + 1);
+            if (!name[0]) {
+                printf("xxd: usage: xxd <file> [n]\n");
+            } else {
+                struct fs_node* node = fs_find_child(cwd, name);
+                if (!node)        printf("xxd: '%s' not found\n", name);
+                else if (node->is_dir) printf("xxd: '%s' is a directory\n", name);
+                else if (fs_ensure_content(node) != 0)
+                    printf("xxd: '%s' read error\n", name);
+                else {
+                    if (cnt < 0) cnt = 0;
+                    if ((uint32_t)cnt > node->size) cnt = node->size;
+                    for (int off = 0; off < cnt; off += 16) {
+                        printf("%04x  ", (unsigned)off);
+                        for (int i = 0; i < 16; i++) {
+                            if (off + i < cnt)
+                                printf("%02x ", (uint8_t)node->content[off + i]);
+                            else printf("   ");
+                            if (i == 7) printf(" ");
+                        }
+                        printf(" |");
+                        for (int i = 0; i < 16 && off + i < cnt; i++) {
+                            char c = node->content[off + i];
+                            put_char((c >= 32 && c < 127) ? c : '.');
+                        }
+                        printf("|\n");
+                    }
+                    printf("(%u bytes total, showing %d)\n",
+                           (unsigned)node->size, cnt);
+                }
+            }
         }
         else if (starts_with(input, "alloc ")) {
             cmd_alloc(input + 6);
@@ -930,6 +992,39 @@ static void shell() {
                 printf("ccfile: missing content (use << \"text\")\n");
             }
         }
+        else if (starts_with(input, "save ")) {
+            /* v0.2: the missing write verb — ccfile only creates NEW
+             * files, so overwriting from the shell meant opening the
+             * editor. `save` is create-OR-overwrite through the same
+             * binary-safe path the editor and mget use (works on the
+             * RAMFS and write-through on the FAT32 volume). */
+            const char* rest = input + 5;
+            char* delim = strstr(rest, " << ");
+            if (delim) {
+                *delim = '\0';
+                char* name = (char*)rest;
+                char* content = delim + 4;
+                if (*content == '"') content++;
+                size_t len = strlen(content);
+                if (len > 0 && content[len-1] == '"') content[--len] = '\0';
+                while (*name == ' ') name++;          /* trim leading  */
+                if (!name[0]) {
+                    printf("save: missing file name\n");
+                } else {
+                    int ret = fs_write_binary(cwd, name,
+                                              (const uint8_t*)content,
+                                              (uint32_t)len);
+                    if (ret == 0)         printf("save: wrote '%s' (%u bytes)\n",
+                                                 name, (unsigned)len);
+                    else if (ret == -6)  printf("save: '%s' is a directory\n", name);
+                    else if (ret == -7)  printf("save: name too long (max 63 chars)\n");
+                    else if (ret == -4)  printf("save: volume full\n");
+                    else                  printf("save: failed (%d)\n", ret);
+                }
+            } else {
+                printf("save: usage: save <name> << \"text\"\n");
+            }
+        }
         else if (starts_with(input, "cat ")) {
             const char* name = input + 4;
             struct fs_node* node = fs_find_child(cwd, name);
@@ -937,6 +1032,8 @@ static void shell() {
                 printf("cat: '%s' not found\n", name);
             } else if (node->is_dir) {
                 printf("cat: '%s' is a directory\n", name);
+            } else if (fs_ensure_content(node) != 0) {
+                printf("cat: '%s' read error\n", name);
             } else {
                 if (node->content && node->size > 0) {
                     /* FIX(K3): print exactly node->size bytes. Binary
@@ -1081,14 +1178,16 @@ static void shell() {
             int ret = fs_delete_node(cwd, name);
             if (ret == -2) printf("rm: '%s' not found\n", name);
             else if (ret == -4) printf("rm: '%s' is a non-empty directory\n", name);
-            else if (ret != 0) printf("rm: failed\n");
+            else if (ret == -9) printf("rm: '%s' is a mounted volume (umount first)\n", name);
+            else if (ret != 0) printf("rm: failed (%d)\n", ret);
         }
         else if (starts_with(input, "rmdir ")) {
             const char* name = input + 6;
             int ret = fs_delete_node(cwd, name);
             if (ret == -2) printf("rmdir: '%s' not found\n", name);
             else if (ret == -4) printf("rmdir: directory not empty\n");
-            else if (ret != 0) printf("rmdir: failed\n");
+            else if (ret == -9) printf("rmdir: '%s' is a mounted volume (umount first)\n", name);
+            else if (ret != 0) printf("rmdir: failed (%d)\n", ret);
         }
         else if (starts_with(input, "edit ")) {
             const char* filename = input + 5;
@@ -1463,7 +1562,7 @@ extern "C" void kernel_main(uint32_t mb_magic, multiboot_info_t* mb_info) {
     /* Purple boot banner — matches the Equinox emblem palette
      * (set_fg_rgb snaps to light magenta in VGA text mode). */
     set_fg_rgb(0xB794FFu);
-    printf("Equinox OS v0.1 Beta - booting\n\n");
+    printf("Equinox OS v0.2 Beta - booting\n\n");
     set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
 
     // ============================================================
@@ -1631,6 +1730,24 @@ extern "C" void kernel_main(uint32_t mb_magic, multiboot_info_t* mb_info) {
      * kernel_panic("can't load libc") -> reboot in 30 s. */
     boot_log("Loading boot modules (GRUB multiboot)");
     mrp_bootloader_load_modules(mb_info);
+
+    // ============================================================
+    //  7b. DISK SUBSYSTEM (v0.2): ATA + FAT32
+    //      Scan the IDE buses, parse the MBR of every hard disk
+    //      and mount the first FAT32 partition at /mnt (write-
+    //      through). Safe no-op without a disk attached.
+    // ============================================================
+    boot_log("Detecting ATA drives + FAT32 volume (v0.2)");
+    fat32_set_boot_log(boot_log);
+    {
+        /* Arena placement needs the real top of RAM: clamp the
+         * FAT cache arena against the multiboot upper-memory figure.
+         * (60 MB fallback for non-multiboot debug boots.) */
+        uint32_t mem_upper =
+            (mb_magic == 0x2BADB002u && mb_info) ? mb_info->mem_upper * 1024u
+                                                 : (60u * 1024u * 1024u);
+        fat32_boot_init(mem_upper);
+    }
 
     boot_log("Initializing syscall layer (int 0x80)");
     syscall_init();   /* reset tabel fd (file descriptor RAMFS) */

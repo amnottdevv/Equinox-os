@@ -5,6 +5,49 @@
 #include <stdint.h>
 #include <stddef.h>
 #include "header/libstring.h"
+#include "header/fs_fat32.h"   // v0.2: FAT32 backing-store hooks
+
+// ============================================================
+//  v0.2: FAT32 BRIDGE
+// ------------------------------------------------------------
+//  Nodes with backing == 1 live on a mounted FAT32 volume:
+//    - directories mirror lazily from disk (fat32_populate_dir)
+//    - file contents load lazily (fat32_read_whole)
+//    - every mutation writes through (create/write/mkdir/delete)
+//  RAMFS nodes (backing == 0) behave exactly as before.
+// ============================================================
+static void fs_node_init_v02(struct fs_node* n) {
+    n->backing       = 0;
+    n->populated     = 0;
+    n->lfn_count     = 0;
+    n->first_cluster = 0;
+    n->dirent_sector = 0;
+    n->dirent_index  = 0;
+    for (int i = 0; i < 11; i++) n->sfn[i] = 0;
+    n->mnt           = NULL;
+}
+
+int fs_ensure_content(struct fs_node* node) {
+    if (!node || node->is_dir) return -1;
+    if (node->backing == 1 && !node->content)
+        return fat32_read_whole(node);
+    return 0;
+}
+
+/* v0.2: FAT name matching is CASE-INSENSITIVE (spec behavior):
+ * "doom1.wad" must find "DOOM1.WAD" stored as plain 8.3. RAMFS
+ * nodes keep the classic case-sensitive strcmp. */
+static int fs_name_eq(struct fs_node* parent, const char* a, const char* b) {
+    if (parent->backing != 1) return strcmp(a, b) == 0;
+    while (*a && *b) {
+        char ca = *a, cb = *b;
+        if (ca >= 'a' && ca <= 'z') ca -= 32;
+        if (cb >= 'a' && cb <= 'z') cb -= 32;
+        if (ca != cb) return 0;
+        a++; b++;
+    }
+    return *a == '\0' && *b == '\0';
+}
 
 // FIX: node-name length limit -- MUST match sizeof(fs_node::name).
 // Used by every create function so there is no unbounded strcpy() into name[64].
@@ -32,6 +75,7 @@ void fs_init(void) {
     root_node->parent = NULL;
     root_node->children = NULL;
     root_node->next = NULL;
+    fs_node_init_v02(root_node);
 }
 
 struct fs_node* fs_get_root(void) {
@@ -45,9 +89,13 @@ struct fs_node* fs_get_root(void) {
 // find a child by exact name (case-sensitive)
 struct fs_node* fs_find_child(struct fs_node* parent, const char* name) {
     if (!parent || !parent->is_dir) return NULL;
+    /* v0.2: FAT32-backed directories mirror lazily — the first
+     * lookup pulls the whole directory listing from disk. */
+    if (parent->backing == 1 && !parent->populated)
+        fat32_populate_dir(parent);
     struct fs_node* child = parent->children;
     while (child) {
-        if (strcmp(child->name, name) == 0) {
+        if (fs_name_eq(parent, child->name, name)) {
             return child;
         }
         child = child->next;
@@ -68,6 +116,25 @@ int fs_create_file(struct fs_node* parent, const char* name, const char* content
     if (!name || !name[0]) return -8;             // FIX: NULL/empty name
     if (strlen(name) >= FS_NAME_MAX) return -7;   // FIX: name > 63 chars = heap overflow
     if (fs_find_child(parent, name)) return -2; // already exists
+
+    /* v0.2: FAT32 parent — create the dirent on disk (write-through),
+     * then optionally fill it. The RAM mirror node is built by the
+     * FAT driver itself (fat32_create_file). */
+    if (parent->backing == 1) {
+        int ret = fat32_create_file(parent, name);
+        /* -5 = the 8.3 alias is taken by a file whose LONG name
+         * differs (e.g. "my_docum.txt" vs "My Document.txt") — the
+         * name effectively exists, report it in fs_ram's vocabulary */
+        if (ret == -5) return -2;
+        if (ret != 0) return ret;
+        if (content) {
+            struct fs_node* n = fs_find_child(parent, name);
+            if (!n) return -3;
+            return fat32_write_file(n, (const uint8_t*)content,
+                                    (uint32_t)strlen(content));
+        }
+        return 0;
+    }
 
     struct fs_node* new_node = (struct fs_node*)malloc(sizeof(struct fs_node));
     if (!new_node) return -3; // out of memory
@@ -98,6 +165,7 @@ int fs_create_file(struct fs_node* parent, const char* name, const char* content
     // sisipkan di depan (linked list)
     new_node->next = parent->children;
     parent->children = new_node;
+    fs_node_init_v02(new_node);
 
     return 0;
 }
@@ -109,6 +177,19 @@ int fs_write_binary(struct fs_node* parent, const char* name,
                      const uint8_t* data, uint32_t len) {
     if (!parent || !parent->is_dir) return -1;
     if (!data) return -5;
+
+    /* v0.2: FAT32 parent — full write-through (create when missing,
+     * resize the cluster chain, update the dirent, refresh cache). */
+    if (parent->backing == 1) {
+        struct fs_node* node = fs_find_child(parent, name);
+        if (!node) {
+            int ret = fat32_create_file(parent, name);
+            if (ret != 0) return ret;
+            node = fs_find_child(parent, name);
+        }
+        if (!node || node->is_dir) return -6;
+        return fat32_write_file(node, data, len);
+    }
 
     struct fs_node* node = fs_find_child(parent, name);
 
@@ -170,6 +251,11 @@ int fs_reference_binary(struct fs_node* parent, const char* name,
     if (!parent || !parent->is_dir) return -1;
     if (!data || len == 0) return -5;
 
+    /* v0.2: a FAT32 directory cannot host memory references —
+     * degrade to a normal (copied) write-through. */
+    if (parent->backing == 1)
+        return fs_write_binary(parent, name, data, len);
+
     struct fs_node* node = fs_find_child(parent, name);
     if (!node) {
         int ret = fs_create_file(parent, name, nullptr);
@@ -196,6 +282,14 @@ int fs_create_dir(struct fs_node* parent, const char* name) {
     if (strlen(name) >= FS_NAME_MAX) return -7;   // FIX: name > 63 chars = heap overflow
     if (fs_find_child(parent, name)) return -2;
 
+    /* v0.2: FAT32 parent — allocate a cluster, write "." + "..",
+     * create the dirent run, then mirror into RAM. */
+    if (parent->backing == 1) {
+        int ret = fat32_create_dir(parent, name);
+        if (ret == -5) return -2;      /* 8.3 alias taken (see above) */
+        return ret;
+    }
+
     struct fs_node* new_dir = (struct fs_node*)malloc(sizeof(struct fs_node));
     if (!new_dir) return -3;
 
@@ -211,6 +305,7 @@ int fs_create_dir(struct fs_node* parent, const char* name) {
     new_dir->children = NULL;
     new_dir->next = parent->children;
     parent->children = new_dir;
+    fs_node_init_v02(new_dir);
 
     return 0;
 }
@@ -221,10 +316,27 @@ int fs_create_dir(struct fs_node* parent, const char* name) {
 
 int fs_delete_node(struct fs_node* parent, const char* name) {
     if (!parent || !parent->is_dir) return -1;
+
+    /* v0.2: FAT32 parent — mark the dirent run 0xE5, free the
+     * cluster chain, then drop the RAM mirror node. */
+    if (parent->backing == 1) {
+        struct fs_node* node = fs_find_child(parent, name);
+        if (!node) return -2;
+        return fat32_delete(node);
+    }
+
     struct fs_node* prev = NULL;
     struct fs_node* curr = parent->children;
     while (curr) {
         if (strcmp(curr->name, name) == 0) {
+            // v0.2 write hardening: a FAT-backed node is a LIVE MOUNT
+            // POINT (i.e. "/mnt" while a volume is mounted on it).
+            // Deleting it would free the node g_fat.mount_pt still
+            // points at -> use-after-free on the next FAT op / umount.
+            // Refuse with -9 ("device busy") exactly like POSIX EBUSY.
+            if (curr->backing == 1) {
+                return -9; // mount point is in use
+            }
             // if a directory, it must be empty
             if (curr->is_dir && curr->children) {
                 return -4; // directory not empty
@@ -288,6 +400,9 @@ void fs_ls(struct fs_node* dir, int show_details) {
         printf("Not a directory\n");
         return;
     }
+    /* v0.2: lazy FAT32 directory mirror on the first listing */
+    if (dir->backing == 1 && !dir->populated)
+        fat32_populate_dir(dir);
     struct fs_node* child = dir->children;
     if (!child) {
         printf("(empty)\n");
@@ -317,6 +432,12 @@ void fs_tree(struct fs_node* dir, int depth) {
         printf("|-- %s\n", dir->name);
     }
     if (dir->is_dir) {
+        /* v0.2: FAT dirs mirror lazily — pull the listing on the
+         * first walk, same as fs_ls/fs_find_child (without this the
+         * tree of /mnt printed "(empty)" until something else
+         * populated it). */
+        if (dir->backing == 1 && !dir->populated)
+            fat32_populate_dir(dir);
         struct fs_node* child = dir->children;
         while (child) {
             fs_tree(child, depth + 1);

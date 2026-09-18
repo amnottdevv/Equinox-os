@@ -153,6 +153,7 @@ extern "C" {
 #define SYS_EMFILE  (-8)  /* fd table full (too many open files)              */
 #define SYS_EBUSY   (-9)  /* FIX(audit V3 #1): nested exec rejected - calling program still running in the MRP arena */
 #define SYS_EFAULT  (-10) /* v10.7 ring 3: argument pointer outside the user region (uaccess) */
+#define SYS_EIO     (-11) /* v0.2: disk I/O error (FAT32 read/write through) */
 
 // ---------------------------------------------------------------
 //  Whence values for SYS_LSEEK #27 (ABI values — do not change).

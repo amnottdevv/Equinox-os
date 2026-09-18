@@ -1,1 +1,0 @@
-this file is place of lvgl clone lvgl in here if you want to compile this os

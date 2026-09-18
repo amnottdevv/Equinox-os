@@ -13,14 +13,40 @@ struct fs_node {
     char name[64];
     uint8_t is_dir;          // 1 if directory, 0 if file
     uint8_t is_ref;          // v10.9: 1 = zero-copy content (GRUB module
-                             // staging) - pointer does NOT belong to the
-                             // kernel heap, never free() it
+                             // staging or the v0.2 FAT arena) - pointer
+                             // does NOT belong to the kernel heap,
+                             // never free() it
     uint32_t size;           // file size (0 for dirs)
     char* content;           // file contents (malloc'd), NULL for dirs
     struct fs_node* parent;  // parent directory
     struct fs_node* children; // linked list of children (for dirs)
     struct fs_node* next;    // next sibling
+    // ---- v0.2: FAT32 backing store --------------------------------
+    // backing == 1 means this node lives on a mounted FAT32 volume:
+    //   - dirs  lazily populate `children` from the disk on the first
+    //            fs_find_child() / fs_ls()
+    //   - files lazily load `content` via fs_ensure_content()
+    //   - every mutating fs_ram call is written through to disk
+    uint8_t  backing;        // 0 = RAMFS, 1 = FAT32
+    uint8_t  populated;      // FAT32 dir: 1 after the first readdir
+    uint16_t lfn_count;      // FAT32: LFN entries preceding the 8.3 slot
+    uint32_t first_cluster;  // FAT32: first data cluster (0 = empty)
+    uint32_t dirent_sector;  // FAT32: absolute LBA of the 8.3 dirent
+    uint16_t dirent_index;   // FAT32: dirent index inside that sector
+    uint8_t  sfn[11];        // FAT32: on-disk 8.3 short name of this
+                             // dirent ("NAME    EXT", spaces included).
+                             // v0.2 write hardening: new files must not
+                             // collide with the SHORT names of existing
+                             // entries even when their long names differ
+                             // (e.g. "My Document.txt" stores MYDOC~1 TXT;
+                             // creating "mydoc~1.txt" must be re-tailled).
+    void*    mnt;            // FAT32: owning fat32_mount (opaque here)
 };
+
+// Make sure a node's content is readable (node->content != NULL for
+// non-empty files). RAMFS nodes: no-op. FAT32 nodes: lazy whole-file
+// read into the arena/heap cache. Returns 0 on success.
+int fs_ensure_content(struct fs_node* node);
 
 // Initialize the filesystem (creates the root)
 void fs_init(void);
@@ -74,6 +100,11 @@ int fs_change_dir(struct fs_node** cwd, const char* path);
 
 // Get a node from an absolute path
 struct fs_node* fs_get_node_from_path(struct fs_node* root, const char* path);
+
+// Delete a node by name under `parent`. v0.2: when `parent` is FAT32-
+// backed, the dirent run is marked 0xE5 and the cluster chain freed
+// on disk (write-through) before the RAM mirror node disappears.
+int fs_delete_node(struct fs_node* parent, const char* name);
 
 #ifdef __cplusplus
 }
