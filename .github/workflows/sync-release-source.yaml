@@ -16,7 +16,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Find zip asset with "source" in its name
+      - name: Find zip asset with "SOURCE" in its name
         id: find_asset
         env:
           GH_TOKEN: ${{ github.token }}
