@@ -2,7 +2,11 @@ name: Sync release source zip to src/
 
 on:
   release:
-    types: [published]
+    types:
+      - published
+      - edited
+      - prereleased
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -16,13 +20,22 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Set release tag
+        id: rel
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ github.event.inputs.release_tag || 'v0.2-Beta' }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${{ github.event.release.tag_name }}" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Find zip asset with "SOURCE" in its name
         id: find_asset
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          RELEASE_TAG="${{ github.event.release.tag_name }}"
+          RELEASE_TAG="${{ steps.rel.outputs.tag }}"
           echo "Release: $RELEASE_TAG"
 
           ASSET_NAME=$(gh release view "$RELEASE_TAG" \
@@ -46,7 +59,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release download "${{ github.event.release.tag_name }}" \
+          gh release download "${{ steps.rel.outputs.tag }}" \
             --repo "${{ github.repository }}" \
             --pattern "${{ steps.find_asset.outputs.asset_name }}" \
             --output downloaded_source.zip
@@ -60,8 +73,6 @@ jobs:
           TMP_DIR=$(mktemp -d)
           unzip -q downloaded_source.zip -d "$TMP_DIR"
 
-          # If the zip has exactly one top-level folder, unwrap it so
-          # src/ doesn't end up with an extra nested directory level.
           ENTRY_COUNT=$(find "$TMP_DIR" -mindepth 1 -maxdepth 1 | wc -l)
           FIRST_ENTRY=$(find "$TMP_DIR" -mindepth 1 -maxdepth 1)
           if [ "$ENTRY_COUNT" -eq 1 ] && [ -d "$FIRST_ENTRY" ]; then
@@ -84,5 +95,5 @@ jobs:
             echo "No changes in src/ — nothing to commit."
             exit 0
           fi
-          git commit -m "chore: sync src/ from release ${{ github.event.release.tag_name }} (${{ steps.find_asset.outputs.asset_name }})"
+          git commit -m "chore: sync src/ from release ${{ steps.rel.outputs.tag }} (${{ steps.find_asset.outputs.asset_name }})"
           git push
