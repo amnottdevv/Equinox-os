@@ -1,0 +1,88 @@
+name: Sync release source zip to src/
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  sync-source:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Find zip asset with "source" in its name
+        id: find_asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          RELEASE_TAG="${{ github.event.release.tag_name }}"
+          echo "Release: $RELEASE_TAG"
+
+          ASSET_NAME=$(gh release view "$RELEASE_TAG" \
+            --repo "${{ github.repository }}" \
+            --json assets \
+            --jq '.assets[] | select(.name | test("source"; "i")) | select(.name | test("\\.zip$"; "i")) | .name' \
+            | head -n1)
+
+          if [ -z "$ASSET_NAME" ]; then
+            echo "No zip asset with 'source' in its name found in this release. Skipping."
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Found asset: $ASSET_NAME"
+          echo "found=true" >> "$GITHUB_OUTPUT"
+          echo "asset_name=$ASSET_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Download the asset
+        if: steps.find_asset.outputs.found == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "${{ github.event.release.tag_name }}" \
+            --repo "${{ github.repository }}" \
+            --pattern "${{ steps.find_asset.outputs.asset_name }}" \
+            --output downloaded_source.zip
+
+      - name: Extract into src/
+        if: steps.find_asset.outputs.found == 'true'
+        run: |
+          set -euo pipefail
+          rm -rf src
+          mkdir -p src
+          TMP_DIR=$(mktemp -d)
+          unzip -q downloaded_source.zip -d "$TMP_DIR"
+
+          # If the zip has exactly one top-level folder, unwrap it so
+          # src/ doesn't end up with an extra nested directory level.
+          ENTRY_COUNT=$(find "$TMP_DIR" -mindepth 1 -maxdepth 1 | wc -l)
+          FIRST_ENTRY=$(find "$TMP_DIR" -mindepth 1 -maxdepth 1)
+          if [ "$ENTRY_COUNT" -eq 1 ] && [ -d "$FIRST_ENTRY" ]; then
+            SRC_ROOT="$FIRST_ENTRY"
+          else
+            SRC_ROOT="$TMP_DIR"
+          fi
+
+          cp -r "$SRC_ROOT"/. src/
+          rm -rf "$TMP_DIR" downloaded_source.zip
+
+      - name: Commit and push
+        if: steps.find_asset.outputs.found == 'true'
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add src/
+          if git diff --cached --quiet; then
+            echo "No changes in src/ — nothing to commit."
+            exit 0
+          fi
+          git commit -m "chore: sync src/ from release ${{ github.event.release.tag_name }} (${{ steps.find_asset.outputs.asset_name }})"
+          git push
