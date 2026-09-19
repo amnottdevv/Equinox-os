@@ -10,6 +10,17 @@ Current version: **v0.2 Beta**
 
 ---
 
+## System requirements
+
+### Memory
+
+- **Minimum RAM while booting:** 24 MB
+- **Recommended RAM:** 64 MB
+
+The minimum configuration is intended for booting Equinox OS and using its core functionality. More RAM may be required for larger RAMFS modules, graphical applications, networking, the FAT32 disk workflow, or running DOOM.
+
+---
+
 ## Features
 
 - **Custom bootloader handoff** — GRUB loads the ELF kernel + RAMFS modules;
@@ -161,8 +172,8 @@ retries in parse-only mode: every record is still authenticated and
 encrypted (the leaf key is extracted for the ECDHE signature check),
 but the trust decision is skipped, and the shell prints a clear
 `ENCRYPTED but NOT VERIFIED` warning. Entropy comes from RDRAND when
-available (jitter mix otherwise), and certificate validity windows
-are checked against the CMOS RTC clock.
+available (jitter mix otherwise), and certificate validity windows are
+checked against the CMOS RTC clock.
 
 ## Repository layout
 
