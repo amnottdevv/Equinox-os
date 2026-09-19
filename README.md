@@ -52,6 +52,15 @@ The repository currently contains the **v0.2 Beta** feature set, including the d
 - Target architecture: 32-bit x86 / i686
 - Primary runtime: QEMU with GRUB and an emulated NE2000/IDE device
 
+## System requirements
+
+### Memory
+
+- **Minimum RAM while booting:** 24 MB
+- **Recommended RAM:** 64 MB
+
+The minimum configuration is intended for booting Equinox OS and using its core functionality. Larger memory is recommended for heavier workloads such as RAMFS-backed files, graphical apps, networking, FAT32 disk access, or running DOOM.
+
 ## Highlights
 
 ### Boot and graphics
@@ -115,7 +124,7 @@ The networking layer uses **lwIP 2.1.3** in `NO_SYS` cooperative-polling mode an
 - A small HTTP server on port 80
 - TLS 1.2 client support for `https://` through vendored BearSSL 0.6
 
-The HTTPS client uses portable BearSSL implementations because the kernel cannot assume normal hosted OS FPU/SSE state. Certificate validation uses embedded compatible trust anchors where possible and reports an explicit warning when a server chain cannot be fully verified by the supported i386 path.
+The HTTPS client uses portable BearSSL implementations because the kernel cannot assume normal hosted OS FPU/SSE state. Certificate validation uses embedded compatible trust anchors where possible.
 
 ### Applications and demos
 
@@ -157,9 +166,9 @@ The HTTPS client uses portable BearSSL implementations because the kernel cannot
 
 ### Memory layout concepts
 
-The early boot code relocates Multiboot modules before clearing `.bss`, avoiding overlap between GRUB-loaded modules and kernel memory. The project reserves separate regions for the kernel heap, MRP user arena, user stack/trampoline, module staging, and the FAT32 file-content arena.
+The early boot code relocates Multiboot modules before clearing `.bss`, avoiding overlap between GRUB-loaded modules and kernel memory. The project reserves separate regions for the kernel heap, module data, and runtime scratch areas.
 
-These addresses are part of the current QEMU-oriented memory design. If you change the kernel layout, linker script, paging map, or module sizes, review [`src/boot/start.asm`](src/boot/start.asm), [`src/linker.ld`](src/linker.ld), and the paging implementation together.
+These addresses are part of the current QEMU-oriented memory design. If you change the kernel layout, linker script, paging map, or module sizes, review [`src/boot/start.asm`](src/boot/start.asm).
 
 ## Quick start
 
@@ -363,11 +372,11 @@ src/
 └── makefile              Main build orchestration
 ```
 
-The release-source synchronization workflow keeps the source archive from a published or edited GitHub Release available under the repository's `src/` tree. Generated build output should remain separate from source files.
+The release-source synchronization workflow keeps the source archive from a published or edited GitHub Release available under the repository's `src/` tree. Generated build output should remain separate from source tree artifacts.
 
 ## Testing and verification
 
-The project contains both host-side and guest-side checks. The FAT32 test flow is especially important because it exercises the boundary between an emulated disk, the kernel's write-through implementation, and an independent host-side filesystem view.
+The project contains both host-side and guest-side checks. The FAT32 test flow is especially important because it exercises the boundary between an emulated disk, the kernel's write-through implementation, and the host-side validation scripts.
 
 Recommended validation loop:
 
@@ -406,7 +415,7 @@ This is not a hosted C++ application. Code runs without a normal operating-syste
 - direct hardware I/O and interrupt context
 - cache flushing and on-disk consistency
 
-The Makefile applies `-mgeneral-regs-only` to selected interrupt, paging, syscall, networking, and other sensitive compilation units. Changes to those units should be reviewed with the same constraint in mind.
+The Makefile applies `-mgeneral-regs-only` to selected interrupt, paging, syscall, networking, and other sensitive compilation units. Changes to those units should be reviewed with the same caution.
 
 ### Safe change workflow
 
@@ -426,7 +435,7 @@ The Makefile applies `-mgeneral-regs-only` to selected interrupt, paging, syscal
 - [doomgeneric](https://github.com/ozkl/doomgeneric) — see its included license and documentation
 - QEMU/SeaBIOS — used for emulation and testing
 
-The shareware DOOM WAD is not automatically downloaded or bundled by the build system. Provide `doom1.wad` yourself where the relevant scripts expect it, and review the applicable licensing terms before distributing artifacts.
+The shareware DOOM WAD is not automatically downloaded or bundled by the build system. Provide `doom1.wad` yourself where the relevant scripts expect it, and review the applicable licensing terms.
 
 ## Contributing
 
