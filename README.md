@@ -1,75 +1,189 @@
 # Equinox OS
 
 <p align="center">
-  <strong>A small, experimental 32-bit x86 operating system built from the ground up.</strong><br />
-  Boot through GRUB, use a framebuffer console and shell, run ring-3 programs,
-  access FAT32 storage and networking, and launch DOOM inside QEMU.
-</p>
-
-<p align="center">
   <img src="https://img.shields.io/badge/architecture-i686%20%2F%2032--bit-6f42c1?style=for-the-badge" alt="i686 32-bit" />
   <img src="https://img.shields.io/badge/kernel-monolithic-8A4FFF?style=for-the-badge" alt="Monolithic kernel" />
   <img src="https://img.shields.io/badge/boot-GRUB%20Multiboot-2D2D2D?style=for-the-badge" alt="GRUB Multiboot" />
+  <img src="https://img.shields.io/badge/language-C%2FC%2B%2B%2FASM-00599C?style=for-the-badge" alt="C C++ Assembly" />
 </p>
+
+<p align="center">
+  <img src="https://img.shields.io/github/license/equinoxosproject/Equinox-os?style=flat-square" alt="License" />
+  <img src="https://img.shields.io/github/repo-size/equinoxosproject/Equinox-os?style=flat-square" alt="Repository size" />
+  <img src="https://img.shields.io/github/commit-activity/y/equinoxosproject/Equinox-os?style=flat-square" alt="Commit activity" />
+  <img src="https://img.shields.io/github/last-commit/equinoxosproject/Equinox-os?style=flat-square" alt="Last commit" />
+  <a href="https://github.com/equinoxosproject/Equinox-os/actions/workflows/sync-release-source.yaml"><img src="https://github.com/equinoxosproject/Equinox-os/actions/workflows/sync-release-source.yaml/badge.svg" alt="Release source sync" /></a>
+</p>
+
+<p align="center">
+  <strong>A small, experimental 32-bit x86 operating system built from the ground up.</strong><br />
+  Boot into a graphical framebuffer console, use a real shell, run ring-3 programs,
+  browse a FAT32 disk, download files over HTTP(S), and launch DOOM inside QEMU.
+</p>
+
+---
 
 ## Overview
 
-Equinox OS is a freestanding hobby operating system for i686 PCs. It includes a custom monolithic kernel, GRUB Multiboot boot flow, RAMFS, FAT32 read/write support, a VESA framebuffer console, ring-3 user programs, an in-OS C compiler, networking, LVGL applications, games, and a ring-3 DOOM port.
+**Equinox OS** is a freestanding hobby operating system for i686 PCs. It uses a custom kernel written primarily in C++ and C, with an Assembly entry point, and is booted through GRUB Multiboot.
 
-> **Status:** experimental hobby OS for learning, experimentation, and emulation. It is not intended for production or security-critical workloads.
+The project is intentionally hands-on: rather than hiding behind a large runtime, Equinox implements and integrates the pieces that make a usable small OS interesting:
+
+- Multiboot handoff and early boot memory staging
+- 32-bit protected mode, GDT, TSS, paging, and ring 3 execution
+- A kernel shell with history, path handling, diagnostics, and self-tests
+- A RAM filesystem populated from GRUB modules
+- A write-through FAT32 subsystem backed by an ATA/IDE PIO driver
+- A VESA framebuffer console with VGA text fallback
+- An i386-friendly networking stack using lwIP and an NE2000 ISA device
+- An HTTP/HTTPS client, HTTP server, DNS, DHCP, ICMP, and TCP tools
+- MRP flat-binary user programs and an in-OS C compiler named `mtcc`
+- LVGL-based graphical applications
+- Games, demos, and a ring-3 DOOM port
+
+> **Status:** experimental hobby OS. It is designed for learning, experimentation, and emulation—not production hardware or security-critical workloads.
+
+## Current release
+
+The repository currently contains the **v0.2 Beta** feature set, including the disk subsystem and persistent FAT32 writes.
+
+- Release: [v0.2-Beta](https://github.com/equinoxosproject/Equinox-os/releases/tag/v0.2-Beta)
+- Source archive: attached to the release as the `SOURCE.zip` artifact
+- Target architecture: 32-bit x86 / i686
+- Primary runtime: QEMU with GRUB and an emulated NE2000/IDE device
 
 ## System requirements
 
-- **Architecture:** 32-bit x86 / i686
+### Memory
+
 - **Minimum RAM while booting:** 24 MB
 - **Recommended RAM:** 64 MB
-- **Recommended emulator:** QEMU with `qemu-system-i386`
-- **Boot method:** GRUB Multiboot
 
-The minimum RAM configuration is intended for booting and core shell functionality. More memory may be required for large RAMFS modules, graphical applications, networking, FAT32 workloads, or DOOM.
+The minimum configuration is intended for booting Equinox OS and using its core functionality. Larger memory is recommended for heavier workloads such as RAMFS-backed files, graphical apps, networking, FAT32 disk access, or running DOOM.
 
 ## Highlights
 
-- GRUB Multiboot kernel handoff and early module staging
-- 32-bit protected mode, GDT, TSS, paging, and ring-3 execution
-- VESA framebuffer console with VGA text fallback
-- RAMFS populated from GRUB modules
-- ATA/IDE PIO and FAT32 read/write support, mounted at `/mnt`
-- lwIP networking with NE2000, DHCP, DNS, ICMP, TCP, HTTP and HTTPS
-- MRP flat-binary user programs and the `mtcc` in-OS C compiler
-- LVGL GUI, file manager, settings, and code editor
-- Snake, Breakout, Pong, and ring-3 DOOM
+### Boot and graphics
+
+- GRUB Multiboot kernel handoff
+- Custom Assembly entry point in [`src/boot/start.asm`](src/boot/start.asm)
+- Early relocation of Multiboot modules into a dedicated staging area
+- Explicit `.bss` clearing before entering C++ code
+- Flat GDT with kernel code/data, user code/data, and a runtime-patched TSS descriptor
+- GRUB VBE framebuffer request with a Bochs/QEMU DISPI mode override when available
+- 1366×768×32 target mode, with hardware-dependent fallback
+- VESA framebuffer console with automatic VGA text-mode fallback
+- Purple/white Equinox boot identity and structured `[ OK ]` initialization log
+
+### Kernel and userland
+
+- Monolithic kernel architecture
+- PIT timer, IDT, PIC remapping, PS/2 keyboard, and PS/2 mouse support
+- Paging with supervisor/user page separation
+- TSS-based transitions from ring 3 back to ring 0
+- `int 0x80` syscall interface
+- MRP flat-binary loader for user programs
+- In-kernel shell with command history and canonicalized paths
+- User home directory at `/user` when the standard RAMFS layout is available
+- Built-in editor, file manager, system diagnostics, calculator, color tools, and self-tests
+
+### Filesystems and storage
+
+Equinox has two complementary storage models:
+
+1. **RAMFS** — populated at boot from GRUB Multiboot modules. Large module-backed files such as a WAD can be exposed without copying them into the small kernel heap.
+2. **FAT32** — an ATA-backed persistent filesystem mounted at `/mnt` when a compatible disk is present.
+
+The FAT32 implementation includes:
+
+- MBR partition probing
+- FAT32 BPB and FSInfo validation
+- FAT12/FAT16 shape rejection
+- 512-byte sector support
+- Lazy directory mirroring into the common `fs_node` tree
+- Case-insensitive matching for disk-backed names
+- Long file names with 8.3 alias generation and collision handling
+- Read, create, overwrite, truncate, delete, and directory creation
+- Write-through updates for FAT copies, directory entries, and FSInfo
+- Directory growth across clusters
+- Rollback handling for several mid-write failures
+- A bounded sector-granular write path
+- An 8 MiB file-content arena outside the 2 MiB kernel heap
+
+This common filesystem abstraction allows shell commands, syscalls, the GUI file manager, and applications such as DOOM to work with RAMFS and FAT32-backed files through the same tree interface.
+
+### Networking
+
+The networking layer uses **lwIP 2.1.3** in `NO_SYS` cooperative-polling mode and an emulated NE2000 ISA NIC. Available functionality includes:
+
+- DHCP
+- DNS resolution
+- ICMP ping
+- TCP connectivity probing
+- HTTP downloads with redirects
+- A small HTTP server on port 80
+- TLS 1.2 client support for `https://` through vendored BearSSL 0.6
+
+The HTTPS client uses portable BearSSL implementations because the kernel cannot assume normal hosted OS FPU/SSE state. Certificate validation uses embedded compatible trust anchors where possible.
+
+### Applications and demos
+
+- `mtcc` — compile and run C source inside the OS
+- MRP user programs and syscall demonstrations
+- Snake, Breakout, and Pong through the small Libgame framework
+- LVGL demo, file manager, settings, and code editor
+- DOOM through the `doomgeneric` port, running as a ring-3 `.mrp` program
 
 ## Quick start
 
 ### Host requirements
 
-On Linux, install GCC/G++ with 32-bit support, NASM, GRUB utilities, `xorriso`, `mtools`, Python 3, and QEMU:
+The build is primarily documented for Linux. Install:
+
+- `gcc` and `g++` with 32-bit support, or an `i686-elf` cross compiler
+- 32-bit `libgcc.a` when using host compiler mode
+- NASM
+- GRUB utilities with `i386-pc` modules
+- `xorriso`
+- `mtools`
+- Python 3
+- QEMU with `qemu-system-i386`
+
+On Debian/Ubuntu-like systems, a typical starting point is:
 
 ```sh
 sudo apt install build-essential gcc-multilib g++-multilib \
   nasm grub-pc-bin grub-common xorriso mtools python3 qemu-system-x86
 ```
 
-### Build and run
+### Build the ISO
 
 ```sh
 cd src
 make
-make run
 ```
 
-The generated ISO is `src/dist/equinox.iso`.
+The main artifacts are generated under `src/dist/`:
 
-To build and run with the demo FAT32 disk:
+```text
+src/dist/kernel.elf
+src/dist/equinox.iso
+```
+
+### Run in QEMU
 
 ```sh
 cd src
-make diskimg
-make run-disk
+make run
 ```
 
-Manual QEMU invocation:
+The default network configuration emulates an NE2000 device and forwards the guest HTTP server to the host:
+
+```text
+http://localhost:8080/
+```
+
+Equivalent manual invocation:
 
 ```sh
 qemu-system-i386 \
@@ -79,174 +193,175 @@ qemu-system-i386 \
   -device ne2k_isa,netdev=net0,iobase=0x300,irq=9
 ```
 
-## Shell command reference
+### Run with a FAT32 disk
 
-The shell supports command history with the **Up/Down** arrow keys. The default prompt starts in `/user` when that directory exists. Commands with paths support relative paths, absolute paths, `.`, and `..`.
+Build the demo disk and boot with it attached:
 
-### General and display
-
-| Command | Description |
-| --- | --- |
-| `help` | Show the complete command list |
-| `clear` | Clear the screen |
-| `echo` | Enter echo mode and print a message |
-| `info` | Show OS version, build information, RAM, and heap usage |
-| `cpu` | Show the CPU vendor string |
-| `color <fg> [bg]` | Set foreground and optional background color |
-| `color list` | List available colors |
-| `color reset` | Restore white text on a black background |
-| `clock` | Show the real-time clock and uptime |
-| `reboot` | Restart the system |
-
-### Filesystem and navigation
-
-| Command | Description |
-| --- | --- |
-| `ls` | List the current directory |
-| `ls -l` | List directory contents with details |
-| `pwd` | Print the working directory |
-| `cd <path>` | Change directory |
-| `tree` | Display the directory tree |
-| `cdir <name>` | Create a directory |
-| `cfile <name>` | Create an empty file |
-| `ccfile <name> << "content"` | Create a file with text |
-| `save <name> << "content"` | Create or overwrite a file |
-| `cat <name>` | Display file contents |
-| `xxd <file> [n]` | Hex dump the first `n` bytes; default is 64 |
-| `rm <name>` | Delete a file or empty directory |
-| `rmdir <name>` | Delete an empty directory |
-| `edit <file>` | Open the built-in text editor |
-| `mount` | Mount the FAT32 volume at `/mnt` |
-| `umount` | Unmount the FAT32 volume |
-| `diskinfo` | Show ATA drives and FAT32 volume details |
-
-### Programs, compiler, and GUI
-
-| Command | Description |
-| --- | --- |
-| `run <path.mrp> [args]` | Run an MRP program with arguments |
-| `./name.mrp [args]` | Run a local MRP program; `.mrp` may be auto-appended |
-| `<tool> [args]` | Run a tool found in `/`, `/bin`, `/equinox/tools`, or `/equinox/games` |
-| `mtcc <file.c>` | Compile and run C from any directory |
-| `mtcc --debug <file.c>` | Compile and run with verbose compiler output |
-| `mtcc -c <file.c>` | Compile to `<file>.mrp`, then run it |
-| `settings` | Open the system settings UI |
-| `fm [path]` | Open the graphical file manager |
-| `gui` | Launch the LVGL GUI demo when LVGL is available |
-| `doom [args]` | Run DOOM; requires `doom1.wad` |
-
-Examples:
-
-```text
-run hello.mrp
-./hello
-mtcc /test/hello.c
-mtcc --debug main.c
-mtcc -c test.c
-fm /user
- doom -warp 1
+```sh
+cd src
+make diskimg
+make run-disk
 ```
 
-### Diagnostics and tests
+The demo image is a 64 MiB FAT32 disk with an MBR and sample files. When detected, it is mounted at `/mnt`.
+
+Useful commands inside the OS:
+
+```text
+ls /mnt
+cat /mnt/README.TXT
+diskinfo
+cd /mnt
+save hello.txt << "hello from Equinox OS"
+mget http://10.0.2.2:8022/data.bin
+doom -iwad /mnt/doom1.wad
+```
+
+## Build targets
+
+Run these from `src/`:
+
+| Command | Purpose |
+| --- | --- |
+| `make` | Build the kernel and bootable ISO |
+| `make pack` | Compile and pack user tools, games, and test files |
+| `make mtcc` | Pack the root `mtcc.c` compiler into an MRP program |
+| `make doom` | Build and pack the DOOM MRP program |
+| `make diskimg` | Create the 64 MiB FAT32 demo disk |
+| `make run` | Boot the ISO with QEMU user-mode networking |
+| `make run-disk` | Boot ISO plus the FAT32 disk image |
+| `make test` | Run host-side compiler tests |
+| `make test-fat32` | Run FAT32 QEMU tests and host-side mtools checks |
+| `make test-doom-disk` | Verify DOOM loading from the FAT32 disk |
+| `make iso` | Rebuild only the ISO target |
+| `make clean` | Remove generated build, distribution, and ISO directories |
+
+## Shell command reference
+
+The shell is part of the kernel and provides both everyday filesystem commands and low-level diagnostics.
+
+### Files and navigation
 
 | Command | Description |
 | --- | --- |
-| `calc <a> <op> <b>` | Calculate using `+`, `-`, `*`, or `/` |
-| `hex <num>` | Convert decimal to hexadecimal |
-| `dec <hex>` | Convert hexadecimal to decimal |
-| `mem <addr>` | Read a 32-bit value from a memory address |
-| `testconv` | Test integer conversion helpers |
-| `tick` | Show the timer tick count |
-| `sleep <ms>` | Sleep for a number of milliseconds |
-| `malloc` | Show heap statistics |
-| `alloc <bytes>` | Allocate memory for a heap test |
-| `free <addr>` | Exercise the dummy free path |
-| `testvector` | Test the dynamic vector implementation |
-| `random` | Test the random-number generator |
-| `math` | Test `sin`, `cos`, and `tan` |
-| `teststr` | Test string splitting and formatting helpers |
-| `mouse` | Show PS/2 mouse driver diagnostics |
-| `ringstats` | Show keyboard, mouse, and audio ring-buffer statistics |
-| `ring` | Show the current CPU privilege level, ring 0 or ring 3 |
-| `memmap` | Show the memory map and ring-3 status |
-| `syscalls` | List the `int 0x80` syscall ABI |
-| `sctest` | Test the syscall layer from the shell |
-| `panic [message]` | Trigger a kernel panic for testing |
+| `help` | Show the full command list |
+| `ls`, `ls -l` | List the current directory or detailed directory listing |
+| `pwd` | Print the working directory |
+| `cd <path>` | Change directory, including `.` and `..` handling |
+| `tree` | Print a directory tree |
+| `cat <file>` | Print a file byte-by-byte |
+| `xxd <file> [n]` | Hex dump the first `n` bytes |
+| `cfile <name>` | Create an empty file |
+| `ccfile <name> << "text"` | Create a file with content |
+| `save <name> << "text"` | Create or overwrite a file |
+| `cdir <name>` | Create a directory |
+| `rm <name>` | Delete a file or empty directory |
+| `edit <file>` | Open the built-in editor |
+| `mount` / `umount` | Attach or detach the FAT32 volume at `/mnt` |
+| `diskinfo` | Show ATA and FAT32 layout/cache information |
 
-### System utility commands
+### Programs and debugging
 
 | Command | Description |
 | --- | --- |
-| `sys cwd` | Show the syscall working directory |
-| `sys mkdir <name>` | Create a directory through the syscall utility layer |
-| `sys touch <name>` | Create a file through the syscall utility layer |
-| `sys rm <name>` | Delete a file through the syscall utility layer |
+| `run <program.mrp> [args]` | Run an MRP program |
+| `./program.mrp [args]` | Run a relative MRP path |
+| `mtcc <file.c>` | Compile and run C in the guest |
+| `doom [args]` | Launch DOOM; requires `doom1.wad` |
+| `info` | Show OS and heap information |
+| `memmap` | Print memory map and ring-3 status |
+| `ring` | Show current privilege level |
+| `syscalls` | List the syscall ABI |
+| `sctest` | Exercise the `int 0x80` syscall path |
+| `panic [message]` | Deliberately exercise kernel panic handling |
 
-### Audio
-
-| Command | Description |
-| --- | --- |
-| `beep` | Play a 440 Hz beep for 500 ms |
-| `song` | Queue “Twinkle Twinkle” for background playback |
-
-### Networking
+### Network
 
 | Command | Description |
 | --- | --- |
 | `ifconfig` | Show network interface information |
-| `netdbg` | Probe and debug the NE2000 network device |
-| `ping <host>` | Send four ICMP pings to an IP or hostname |
-| `tcpping <host> [port]` | Test TCP connectivity; useful with QEMU user networking |
-| `dns <hostname>` | Resolve a hostname through the configured DNS server |
-| `mget <url> [-port <n>]` | Download an HTTP/HTTPS file into the current directory |
-| `httpd` | Show or start the in-OS HTTP server on port 80 |
+| `ping <host>` | Send ICMP echo requests |
+| `tcpping <host> [port]` | Test TCP connectivity and RTT |
+| `dns <hostname>` | Resolve a hostname |
+| `mget <url> [-port n]` | Download an HTTP(S) resource |
+| `httpd` | Show/start the in-OS HTTP server |
 
-`mget` accepts `http://`, `https://`, and host/path URLs. The port priority is:
+### Additional kernel shell commands from `kernel.cpp`
+
+The shell contains several builtins that are useful for debugging, math, networking, and testing. These commands are implemented in `src/kernel/kernel.cpp` and are part of the runtime shell feature set:
+
+| Command | Description |
+| --- | --- |
+| `clear` | Clear the display |
+| `echo` | Enter echo mode and print a message entered by the user |
+| `cpu` | Show the detected CPU vendor string |
+| `color <fg> [bg]` | Change the active terminal color; use `color list` to see all palette entries |
+| `color list` | Show all supported VGA colors |
+| `color reset` | Reset terminal colors to white-on-black |
+| `calc <a> <op> <b>` | Simple calculator for `+`, `-`, `*`, and `/` |
+| `hex <num>` | Convert a decimal number to hexadecimal |
+| `dec <hex>` | Convert a hexadecimal number to decimal |
+| `mem <addr>` | Read a 32-bit memory value from an address |
+| `alloc <bytes>` | Allocate test memory from the kernel heap and print the first bytes |
+| `free <addr>` | Call the free path for a test pointer |
+| `tick` | Show the current timer tick count |
+| `sleep <ms>` | Delay for a given number of milliseconds |
+| `malloc` | Show heap statistics |
+| `testconv` | Exercise the integer conversion helpers |
+| `testvector` | Test the dynamic vector implementation |
+| `random` | Test the random number generator |
+| `math` | Print sample `sin`, `cos`, and `tan` values |
+| `beep` | Play a 440 Hz beep for 500 ms |
+| `song` | Queue the Twinkle Twinkle melody for background playback |
+| `ringstats` | Show keyboard, mouse, and audio ring-buffer statistics |
+| `mouse` | Show the PS/2 mouse IRQ count and last packet |
+| `settings` | Open the system settings UI |
+| `fm [path]` | Open the file manager UI |
+| `clock` | Show clock information and uptime |
+| `sys <cmd>` | System helper commands: `cwd`, `mkdir`, `touch`, and `rm` |
+| `teststr` | Exercise string splitting and formatting helpers |
+| `reboot` | Restart the system |
+| `netdbg` | Probe the NE2000 device and show low-level debug info |
+| `gui` | Launch the LVGL demo when supported |
+
+`mget` supports `http://`, `https://`, redirects, and an explicit `-port` override. The priority is:
 
 ```text
 -port option > port in URL > scheme default
 ```
 
-HTTP uses port 80 and HTTPS uses port 443. In QEMU, forward the guest HTTP server with `hostfwd=tcp::8080-:80`, then browse to `http://localhost:8080/`.
-
-## Build targets
-
-Run these commands from `src/`:
-
-| Command | Purpose |
-| --- | --- |
-| `make` | Build the kernel and bootable ISO |
-| `make pack` | Pack user tools, games, and test files |
-| `make mtcc` | Build and pack the in-OS C compiler |
-| `make doom` | Build and pack the DOOM MRP program |
-| `make diskimg` | Create the 64 MiB FAT32 demo disk |
-| `make run` | Boot the ISO with QEMU networking |
-| `make run-disk` | Boot the ISO with the FAT32 disk attached |
-| `make test` | Run host-side compiler tests |
-| `make test-fat32` | Run FAT32 QEMU and host-side checks |
-| `make test-doom-disk` | Verify DOOM loading from the FAT32 disk |
-| `make iso` | Rebuild only the ISO |
-| `make clean` | Remove generated build output |
+HTTP defaults to port 80 and HTTPS to port 443.
 
 ## Repository layout
 
 ```text
 src/
-├── boot/          Multiboot entry point and GRUB configuration
-├── kernel/        Kernel, shell, drivers, memory, filesystem, UI, and syscalls
-├── mrp_user/      Ring-3 tools and MRP programs
-├── games/         Snake, Breakout, and Pong
-├── Libgame/       Small game framework
-├── doomgeneric/   DOOM portability layer and Equinox port
-├── test/          C samples and test inputs
-├── third_party/   lwIP, BearSSL, LVGL, and other dependencies
-├── scripts/       Build, packaging, image, and QEMU test scripts
-├── mtcc.c         In-OS C compiler source
-├── linker.ld      Kernel linker script
-└── makefile       Main build orchestration
+├── boot/                 Multiboot entry point and GRUB configuration
+├── kernel/
+│   ├── kernel.cpp        Boot sequence and kernel shell
+│   ├── library/          Memory, filesystem, syscalls, drivers, UI, libc
+│   │   ├── fs_ram.cpp     RAMFS and RAMFS/FAT32 bridge
+│   │   ├── fs_fat32.cpp  FAT32 mount, cache, reads, and lazy mirror
+│   │   └── fs_fat32_write.cpp  FAT32 write-through operations
+│   ├── net/              lwIP glue, NE2000, HTTP server, TLS client
+│   └── gui/              LVGL integration and graphical applications
+├── mrp_user/             Ring-3 tools and MRP packer
+├── games/                MRP games using Libgame
+├── Libgame/              Small game framework
+├── doomgeneric/          DOOM portability layer and Equinox port
+├── test/                 C samples and test inputs
+├── third_party/          lwIP, BearSSL, LVGL, and other dependencies
+├── scripts/              Build, packaging, image, and QEMU test scripts
+├── mtcc.c                Canonical source for the in-OS C compiler
+├── linker.ld             Kernel linker script
+└── makefile              Main build orchestration
 ```
 
-## Testing
+The release-source synchronization workflow keeps the source archive from a published or edited GitHub Release available under the repository's `src/` tree. Generated build output should remain separate from source tree artifacts.
+
+## Testing and verification
+
+The project contains both host-side and guest-side checks. The FAT32 test flow is especially important because it exercises the boundary between an emulated disk, the kernel's write-through implementation, and the host-side validation scripts.
 
 Recommended validation loop:
 
@@ -260,7 +375,7 @@ make test
 make test-fat32
 ```
 
-For ring-3, paging, syscall, or executable-loader changes, also run:
+For changes involving ring 3, paging, syscalls, or executable loading, also run the QEMU smoke tests and manually verify:
 
 ```text
 ring
@@ -269,6 +384,72 @@ sctest
 run hello.mrp
 ```
 
+For changes involving boot modules or GRUB configuration, verify that the boot log lists the expected files and that `.mrp` programs are available from the shell.
+
+## Development notes
+
+### Freestanding constraints
+
+This is not a hosted C++ application. Code runs without a normal operating-system runtime, standard library, process model, or libc. Be careful with:
+
+- stack usage, especially in interrupt-sensitive code
+- implicit compiler-generated runtime calls
+- floating-point/SSE instructions in kernel and interrupt paths
+- ownership of heap memory versus zero-copy module memory
+- 32-bit pointer assumptions
+- direct hardware I/O and interrupt context
+- cache flushing and on-disk consistency
+
+The Makefile applies `-mgeneral-regs-only` to selected interrupt, paging, syscall, networking, and other sensitive compilation units. Changes to those units should be reviewed with the same caution.
+
+### Safe change workflow
+
+1. Make one focused change.
+2. Rebuild from a clean tree when changing build, linker, boot, or memory code.
+3. Run the relevant host tests.
+4. Boot under QEMU and inspect the complete boot log.
+5. Exercise the affected shell command or syscall.
+6. For storage changes, reboot with the same disk image and verify persistence.
+7. For userland changes, test both successful execution and an intentional fault path.
+
+## Third-party software and licensing
+
+- [lwIP 2.1.3](https://savannah.nongnu.org/projects/lwip/) — BSD-3-Clause
+- [BearSSL 0.6](https://bearssl.org/) — MIT
+- [LVGL](https://lvgl.io/) — MIT
+- [doomgeneric](https://github.com/ozkl/doomgeneric) — see its included license and documentation
+- QEMU/SeaBIOS — used for emulation and testing
+
+The shareware DOOM WAD is not automatically downloaded or bundled by the build system. Provide `doom1.wad` yourself where the relevant scripts expect it, and review the applicable licensing terms.
+
+## Contributing
+
+Contributions are welcome, especially in these areas:
+
+- hardware abstraction and additional emulated devices
+- filesystem robustness and recovery tooling
+- syscall documentation and userland examples
+- QEMU regression tests
+- build reproducibility and cross-toolchain support
+- shell usability and documentation
+- performance measurements for ATA, FAT32, networking, and framebuffer paths
+
+When opening an issue or pull request, include:
+
+- host operating system and toolchain versions
+- QEMU version and command line
+- exact build target used
+- complete boot log or failure output
+- whether the issue reproduces with ISO-only and disk-backed boots
+- a minimal reproduction when possible
+
 ## License
 
-Equinox OS code is provided under the repository's [MIT License](LICENSE), except for third-party components and assets, which retain their respective licenses.
+Equinox OS code is provided under the repository's [MIT License](LICENSE), except for third-party components and assets which retain their respective licenses.
+
+---
+
+<p align="center">
+  Built to understand the machine one subsystem at a time.<br />
+  <strong>Equinox OS</strong> — kernel, shell, disk, network, and games in one small experiment.
+</p>
