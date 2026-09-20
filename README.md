@@ -101,12 +101,16 @@ qemu-system-i386 -m 64 -boot order=d -cdrom equinox.iso \
     -drive file=disk.img,format=raw,if=ide,index=0,media=disk \
     -netdev user,id=net0,hostfwd=tcp::8080-:80 \
     -device ne2k_isa,netdev=net0,iobase=0x300,irq=9
-```
-
+``` 
 - `-boot order=d` boots the ISO. The demo disk carries an MBR without boot code.
 - Without `disk.img`, drop the `-drive` lines: the OS runs entirely from the RAM filesystem.
 - The guest gets `10.0.2.15` by DHCP; the QEMU host is `10.0.2.2`, DNS is `10.0.2.3`.
   The guest web server is reachable from the host at `http://localhost:8080/`.
+
+### minimum spec (requirements) 
+- OS while booting with `24Mb` ram
+- recommended ram is `64+`
+
 
 ### First five minutes
 
