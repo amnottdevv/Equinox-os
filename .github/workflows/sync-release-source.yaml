@@ -7,6 +7,11 @@ on:
       - edited
       - prereleased
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag to synchronize"
+        required: false
+        default: "v0.2-Beta"
 
 permissions:
   contents: write
@@ -14,35 +19,46 @@ permissions:
 jobs:
   sync-source:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
+          ref: ${{ github.event.repository.default_branch }}
           fetch-depth: 0
+          token: ${{ github.token }}
 
       - name: Set release tag
         id: rel
         run: |
+          set -euo pipefail
+
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "tag=${{ github.event.inputs.release_tag || 'v0.2-Beta' }}" >> "$GITHUB_OUTPUT"
+            echo "tag=${{ github.event.inputs.release_tag }}" >> "$GITHUB_OUTPUT"
           else
             echo "tag=${{ github.event.release.tag_name }}" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Find zip asset with "SOURCE" in its name
+      - name: Find zip asset with "source" in its name
         id: find_asset
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+
           RELEASE_TAG="${{ steps.rel.outputs.tag }}"
           echo "Release: $RELEASE_TAG"
 
-          ASSET_NAME=$(gh release view "$RELEASE_TAG" \
-            --repo "${{ github.repository }}" \
-            --json assets \
-            --jq '.assets[] | select(.name | test("source"; "i")) | select(.name | test("\\.zip$"; "i")) | .name' \
-            | head -n1)
+          ASSET_NAME="$(
+            gh release view "$RELEASE_TAG" \
+              --repo "${{ github.repository }}" \
+              --json assets \
+              --jq '.assets[]
+                | select(.name | test("source"; "i"))
+                | select(.name | test("\\.zip$"; "i"))
+                | .name' \
+              | head -n1
+          )"
 
           if [ -z "$ASSET_NAME" ]; then
             echo "No zip asset with 'source' in its name found in this release. Skipping."
@@ -59,6 +75,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
+
           gh release download "${{ steps.rel.outputs.tag }}" \
             --repo "${{ github.repository }}" \
             --pattern "${{ steps.find_asset.outputs.asset_name }}" \
@@ -68,13 +86,18 @@ jobs:
         if: steps.find_asset.outputs.found == 'true'
         run: |
           set -euo pipefail
+
           rm -rf src
           mkdir -p src
-          TMP_DIR=$(mktemp -d)
+
+          TMP_DIR="$(mktemp -d)"
+          trap 'rm -rf "$TMP_DIR" downloaded_source.zip' EXIT
+
           unzip -q downloaded_source.zip -d "$TMP_DIR"
 
-          ENTRY_COUNT=$(find "$TMP_DIR" -mindepth 1 -maxdepth 1 | wc -l)
-          FIRST_ENTRY=$(find "$TMP_DIR" -mindepth 1 -maxdepth 1)
+          ENTRY_COUNT="$(find "$TMP_DIR" -mindepth 1 -maxdepth 1 | wc -l)"
+          FIRST_ENTRY="$(find "$TMP_DIR" -mindepth 1 -maxdepth 1 | head -n1)"
+
           if [ "$ENTRY_COUNT" -eq 1 ] && [ -d "$FIRST_ENTRY" ]; then
             SRC_ROOT="$FIRST_ENTRY"
           else
@@ -82,18 +105,25 @@ jobs:
           fi
 
           cp -r "$SRC_ROOT"/. src/
-          rm -rf "$TMP_DIR" downloaded_source.zip
 
       - name: Commit and push
         if: steps.find_asset.outputs.found == 'true'
         run: |
           set -euo pipefail
+
+          BRANCH="${{ github.event.repository.default_branch }}"
+
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+
           git add src/
+
           if git diff --cached --quiet; then
             echo "No changes in src/ — nothing to commit."
             exit 0
           fi
-          git commit -m "chore: sync src/ from release ${{ steps.rel.outputs.tag }} (${{ steps.find_asset.outputs.asset_name }})"
-          git push
+
+          git commit \
+            -m "chore: sync src/ from release ${{ steps.rel.outputs.tag }} (${{ steps.find_asset.outputs.asset_name }})"
+
+          git push origin "HEAD:${BRANCH}"
