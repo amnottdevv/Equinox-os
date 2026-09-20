@@ -54,6 +54,38 @@ void term_cursor_tick(void);
 // VESA framebuffer (if available) instead of VGA text buffer.
 void init_display(void);
 
+// ----- MULTI-CONSOLE (Phase A — multitasking) -----
+// Every task owns a virtual console (its own cell mirror + cursor
+// state). Only the ACTIVE console is rendered to the screen and
+// receives keyboard input. F1 = new console (new shell),
+// F2 = previous console.
+int  console_create(void);          // new console id, -1 = table full
+void console_free(int id);          // release the console slot
+int  console_active_id(void);       // id of the visible/focused console
+int  console_count(void);            // number of consoles in use (Phase C: switch)
+int  console_next_used(int from, int dir);   // next used id (dir +/-1)
+void console_activate(int id);      // switch the visible console (full re-render)
+
+// Per-console PIXEL canvas (graphics program isolation). A console on
+// which a user program has drawn (fillrect/putpixel/blit) keeps a
+// full framebuffer snapshot while it is NOT the active console, and
+// the snapshot is restored when focus returns — the frozen game
+// reappears exactly as it was left, instead of leaking onto other
+// terminals. The buffer lives in the user physical pool (identity
+// mapped), so allocation can fail gracefully under memory pressure
+// (the console then falls back to plain text re-rendering).
+void console_canvas_mark(void);               // active console drew pixels
+void console_canvas_invalidate(int console_id); // drop the canvas (game exited)
+
+// The CURRENT output console = owned by the running task (printf
+// writes to the running task's console, not necessarily the visible
+// one). Called by the scheduler after each context switch.
+void term_set_output(int id);
+
+// Force output to the ACTIVE console (used by panic so it is visible).
+void term_force_active_output(void);
+
+
 // ----- Keyboard input (interrupt-driven buffer) -----
 int keyboard_has_data(void);      // from idt.cpp
 uint8_t keyboard_read_byte(void); // from idt.cpp (blocking, busy-wait)
@@ -103,8 +135,11 @@ void gets_history(char* buffer, int max);
 // ----- Port I/O -----
 uint8_t inb(uint16_t port);
 void outb(uint16_t port, uint8_t val);
-uint16_t inw(uint16_t port);      // FIX(V1b): port 16-bit (VBE DISPI data)
+uint16_t inw(uint16_t port);
 void outw(uint16_t port, uint16_t val);
+/* v0.3 (FR-12): 32-bit port I/O — PCI config space (0xCF8/0xCFC) */
+uint32_t inl(uint16_t port);
+void outl(uint16_t port, uint32_t val);
 
 // ----- System -----
 void reboot(void);

@@ -83,9 +83,12 @@
 //               unary - + * &, ++/-- (pre & post), ternary ?:
 //    globals: scalars + arrays + constant/list/string initializers (zero-init area)
 //    functions: forward prototypes, recursion, max 8 params
-//  NOT supported (v0.1): struct/union, float/double, unsigned semantics
+//  NOT supported: struct/union, float/double, unsigned semantics
 //    (int is processed as signed), switch, 2D arrays, variadic functions,
-//    sizeof, typedef, preprocessor, static locals, long/short.
+//    sizeof, typedef, static locals, long/short.
+//  The MINI PREPROCESSOR exists since v10.8 (object-like #define,
+//    #include <morph.h>/<multitasking.h>/<fileio.h>/..., #ifdef/#ifndef)
+//    — "no preprocessor" claims in old docs are stale.
 //
 //  RUNTIME LIMITATIONS (stated honestly — no false expectations):
 //    - exec() from compiled code is ALWAYS rejected (SYS_EBUSY -9,
@@ -172,6 +175,29 @@
 #define SYS_MOUSEDELTA 33
 #define SYS_NETINFO   34
 #define SYS_NETPING   35
+/* Phase B (multitasking) — keep in sync with kernel/library/header/syscall.h */
+#define SYS_SPAWN     36
+#define SYS_YIELD     37
+#define SYS_TASKINFO  38   /* Phase C */
+#define SYS_KILL      39   /* Phase C */
+/* v0.3 FR-01/FR-03 — full file + memory syscalls */
+#define SYS_OPEN2     40
+#define SYS_UNLINK    41
+#define SYS_MKDIR     42
+#define SYS_RMDIR     43
+#define SYS_RENAME    44
+#define SYS_STAT      45
+#define SYS_READDIR   46
+#define SYS_FSTAT     47
+#define SYS_FREE      48
+/* v0.3 (FR-02/05) - process & memory model */
+#define SYS_WAIT      49
+#define SYS_PIPE      50
+#define SYS_MEMINFO   51
+#define SYS_SPAWN2    52
+/* v0.3 (FR-17/18) - per-task graphics */
+#define SYS_SETCLIP   53
+#define SYS_DRAWLINE  54
 
 #else // ---- build .mrp (Equinox OS) ----
 #include "../kernel/library/header/syscall.h"  // syscall numbers + int $0x80 wrappers
@@ -266,6 +292,9 @@ struct Func {
     // (forward calls). When the body starts emitting, all are filled in.
     uint16_t pending[24];
     uint8_t  pending_count;
+    // v0.3 FR-20: source line of the FIRST call (for the
+    // undefined-reference error message).
+    uint16_t first_call_line;
 };
 
 struct LVar {
@@ -918,8 +947,9 @@ static const Builtin BUILTINS[] = {
     { "getargs",  SYS_GETARGS,  2, { TY_INT,  0, 0, 0 } },
     { "mkfile",   SYS_MKFILE,   3, { TY_INT,  0, 0, 0 } },
     // ---- Morph.h-compatible file API (same names as the SDK header) ----
-    // mtcc has no preprocessor, so #include <Morph.h> is impossible in-OS;
-    // these built-ins give mtcc programs the exact Morph.h file names.
+    // The mini preprocessor splices <morph.h>-family headers since v10.8,
+    // but programs compiled WITHOUT includes still see these builtins —
+    // they give mtcc programs the exact Morph.h file names directly.
     { "file_open",     SYS_OPEN,      1, { TY_INT, 0, 0, 0 } },
     { "file_read",     SYS_READ,      3, { TY_INT, 0, 0, 0 } },
     { "file_close",    SYS_CLOSE,     1, { TY_INT, 0, 0, 0 } },
@@ -950,12 +980,45 @@ static const Builtin BUILTINS[] = {
     // heap (malloc/free/calloc/realloc in user space) carves chunks
     // out of this. Double-underscore name so user code never collides.
     { "__arena_alloc", SYS_MALLOC,   1, { TY_INT, 1, 0, 0 } },  // (bytes) -> int*
-    // __sys_printf: printf via SYS_PRINTF — the prelude wrapper
-    // printf() collects up to 3 args into an int[3] then calls this.
+    // __sys_printf: legacy kernel-side printf (SYS_PRINTF) — kept for
+    // compatibility. Since v0.3 FR-19 the prelude printf() renders
+    // LOCALLY via __vsnprintf (up to 7 conversions) and does not use
+    // this builtin; old programs calling it directly still work.
     { "__sys_printf",  SYS_PRINTF,   2, { TY_INT, 0, 0, 0 } },  // (fmt, int* args)
     // ring: privilege level of the CALLER (0 shell/kernel, 3 user
     // program) — lets a program prove it runs unprivileged.
     { "ring",          SYS_RINGINFO, 0, { TY_INT, 0, 0, 0 } },
+    // ---- Phase B: multitasking (used by the multitasking.h prelude) ----
+    // __task_spawn2(path, arena_hint): 2 mandatory args (mtcc has no
+    // default-args) — the prelude provides the task_spawn(path) wrapper.
+    { "__task_spawn2", SYS_SPAWN,    2, { TY_INT, 0, 0, 0 } },
+    { "__task_yield0", SYS_YIELD,    0, { TY_INT, 0, 0, 0 } },
+    // Phase C: kill(pid) + taskinfo(u32* out)
+    { "__task_kill1",  SYS_KILL,     1, { TY_INT, 0, 0, 0 } },
+    { "__task_info1",  SYS_TASKINFO, 1, { TY_INT, 0, 0, 0 } },
+    // ---- v0.3 FR-01: full file syscalls (used by the fileio.h prelude) ----
+    // __sys_open2(path, flags) — flags = F_* constants from fileio.h
+    { "__sys_open2",   SYS_OPEN2,   2, { TY_INT, 0, 0, 0 } },
+    { "__sys_unlink1", SYS_UNLINK,  1, { TY_INT, 0, 0, 0 } },
+    { "__sys_mkdir1",  SYS_MKDIR,   1, { TY_INT, 0, 0, 0 } },
+    { "__sys_rmdir1",  SYS_RMDIR,   1, { TY_INT, 0, 0, 0 } },
+    { "__sys_rename2", SYS_RENAME,  2, { TY_INT, 0, 0, 0 } },
+    { "__sys_stat2",   SYS_STAT,    2, { TY_INT, 0, 0, 0 } },  // (path, int* st)
+    { "__sys_readdir2",SYS_READDIR, 2, { TY_INT, 0, 0, 0 } },  // (fd, char* de)
+    { "__sys_fstat2",  SYS_FSTAT,   2, { TY_INT, 0, 0, 0 } },  // (fd, int* st)
+    // v0.3 FR-03: free one SYS_MALLOC/__arena_alloc block
+    { "__sys_free1",   SYS_FREE,    1, { TY_INT, 0, 0, 0 } },
+    // ---- v0.3: wait/pipe/meminfo/spawn2 (multitasking.h prelude) ----
+    { "__task_wait2",  SYS_WAIT,    2, { TY_INT, 0, 0, 0 } },  // (pid, int* status)
+    { "__pipe_cre1",   SYS_PIPE,    1, { TY_INT, 0, 0, 0 } },  // (int fds[2])
+    { "__meminfo1",    SYS_MEMINFO, 1, { TY_INT, 0, 0, 0 } },  // (int w[6])
+    { "__task_spawn3", SYS_SPAWN2,  3, { TY_INT, 0, 0, 0 } },  // (path,hint,args)
+    // ---- v0.3 (FR-17): per-task graphics window + line ----
+    // set_clip(x | w<<16, y | h<<16) confines this task's draws; the
+    // prelude wrapper takes the same packed form as fill_rect.
+    { "__gfx_clip2",   SYS_SETCLIP,  2, { TY_INT, 0, 0, 0 } },
+    // draw_line(x0|y0<<16, x1|y1<<16, color) - Bresenham, clipped.
+    { "__gfx_line3",   SYS_DRAWLINE, 3, { TY_INT, 0, 0, 0 } },
 };
 #define BUILTIN_COUNT (sizeof(BUILTINS) / sizeof(BUILTINS[0]))
 
@@ -986,9 +1049,14 @@ static const char* const MORPH_PRELUDE[] = {
     "#define MORPH_H_INCLUDED\n",
     "/* morph.h - Equinox OS libc prelude (mtcc in-OS build)\n",
     "   Spliced by: #include <morph.h> (alias <stdio.h> <stdlib.h> <string.h>)\n",
-    "   printf family: max 3 conversion args (kernel ABI). Generic qsort\n",
-    "   needs function pointers (not yet in the mtcc subset): use qsort_int /\n",
-    "   qsort_str. %u is rendered signed (mtcc has no unsigned type). */\n",
+    "   v0.3 FR-19: printf/sprintf/snprintf render LOCALLY (up to 5\n",
+    "   conversion args: %d %i %u %x %X %o %p %c %s, width/pad/left-align).\n",
+    "   %u is a TRUE unsigned render (binary long division by 10 — the\n",
+    "   full 0..4294967295 range without an unsigned type). Also added:\n",
+    "   sscanf, ctype, strdup/strtok/strspn/strcspn/strcasecmp, abs,\n",
+    "   rand/srand, puts/fputs/fputc/fgetc, remove/rename, strerror.\n",
+    "   Generic qsort needs function pointers (not yet in the mtcc\n",
+    "   subset): use qsort_int / qsort_str. */\n",
     "\n",
     "#define NULL 0\n",
     "#define EOF (-1)\n",
@@ -1201,6 +1269,59 @@ static const char* const MORPH_PRELUDE[] = {
     "void utoa(int v, char* b, int base) {\n",
     "    itoa(v, b, base);\n",
     "}\n",
+    "/* ===================== ctype (FR-19) ===================== */\n",
+    "int isspace(int c) {\n",
+    "    if (c == ' ' || c == '\\t' || c == '\\n' || c == '\\r' || c == 11 || c == 12) return 1;\n",
+    "    return 0;\n",
+    "}\n",
+    "int isdigit(int c) {\n",
+    "    if (c >= '0' && c <= '9') return 1;\n",
+    "    return 0;\n",
+    "}\n",
+    "int isalpha(int c) {\n",
+    "    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) return 1;\n",
+    "    return 0;\n",
+    "}\n",
+    "int isalnum(int c) {\n",
+    "    if (isalpha(c) || isdigit(c)) return 1;\n",
+    "    return 0;\n",
+    "}\n",
+    "int isupper(int c) {\n",
+    "    if (c >= 'A' && c <= 'Z') return 1;\n",
+    "    return 0;\n",
+    "}\n",
+    "int islower(int c) {\n",
+    "    if (c >= 'a' && c <= 'z') return 1;\n",
+    "    return 0;\n",
+    "}\n",
+    "int isxdigit(int c) {\n",
+    "    if (isdigit(c) || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) return 1;\n",
+    "    return 0;\n",
+    "}\n",
+    "int isprint(int c) {\n",
+    "    if (c >= 32 && c < 127) return 1;\n",
+    "    return 0;\n",
+    "}\n",
+    "int isgraph(int c) {\n",
+    "    if (c > 32 && c < 127) return 1;\n",
+    "    return 0;\n",
+    "}\n",
+    "int iscntrl(int c) {\n",
+    "    if (c < 32 || c == 127) return 1;\n",
+    "    return 0;\n",
+    "}\n",
+    "int ispunct(int c) {\n",
+    "    if (isgraph(c) && !isalnum(c)) return 1;\n",
+    "    return 0;\n",
+    "}\n",
+    "int toupper(int c) {\n",
+    "    if (c >= 'a' && c <= 'z') return c - 32;\n",
+    "    return c;\n",
+    "}\n",
+    "int tolower(int c) {\n",
+    "    if (c >= 'A' && c <= 'Z') return c + 32;\n",
+    "    return c;\n",
+    "}\n",
     "/* ===================== misc ===================== */\n",
     "void abort() {\n",
     "    print(\"abort() called\\n\");\n",
@@ -1210,7 +1331,21 @@ static const char* const MORPH_PRELUDE[] = {
     "    return gettick() / 100;\n",
     "}\n",
     "char* getenv(char* name) {\n",
+    "    if (!name) return 0;\n",
     "    return 0;\n",
+    "}\n",
+    "int abs(int v) {\n",
+    "    if (v < 0) return -v;\n",
+    "    return v;\n",
+    "}\n",
+    "int __rand_seed;\n",
+    "int srand(int s) {\n",
+    "    __rand_seed = s;\n",
+    "    return 0;\n",
+    "}\n",
+    "int rand() {\n",
+    "    __rand_seed = 1664525 * __rand_seed + 1013904223;\n",
+    "    return (__rand_seed >> 8) & 32767;\n",
     "}\n",
     "/* ============ user-space heap (malloc/free/calloc/realloc) ============\n",
     "   The kernel provides raw blocks via __arena_alloc (MRP arena).\n",
@@ -1309,13 +1444,84 @@ static const char* const MORPH_PRELUDE[] = {
     "    free(p);\n",
     "    return np;\n",
     "}\n",
+    "/* ================= string extras (FR-19) ================= */\n",
+    "char* strdup(char* s) {\n",
+    "    int n; char* d;\n",
+    "    n = strlen(s) + 1;\n",
+    "    d = malloc(n);\n",
+    "    if (!d) return 0;\n",
+    "    memcpy(d, s, n);\n",
+    "    return d;\n",
+    "}\n",
+    "int strspn(char* s, char* set) {\n",
+    "    int i; int j; int ok;\n",
+    "    i = 0;\n",
+    "    while (s[i]) {\n",
+    "        ok = 0;\n",
+    "        j = 0;\n",
+    "        while (set[j]) {\n",
+    "            if (s[i] == set[j]) { ok = 1; break; }\n",
+    "            j = j + 1;\n",
+    "        }\n",
+    "        if (!ok) break;\n",
+    "        i = i + 1;\n",
+    "    }\n",
+    "    return i;\n",
+    "}\n",
+    "int strcspn(char* s, char* set) {\n",
+    "    int i; int j; int hit;\n",
+    "    i = 0;\n",
+    "    while (s[i]) {\n",
+    "        hit = 0;\n",
+    "        j = 0;\n",
+    "        while (set[j]) {\n",
+    "            if (s[i] == set[j]) { hit = 1; break; }\n",
+    "            j = j + 1;\n",
+    "        }\n",
+    "        if (hit) break;\n",
+    "        i = i + 1;\n",
+    "    }\n",
+    "    return i;\n",
+    "}\n",
+    "int strcasecmp(char* a, char* b) {\n",
+    "    int i; int ca; int cb;\n",
+    "    i = 0;\n",
+    "    while (1) {\n",
+    "        ca = tolower(a[i]);\n",
+    "        cb = tolower(b[i]);\n",
+    "        if (ca != cb) return ca - cb;\n",
+    "        if (!ca) return 0;\n",
+    "        i = i + 1;\n",
+    "    }\n",
+    "}\n",
+    "char* __sttok_cur;\n",
+    "char* strtok(char* s, char* sep) {\n",
+    "    char* p; char* q;\n",
+    "    if (s) __sttok_cur = s;\n",
+    "    if (!__sttok_cur) return 0;\n",
+    "    p = __sttok_cur + strspn(__sttok_cur, sep);\n",
+    "    if (!p[0]) { __sttok_cur = 0; return 0; }\n",
+    "    q = p + strcspn(p, sep);\n",
+    "    if (q[0]) { q[0] = 0; __sttok_cur = q + 1; }\n",
+    "    else __sttok_cur = 0;\n",
+    "    return p;\n",
+    "}\n",
     "/* ===================== printf family ===================== */\n",
-    "int __pf_args[3];\n",
-    "int printf(char* fmt, int a = 0, int b = 0, int c = 0) {\n",
-    "    __pf_args[0] = a;\n",
-    "    __pf_args[1] = b;\n",
-    "    __pf_args[2] = c;\n",
-    "    return __sys_printf(fmt, __pf_args);\n",
+    "/* v0.3 FR-19: printf renders LOCALLY through the snprintf engine\n",
+    "   (__vsnprintf) with up to 7 conversion args — the old 3-arg\n",
+    "   kernel SYS_PRINTF ABI limit is gone. */\n",
+    "int __vsnprintf(char* b, int cap, char* fmt, int* ai);\n",
+    "int printf(char* fmt, int a = 0, int b = 0, int c = 0, int d = 0, int e = 0) {\n",
+    "    char buf[512];\n",
+    "    int ai[5];\n",
+    "    int n;\n",
+    "    if (!fmt) fmt = \"(null)\";\n",
+    "    ai[0] = a; ai[1] = b; ai[2] = c; ai[3] = d; ai[4] = e;\n",
+    "    n = __vsnprintf(buf, 512, fmt, ai);\n",
+    "    if (n > 511) n = 511;\n",
+    "    buf[n] = 0;\n",
+    "    print(buf);\n",
+    "    return n;\n",
     "}\n",
     "int __sn_emit(char* b, int cap, int* len, char ch) {\n",
     "    if (*len < cap - 1) b[*len] = ch;\n",
@@ -1371,7 +1577,58 @@ static const char* const MORPH_PRELUDE[] = {
     "    if (la) { i = 8 - n; while (i < width) { __sn_emit(b, cap, len, ' '); i = i + 1; } }\n",
     "    return 0;\n",
     "}\n",
-    "int snprintf(char* buf, int size, char* fmt, int a = 0, int b = 0, int c = 0) {\n",
+    "/* v0.3 FR-19: unsigned decimal + octal rendering — binary long\n",
+    "   division by 10: (n >> i) & 1 extracts each bit even when n is\n",
+    "   negative (arithmetic shift + mask), so the whole 0..4294967295\n",
+    "   range works without an unsigned type. */\n",
+    "int __udiv10(int n, int* rem) {\n",
+    "    int q; int r; int b; int i;\n",
+    "    q = 0; r = 0;\n",
+    "    i = 31;\n",
+    "    while (i >= 0) {\n",
+    "        r = r * 2 + ((n >> i) & 1);\n",
+    "        b = 0;\n",
+    "        if (r >= 10) { b = 1; r = r - 10; }\n",
+    "        q = q * 2 + b;\n",
+    "        i = i - 1;\n",
+    "    }\n",
+    "    *rem = r;\n",
+    "    return q;\n",
+    "}\n",
+    "int __sn_uint(char* b, int cap, int* len, int v, int width, char pad, int la) {\n",
+    "    char t[12];\n",
+    "    int n; int i; int r;\n",
+    "    n = 0;\n",
+    "    if (v == 0) { t[0] = '0'; n = 1; }\n",
+    "    while (v != 0) {\n",
+    "        v = __udiv10(v, &r);\n",
+    "        t[n] = '0' + r;\n",
+    "        n = n + 1;\n",
+    "    }\n",
+    "    if (!la) { i = n; while (i < width) { __sn_emit(b, cap, len, pad); i = i + 1; } }\n",
+    "    i = n - 1;\n",
+    "    while (i >= 0) { __sn_emit(b, cap, len, t[i]); i = i - 1; }\n",
+    "    if (la) { i = n; while (i < width) { __sn_emit(b, cap, len, ' '); i = i + 1; } }\n",
+    "    return 0;\n",
+    "}\n",
+    "int __sn_oct(char* b, int cap, int* len, int v, int width, char pad, int la) {\n",
+    "    char t[13];\n",
+    "    int n; int i; int r;\n",
+    "    n = 0;\n",
+    "    if (v == 0) { t[0] = '0'; n = 1; }\n",
+    "    while (v != 0) {\n",
+    "        r = v & 7;\n",
+    "        v = (v >> 3) & 536870911;\n",
+    "        t[n] = '0' + r;\n",
+    "        n = n + 1;\n",
+    "    }\n",
+    "    if (!la) { i = n; while (i < width) { __sn_emit(b, cap, len, pad); i = i + 1; } }\n",
+    "    i = n - 1;\n",
+    "    while (i >= 0) { __sn_emit(b, cap, len, t[i]); i = i - 1; }\n",
+    "    if (la) { i = n; while (i < width) { __sn_emit(b, cap, len, ' '); i = i + 1; } }\n",
+    "    return 0;\n",
+    "}\n",
+    "int __vsnprintf(char* buf, int size, char* fmt, int* ai) {\n",
     "    int i; int len; int specn; char ch; char pad; int width; int la; int av; char* sv;\n",
     "    i = 0; len = 0; specn = 0;\n",
     "    while (fmt[i]) {\n",
@@ -1383,14 +1640,16 @@ static const char* const MORPH_PRELUDE[] = {
     "        while (fmt[i] == '-') { la = 1; i = i + 1; }\n",
     "        if (fmt[i] == '0') { pad = '0'; i = i + 1; }\n",
     "        while (fmt[i] >= '0' && fmt[i] <= '9') { width = width * 10 + (fmt[i] - '0'); i = i + 1; }\n",
-    "        if (specn == 0) av = a;\n",
-    "        else if (specn == 1) av = b;\n",
-    "        else if (specn == 2) av = c;\n",
+    "        if (specn < 5) av = ai[specn];\n",
     "        else av = 0;\n",
     "        specn = specn + 1;\n",
     "        ch = fmt[i];\n",
-    "        if (ch == 'd' || ch == 'u') {\n",
+    "        if (ch == 'd' || ch == 'i') {\n",
     "            __sn_int(buf, size, &len, av, 10, width, pad, la);\n",
+    "        } else if (ch == 'u') {\n",
+    "            __sn_uint(buf, size, &len, av, width, pad, la);\n",
+    "        } else if (ch == 'o') {\n",
+    "            __sn_oct(buf, size, &len, av, width, pad, la);\n",
     "        } else if (ch == 'x') {\n",
     "            __sn_hex(buf, size, &len, av, 0, width, pad, la);\n",
     "        } else if (ch == 'X') {\n",
@@ -1401,6 +1660,10 @@ static const char* const MORPH_PRELUDE[] = {
     "            sv = av;\n",
     "            if (!sv) sv = \"(null)\";\n",
     "            __sn_str(buf, size, &len, sv, width, pad, la);\n",
+    "        } else if (ch == 'p') {\n",
+    "            __sn_emit(buf, size, &len, '0');\n",
+    "            __sn_emit(buf, size, &len, 'x');\n",
+    "            __sn_hex(buf, size, &len, av, 0, width, pad, la);\n",
     "        }\n",
     "        i = i + 1;\n",
     "    }\n",
@@ -1408,8 +1671,95 @@ static const char* const MORPH_PRELUDE[] = {
     "    else buf[size - 1] = 0;\n",
     "    return len;\n",
     "}\n",
-    "int sprintf(char* buf, char* fmt, int a = 0, int b = 0, int c = 0) {\n",
-    "    return snprintf(buf, 1073741824, fmt, a, b, c);\n",
+    "int snprintf(char* buf, int size, char* fmt, int a = 0, int b = 0, int c = 0, int d = 0, int e = 0) {\n",
+    "    int ai[5];\n",
+    "    ai[0] = a; ai[1] = b; ai[2] = c; ai[3] = d; ai[4] = e;\n",
+    "    return __vsnprintf(buf, size, fmt, ai);\n",
+    "}\n",
+    "int sprintf(char* buf, char* fmt, int a = 0, int b = 0, int c = 0, int d = 0, int e = 0) {\n",
+    "    int ai[5];\n",
+    "    ai[0] = a; ai[1] = b; ai[2] = c; ai[3] = d; ai[4] = e;\n",
+    "    return __vsnprintf(buf, 1073741824, fmt, ai);\n",
+    "}\n",
+    "/* ===================== sscanf (FR-19) =====================\n",
+    "   %d %u %x %s %c %%, whitespace, literal chars. Pointers are\n",
+    "   passed straight through (mtcc does not type-check arguments). */\n",
+    "void __ss_putc(char* dst, int n, char c) {\n",
+    "    if (dst) dst[n] = c;\n",
+    "}\n",
+    "int sscanf(char* s, char* fmt, int* a = 0, int* b = 0, int* c = 0, int* d = 0, int* e = 0) {\n",
+    "    int ai[5];\n",
+    "    int conv; int si; int fi; int n; int neg; int v; int dg; int base; int* ip; char ch;\n",
+    "    ai[0] = a; ai[1] = b; ai[2] = c; ai[3] = d; ai[4] = e;\n",
+    "    si = 0; fi = 0; conv = 0;\n",
+    "    while (fmt[fi]) {\n",
+    "        ch = fmt[fi];\n",
+    "        if (ch == ' ') {\n",
+    "            while (fmt[fi] == ' ') fi = fi + 1;\n",
+    "            while (s[si] == ' ' || s[si] == '\\t' || s[si] == '\\n') si = si + 1;\n",
+    "        } else if (ch != '%') {\n",
+    "            if (s[si] != ch) return conv;\n",
+    "            si = si + 1;\n",
+    "            fi = fi + 1;\n",
+    "        } else {\n",
+    "            fi = fi + 1;\n",
+    "            ch = fmt[fi];\n",
+    "            if (ch == '%') {\n",
+    "                if (s[si] != '%') return conv;\n",
+    "                si = si + 1;\n",
+    "                fi = fi + 1;\n",
+    "            } else if (ch == 'd' || ch == 'u' || ch == 'x') {\n",
+    "                base = 10;\n",
+    "                if (ch == 'x') base = 16;\n",
+    "                while (s[si] == ' ' || s[si] == '\\t' || s[si] == '\\n') si = si + 1;\n",
+    "                neg = 0; v = 0; dg = 0;\n",
+    "                if (s[si] == '-') { neg = 1; si = si + 1; }\n",
+    "                else if (s[si] == '+') si = si + 1;\n",
+    "                if (base == 16 && s[si] == '0' && (s[si + 1] == 'x' || s[si + 1] == 'X')) si = si + 2;\n",
+    "                while (1) {\n",
+    "                    ch = s[si];\n",
+    "                    if (ch >= '0' && ch <= '9') v = v * base + (ch - '0');\n",
+    "                    else if (base == 16 && ch >= 'a' && ch <= 'f') v = v * base + (ch - 'a' + 10);\n",
+    "                    else if (base == 16 && ch >= 'A' && ch <= 'F') v = v * base + (ch - 'A' + 10);\n",
+    "                    else break;\n",
+    "                    dg = dg + 1;\n",
+    "                    si = si + 1;\n",
+    "                }\n",
+    "                if (dg == 0) return conv;\n",
+    "                if (neg) v = -v;\n",
+    "                ip = 0;\n",
+    "                if (conv < 5) ip = ai[conv];\n",
+    "                if (ip) *ip = v;\n",
+    "                conv = conv + 1;\n",
+    "                fi = fi + 1;\n",
+    "            } else if (ch == 'c') {\n",
+    "                if (!s[si]) return conv;\n",
+    "                ip = 0;\n",
+    "                if (conv < 5) ip = ai[conv];\n",
+    "                if (ip) *ip = s[si] & 255;\n",
+    "                conv = conv + 1;\n",
+    "                si = si + 1;\n",
+    "                fi = fi + 1;\n",
+    "            } else if (ch == 's') {\n",
+    "                while (s[si] == ' ' || s[si] == '\\t' || s[si] == '\\n') si = si + 1;\n",
+    "                if (!s[si]) return conv;\n",
+    "                ip = 0;\n",
+    "                if (conv < 5) ip = ai[conv];\n",
+    "                n = 0;\n",
+    "                while (s[si] && s[si] != ' ' && s[si] != '\\t' && s[si] != '\\n') {\n",
+    "                    __ss_putc(ip, n, s[si]);\n",
+    "                    n = n + 1;\n",
+    "                    si = si + 1;\n",
+    "                }\n",
+    "                __ss_putc(ip, n, 0);\n",
+    "                conv = conv + 1;\n",
+    "                fi = fi + 1;\n",
+    "            } else {\n",
+    "                fi = fi + 1;\n",
+    "            }\n",
+    "        }\n",
+    "    }\n",
+    "    return conv;\n",
     "}\n",
     "/* ============ stdio FILE I/O (RAMFS) ============\n",
     "   fopen mode \"r\" = direct fd (fseek via the lseek syscall).\n",
@@ -1544,6 +1894,50 @@ static const char* const MORPH_PRELUDE[] = {
     "    __fio_buf[s] = 0;\n",
     "    return r;\n",
     "}\n",
+    "/* ================= stdio extras (FR-19) ================= */\n",
+    "int puts(char* s) {\n",
+    "    print(s);\n",
+    "    print(\"\\n\");\n",
+    "    return 0;\n",
+    "}\n",
+    "int fputs(char* s, int f) {\n",
+    "    return fwrite(s, 1, strlen(s), f);\n",
+    "}\n",
+    "int fputc(int c, int f) {\n",
+    "    char b[2];\n",
+    "    b[0] = c;\n",
+    "    b[1] = 0;\n",
+    "    if (fwrite(b, 1, 1, f) != 1) return -1;\n",
+    "    return c;\n",
+    "}\n",
+    "int fgetc(int f) {\n",
+    "    char b[1];\n",
+    "    int n;\n",
+    "    n = fread(b, 1, 1, f);\n",
+    "    if (n < 1) return -1;\n",
+    "    return b[0] & 255;\n",
+    "}\n",
+    "int remove(char* path) {\n",
+    "    return __sys_unlink1(path);\n",
+    "}\n",
+    "int rename(char* oldp, char* newp) {\n",
+    "    return __sys_rename2(oldp, newp);\n",
+    "}\n",
+    "char* strerror(int e) {\n",
+    "    if (e == -1) return \"EPERM: operation not permitted\";\n",
+    "    if (e == -3) return \"ENOENT: no such file or directory\";\n",
+    "    if (e == -4) return \"EISDIR: path is a directory\";\n",
+    "    if (e == -5) return \"ENOMEM: out of memory\";\n",
+    "    if (e == -6) return \"EINVAL: invalid argument\";\n",
+    "    if (e == -7) return \"ENOTSUP: operation not supported\";\n",
+    "    if (e == -8) return \"EMFILE: too many open files\";\n",
+    "    if (e == -9) return \"EBUSY: resource busy\";\n",
+    "    if (e == -10) return \"EFAULT: bad user pointer\";\n",
+    "    if (e == -11) return \"EIO: I/O error\";\n",
+    "    if (e == -12) return \"EEXIST: file already exists\";\n",
+    "    if (e == -13) return \"ECHILD: no such child\";\n",
+    "    return \"unknown error\";\n",
+    "}\n",
     "/* ===================== sort ===================== */\n",
     "int __qs_ip(int* a, int lo, int hi) {\n",
     "    int p; int i; int j; int t;\n",
@@ -1593,9 +1987,179 @@ static const char* const MORPH_PRELUDE[] = {
     "void qsort_str(char** a, int n) {\n",
     "    if (n > 1) __qs_s(a, 0, n - 1);\n",
     "}\n",
+    "/* ===================== graphics (FR-17) ===================== */\n",
+    "/* set_clip(x | w<<16, y | h<<16): confine this task's draws to a\n",
+    "   window - put_pixel / fill_rect / draw_line are clipped to it\n",
+    "   (kernel-side, per task). Same packed form as fill_rect. */\n",
+    "int set_clip(int xw, int yh) {\n",
+    "    return __gfx_clip2(xw, yh);\n",
+    "}\n",
+    "/* draw_line(x0 | y0<<16, x1 | y1<<16, color): Bresenham line,\n",
+    "   clipped to the task's window (if any) and console focus. */\n",
+    "int draw_line(int p0, int p1, int color) {\n",
+    "    return __gfx_line3(p0, p1, color);\n",
+    "}\n",
     "#endif\n",
 };
+// ============================================================================
+//  MULTITASKING PRELUDE (Phase B) — the virtual <multitasking.h> content.
+//  mtcc programs can create new .mrp tasks (non-blocking) and yield:
+//      task_spawn("hello.mrp")     -> pid (>0) / negative errno
+//      task_spawn_hint(f, bytes)   -> spawn with an arena hint
+//      task_yield()                -> give the CPU to other tasks
+//      task_pid()                  -> this task's pid
+//  The wrappers use the __task_spawn2/task_yield builtins (mtcc has no
+//  default arguments — 2-arg builtin + 1-arg wrapper in the prelude).
+// ============================================================================
+static const char* const MULTITASKING_PRELUDE[] = {
+    "#ifndef MULTITASKING_H_INCLUDED\n",
+    "#define MULTITASKING_H_INCLUDED\n",
+    "/* multitasking.h - Equinox OS task API (Phase B, mtcc in-OS build)\n",
+    "   Spliced by: #include <multitasking.h> */\n",
+    "\n",
+    "/* run another .mrp in a NEW task (non-blocking, 2 MB arena).\n",
+    "   return: pid > 0 on success / negative = error */\n",
+    "int task_spawn(char* path) {\n",
+    "    return __task_spawn2(path, 0);\n",
+    "}\n",
+    "\n",
+    "/* spawn with an arena hint (heap slack bytes, e.g. 8388608 = 8 MB) */\n",
+    "int task_spawn_hint(char* path, int arena_hint) {\n",
+    "    return __task_spawn2(path, arena_hint);\n",
+    "}\n",
+    "\n",
+    "/* give the CPU to the next task (round-robin scheduler) */\n",
+    "void task_yield(void) {\n",
+    "    __task_yield0();\n",
+    "}\n",
+    "\n",
+    "/* this task's pid */\n",
+    "int task_pid(void) {\n",
+    "    return getpid();\n",
+    "}\n",
+    "\n",
+    "/* Phase C: kill another task by pid (0 = success). */\n",
+    "int task_kill(int pid) {\n",
+    "    return __task_kill1(pid);\n",
+    "}\n",
+    "\n",
+    "/* Phase C: snapshot of the task list.\n",
+    "   out[0] = count N, then N entries of 4 ints: {pid, state, kind, console}.\n",
+    "   Call with an array of at least 33 ints:\n",
+    "     int info[33]; int n = task_list(info); */\n",
+    "int task_list(int* out) {\n",
+    "    return __task_info1(out);\n",
+    "}\n",
+    "\n",
+    "/* v0.3: blocking waitpid - pid > 0 = that child, 0/-1 = any. */\n",
+    "/* Returns the reaped child's pid, or -13 (ECHILD). */\n",
+    "int task_wait(int pid, int* status_out) {\n",
+    "    return __task_wait2(pid, status_out);\n",
+    "}\n",
+    "\n",
+    "/* v0.3: create an anonymous pipe: fds[0]=read end,\n",
+    "   fds[1]=write end. A spawned child INHERITS the parent's pipe\n",
+    "   fds - close the end you do not use so EOF/broken-pipe work. */\n",
+    "int pipe_create(int* fds) {\n",
+    "    return __pipe_cre1(fds);\n",
+    "}\n",
+    "\n",
+    "/* v0.3: spawn a NEW task with an explicit args string\n",
+    "   (the child reads it via getargs()). Returns pid / errno. */\n",
+    "int task_spawn_args(char* path, int arena_hint, char* args) {\n",
+    "    return __task_spawn3(path, arena_hint, args);\n",
+    "}\n",
+    "\n",
+    "/* v0.3: memory statistics - w[0]=pool total KB,\n",
+    "   w[1]=pool free KB, w[2]=faulted-in user KB, w[3]=live tasks,\n",
+    "   w[4]=zombies, w[5]=0. Returns 0 / errno. */\n",
+    "int mem_info(int* w) {\n",
+    "    return __meminfo1(w);\n",
+    "}\n",
+    "\n",
+    "#endif\n",
+};
+
 #define MORPH_PRELUDE_LINES (sizeof(MORPH_PRELUDE) / sizeof(MORPH_PRELUDE[0]))
+#define MULTITASKING_PRELUDE_LINES (sizeof(MULTITASKING_PRELUDE) / sizeof(MULTITASKING_PRELUDE[0]))
+
+// ============================================================================
+//  FILEIO_PRELUDE (v0.3 FR-01) — virtual contents of `#include <fileio.h>`.
+// ----------------------------------------------------------------------------
+//  Thin wrappers over the full file syscalls #40-#48 (open flags, unlink,
+//  mkdir/rmdir, rename, stat/readdir/fstat). mtcc has no struct support,
+//  so morph_stat_t = int[4] and morph_dirent_t = char[72] with the two
+//  ints at offsets 64/68 — documented per function below.
+// ============================================================================
+static const char* const FILEIO_PRELUDE[] = {
+    "#ifndef FILEIO_H_INCLUDED\n",
+    "#define FILEIO_H_INCLUDED\n",
+    "/* fileio.h - Equinox OS file syscalls (v0.3 FR-01)\n",
+    "   Spliced by: #include <fileio.h> */\n",
+    "\n",
+    "/* ---- open flags (f_open) ---- */\n",
+    "#define F_RDONLY 0\n",
+    "#define F_WRONLY 1\n",
+    "#define F_RDWR 2\n",
+    "#define F_CREAT 256\n",
+    "#define F_TRUNC 512\n",
+    "#define F_APPEND 1024\n",
+    "#define F_EXCL 2048\n",
+    "#define F_DIR 4096\n",
+    "\n",
+    "/* open with flags -> fd (3+), negative = errno. Combine flags with |\n",
+    "   e.g. f_create = f_open(path, F_WRONLY|F_CREAT|F_TRUNC); */\n",
+    "int f_open(char* path, int flags) {\n",
+    "    return __sys_open2(path, flags);\n",
+    "}\n",
+    "\n",
+    "/* remove a FILE -> 0 / errno (directories: f_rmdir) */\n",
+    "int f_unlink(char* path) {\n",
+    "    return __sys_unlink1(path);\n",
+    "}\n",
+    "\n",
+    "/* create a directory -> 0 / errno */\n",
+    "int f_mkdir(char* path) {\n",
+    "    return __sys_mkdir1(path);\n",
+    "}\n",
+    "\n",
+    "/* remove an EMPTY directory -> 0 / errno */\n",
+    "int f_rmdir(char* path) {\n",
+    "    return __sys_rmdir1(path);\n",
+    "}\n",
+    "\n",
+    "/* rename/move a file: f_rename(old, new) -> 0 / errno */\n",
+    "int f_rename(char* oldpath, char* newpath) {\n",
+    "    return __sys_rename2(oldpath, newpath);\n",
+    "}\n",
+    "\n",
+    "/* stat: st is int[4] -> [0]=size [1]=is_dir [2]=backing [3]=mode */\n",
+    "int f_stat(char* path, int* st) {\n",
+    "    return __sys_stat2(path, st);\n",
+    "}\n",
+    "\n",
+    "/* readdir: de is char[72] -> name at de[0..63],\n",
+    "   is_dir = int at de+64, size = int at de+68.\n",
+    "   fd must be opened with f_open(dir, F_DIR).\n",
+    "   return 1 = entry filled, 0 = end of directory, negative = errno */\n",
+    "int f_readdir(int fd, char* de) {\n",
+    "    return __sys_readdir2(fd, de);\n",
+    "}\n",
+    "\n",
+    "/* fstat by descriptor (same int[4] layout as f_stat) */\n",
+    "int f_fstat(int fd, int* st) {\n",
+    "    return __sys_fstat2(fd, st);\n",
+    "}\n",
+    "\n",
+    "/* free a raw malloc()/__arena_alloc() block (v0.3 FR-03) -> 0 / -1 */\n",
+    "int f_free(char* p) {\n",
+    "    return __sys_free1(p);\n",
+    "}\n",
+    "\n",
+    "#endif\n",
+};
+
+#define FILEIO_PRELUDE_LINES (sizeof(FILEIO_PRELUDE) / sizeof(FILEIO_PRELUDE[0]))
 
 // ============================================================================
 //  PREPROCESSOR MINI (v10.8)
@@ -1692,6 +2256,55 @@ static int ppo_puts(struct PpOut* o, const char* s) {
 // The contiguous buffer is built once per run (static cache; the .mrp
 // arena is reset per program, host memory is freed by the OS on exit).
 static void pp_process(const char* src, uint32_t len, struct PpOut* o, int depth);
+
+// Splice MULTITASKING_PRELUDE (Phase B) — bypasses pp_process so the
+// guard #ifndef MULTITASKING_H_INCLUDED benar-benar dieksekusi.
+// Splice FILEIO_PRELUDE (v0.3 FR-01) — same shape as the multitasking
+// splicer; the guard #ifndef FILEIO_H_INCLUDED really executes.
+static void pp_splice_fileio(struct PpOut* o) {
+    static char* fbuf = NULL;
+    static uint32_t flen = 0;
+    if (!fbuf) {
+        uint32_t total = 0;
+        for (uint32_t i = 0; i < FILEIO_PRELUDE_LINES; i++) {
+            const char* sp = FILEIO_PRELUDE[i];
+            while (*sp) { total++; sp++; }
+        }
+        fbuf = (char*)os_alloc(total + 1);
+        if (!fbuf) { pp_error(1, "pp: OOM fileio prelude"); return; }
+        uint32_t p = 0;
+        for (uint32_t i = 0; i < FILEIO_PRELUDE_LINES; i++) {
+            const char* sp = FILEIO_PRELUDE[i];
+            while (*sp) fbuf[p++] = *sp++;
+        }
+        fbuf[p] = '\0';
+        flen = p;
+    }
+    pp_process(fbuf, flen, o, 1);
+}
+
+static void pp_splice_multitasking(struct PpOut* o) {
+    static char* mbuf = NULL;
+    static uint32_t mlen = 0;
+    if (!mbuf) {
+        uint32_t total = 0;
+        for (uint32_t i = 0; i < MULTITASKING_PRELUDE_LINES; i++) {
+            const char* s = MULTITASKING_PRELUDE[i];
+            while (*s) { total++; s++; }
+        }
+        mbuf = (char*)os_alloc(total + 1);
+        if (!mbuf) { pp_error(1, "pp: OOM multitasking prelude"); return; }
+        uint32_t p = 0;
+        for (uint32_t i = 0; i < MULTITASKING_PRELUDE_LINES; i++) {
+            const char* s = MULTITASKING_PRELUDE[i];
+            while (*s) mbuf[p++] = *s++;
+        }
+        mbuf[p] = '\0';
+        mlen = p;
+    }
+    pp_process(mbuf, mlen, o, 1);
+}
+
 
 static void pp_splice_prelude(struct PpOut* o) {
     static char* prelude_buf = NULL;
@@ -1908,6 +2521,14 @@ static void pp_process(const char* src, uint32_t len, struct PpOut* o, int depth
                 // splice the prelude + execute its directives (the guard
                 // works: a second include hits an already-defined #ifndef)
                 pp_splice_prelude(o);
+                if (PP.err) return;
+            } else if (m_streq(hname, "fileio.h")) {
+                // v0.3 FR-01: full file API prelude (f_open/.../f_free)
+                pp_splice_fileio(o);
+                if (PP.err) return;
+            } else if (m_streq(hname, "multitasking.h")) {
+                // Phase B: task API prelude (spawn/yield)
+                pp_splice_multitasking(o);
                 if (PP.err) return;
             } else if (depth >= PP_MAX_DEPTH) {
                 pp_error(o->line, "pp: #include nested too deep (max 8)");
@@ -2657,6 +3278,7 @@ static void gen_call_user(Func* f, CType* t) {
     if (f->code_off < 0) {
         if (f->pending_count >= 24) { mtcc_error("too many forward calls"); return; }
         f->pending[f->pending_count++] = (uint16_t)(S.fixup_count - 1);
+        if (f->first_call_line == 0) f->first_call_line = (uint16_t)S.line;
     }
     if (f->nparams) e_add_esp_i8((uint8_t)(f->nparams * 4));
     *t = f->ret;
@@ -3432,6 +4054,60 @@ static int mtcc_compile(const char* src, uint32_t src_len, MtccOut* out) {
         if (!mf || !mf->defined) mtcc_error("function main() not found");
         else S.fixups[main_fx].v = mf->code_off;
     }
+
+    // ---- v0.3 FR-20: undefined-reference detection (linker-style) ----
+    // A prototype that was CALLED (pending forward-call fixups exist)
+    // but never DEFINED used to compile silently — the emitted
+    // `call rel32` pointed at garbage and the program crashed at
+    // RUNTIME. A never-called prototype is fine (headers do that);
+    // only called-but-undefined functions are an error, exactly like
+    // a real linker's "undefined reference".
+    if (!S.err) {
+        for (uint32_t fi = 0; fi < S.func_count && !S.err; fi++) {
+            Func* f = &S.funcs[fi];
+            if (!f->defined && f->pending_count > 0) {
+                char msg[96];
+                uint32_t k = 0;
+                const char* pre = "undefined reference to '";
+                while (pre[k] && k < sizeof(msg) - 32) { msg[k] = pre[k]; k++; }
+                uint32_t j = 0;
+                while (f->name[j] && k < sizeof(msg) - 32) {
+                    msg[k] = f->name[j]; k++; j++;
+                }
+                msg[k++] = '\'';
+                msg[k++] = ' ';
+                msg[k++] = '(';
+                msg[k++] = 'c';
+                msg[k++] = 'a';
+                msg[k++] = 'l';
+                msg[k++] = 'l';
+                msg[k++] = 'e';
+                msg[k++] = 'd';
+                msg[k++] = ' ';
+                msg[k++] = 'b';
+                msg[k++] = 'u';
+                msg[k++] = 't';
+                msg[k++] = ' ';
+                msg[k++] = 'n';
+                msg[k++] = 'e';
+                msg[k++] = 'v';
+                msg[k++] = 'e';
+                msg[k++] = 'r';
+                msg[k++] = ' ';
+                msg[k++] = 'd';
+                msg[k++] = 'e';
+                msg[k++] = 'f';
+                msg[k++] = 'i';
+                msg[k++] = 'n';
+                msg[k++] = 'e';
+                msg[k++] = 'd';
+                msg[k++] = ')';
+                msg[k] = '\0';
+                mtcc_error(msg);
+                if (f->first_call_line) S.err_line = f->first_call_line;
+            }
+        }
+    }
     if (S.err) return 1;
 
     out->code = S.code; out->code_len = S.code_len;
@@ -3510,12 +4186,17 @@ static void tcc_usage(void) {
     os_print("          file_read_all file_size file_exists  (Morph.h API)\n");
     os_print("          lseek(fd,off,whence) ring() -> CPL caller (v10.8)\n");
     os_print("net API : net_info(w10) fills network status; net_ping(ip) 0..4\n");
-    os_print("libc prelude: strlen strcmp strcpy strncpy strcat strchr strstr\n");
-    os_print("          memcpy memset memmove memcmp atoi strtol itoa\n");
+    os_print("libc prelude: strlen strcmp strncmp strcpy strncpy strcat\n");
+    os_print("          strncat strchr strrchr strstr strdup strtok strspn\n");
+    os_print("          strcspn strcasecmp memcpy memset memmove memcmp\n");
+    os_print("          memchr atoi strtol itoa utoa sscanf ctype(13 fn)\n");
     os_print("          malloc free calloc realloc printf sprintf snprintf\n");
-    os_print("          fopen fread fwrite fseek ftell fclose qsort_int\n");
-    os_print("          qsort_str time getenv abort  (via #include <morph.h>)\n");
+    os_print("          (7 conv args: %d %i %u %x %X %o %p %c %s)\n");
+    os_print("          fopen fread fwrite fseek ftell fclose fgetc fputc\n");
+    os_print("          puts fputs remove rename strerror abs rand srand\n");
+    os_print("          qsort_int qsort_str time getenv abort (via <morph.h>)\n");
     os_print("game API : fb_info(fb) put_pixel(x,y,c) fill_rect(x|w<<16,y|h<<16,c)\n");
+    os_print("          draw_line(x0|y0<<16,x1|y1<<16,c) set_clip(x|w<<16,y|h<<16)\n");
     os_print("          pollkey() mouse_state(m) spk_tone(hz) spk_silence()\n");
     os_print("          snd_beep(hz, ms)  queue a timed note (non-blocking)\n");
 }
@@ -3666,12 +4347,23 @@ MRP_ENTRY {
     }
 
     if (compile_only) {
-        // ---- -c mode: write the .mrp to RAMFS ----
+        // ---- -c mode: write the .mrp ----
+        // v0.3: the output lands NEXT TO THE SOURCE (the input's
+        // directory prefix is kept), not in the task cwd — so
+        // `mtcc -c /equinox/tools/ls.c` writes /equinox/tools/ls.mrp
+        // (SYS_MKFILE resolves the dir part via syscall_resolve).
         char oname[64];
         const char* base = fname;
-        for (const char* q = fname; *q; q++) if (*q == '/') base = q + 1;
+        uint32_t dlen = 0;
+        for (const char* q = fname; *q; q++) {
+            if (*q == '/') { base = q + 1; dlen = (uint32_t)(q + 1 - fname); }
+        }
         uint32_t j = 0;
-        while (base[j] && base[j] != '.' && j < sizeof(oname) - 5) { oname[j] = base[j]; j++; }
+        while (j < dlen && j < sizeof(oname) - 8) { oname[j] = fname[j]; j++; }
+        uint32_t k = 0;
+        while (base[k] && base[k] != '.' && j < sizeof(oname) - 5) {
+            oname[j] = base[k]; j++; k++;
+        }
         oname[j] = '.'; oname[j + 1] = 'm'; oname[j + 2] = 'r';
         oname[j + 3] = 'p'; oname[j + 4] = '\0';
 

@@ -15,6 +15,7 @@
 // ============================================================
 
 #include "header/ata.h"
+#include "header/task.h"   // Phase A: sched-lock
 #include "header/stdio.h"      // inb/outb, printf
 #include "header/libstring.h"  // memset
 
@@ -299,52 +300,56 @@ static int ata_cmd_lba(const struct ata_bus_ports* io, uint8_t drive_bit,
 }
 
 int ata_read_sectors(int slot, uint64_t lba, uint32_t count, void* buf) {
+    task_sched_lock();   /* Phase A: no preemption mid-storage-operation */
     struct ata_drive* d = ata_get_drive(slot);
-    if (!d || d->kind != ATA_PATA) return -1;
-    if (!count || count > ATA_MAX_CHUNK || !buf) return -2;
+    if (!d || d->kind != ATA_PATA) { task_sched_unlock(); return -1; }
+    if (!count || count > ATA_MAX_CHUNK || !buf) { task_sched_unlock(); return -2; }
     if (lba + count > d->total_sectors) return -3;      // beyond the disk
 
     const struct ata_bus_ports* io = &buses[d->bus];
     int use48 = (d->lba48 && lba > 0x0FFFFFFFull);
 
-    if (ata_cmd_lba(io, d->drive, (uint8_t)use48, 0, lba, count) != 0)
-        return -4;
+        if (ata_cmd_lba(io, d->drive, (uint8_t)use48, 0, lba, count) != 0) { task_sched_unlock(); return -4; }
 
     uint16_t* out = (uint16_t*)buf;
     for (uint32_t s = 0; s < count; s++) {
-        if (ata_wait_drq(io) != 0) return -5;
+        if (ata_wait_drq(io) != 0) { task_sched_unlock(); return -5; }
         for (int w = 0; w < 256; w++) out[w] = port_inw(io->data);
         out += 256;
     }
     // drain trailing status (clears DRQ)
     (void)inb(io->status);
+    task_sched_unlock();
     return 0;
+    task_sched_unlock();
 }
 
 int ata_write_sectors(int slot, uint64_t lba, uint32_t count, const void* buf) {
+    task_sched_lock();   /* Phase A: no preemption mid-storage-operation */
     struct ata_drive* d = ata_get_drive(slot);
-    if (!d || d->kind != ATA_PATA) return -1;
-    if (!count || count > ATA_MAX_CHUNK || !buf) return -2;
-    if (lba + count > d->total_sectors) return -3;
+    if (!d || d->kind != ATA_PATA) { task_sched_unlock(); return -1; }
+    if (!count || count > ATA_MAX_CHUNK || !buf) { task_sched_unlock(); return -2; }
+    if (lba + count > d->total_sectors) { task_sched_unlock(); return -3; }
 
     const struct ata_bus_ports* io = &buses[d->bus];
     int use48 = (d->lba48 && lba > 0x0FFFFFFFull);
 
-    if (ata_cmd_lba(io, d->drive, (uint8_t)use48, 1, lba, count) != 0)
-        return -4;
+        if (ata_cmd_lba(io, d->drive, (uint8_t)use48, 1, lba, count) != 0) { task_sched_unlock(); return -4; }
 
     const uint16_t* src = (const uint16_t*)buf;
     for (uint32_t s = 0; s < count; s++) {
-        if (ata_wait_drq(io) != 0) return -5;
+        if (ata_wait_drq(io) != 0) { task_sched_unlock(); return -5; }
         for (int w = 0; w < 256; w++) port_outw(io->data, src[w]);
         src += 256;
     }
     // wait for the buffer to drain, then FLUSH CACHE so the data is
     // durable in the backing file even if QEMU is killed.
-    if (ata_wait_not_busy(io, 100000) == 0) return -6;
+    if (ata_wait_not_busy(io, 100000) == 0) { task_sched_unlock(); return -6; }
     outb(io->status, ATA_CMD_FLUSH_CACHE);
     (void)ata_wait_not_busy(io, 100000);
+    task_sched_unlock();
     return 0;
+    task_sched_unlock();
 }
 
 // ===================================================================

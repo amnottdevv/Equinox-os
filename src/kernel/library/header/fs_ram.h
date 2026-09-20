@@ -13,9 +13,12 @@ struct fs_node {
     char name[64];
     uint8_t is_dir;          // 1 if directory, 0 if file
     uint8_t is_ref;          // v10.9: 1 = zero-copy content (GRUB module
-                             // staging or the v0.2 FAT arena) - pointer
-                             // does NOT belong to the kernel heap,
-                             // never free() it
+                             // staging) - pointer does NOT belong to the
+                             // kernel heap, never free() it
+    uint8_t cont_owner;      // v0.3 FR-08: content ownership for cache
+                             // eviction - 0 = kernel heap (free()),
+                             // 1 = GRUB staging (never freed),
+                             // 2 = FAT disk arena (fat_arena_free)
     uint32_t size;           // file size (0 for dirs)
     char* content;           // file contents (malloc'd), NULL for dirs
     struct fs_node* parent;  // parent directory
@@ -42,6 +45,20 @@ struct fs_node {
                              // creating "mydoc~1.txt" must be re-tailled).
     void*    mnt;            // FAT32: owning fat32_mount (opaque here)
 };
+
+// v0.3 FR-01: RAMFS rename — move `node` to `new_parent` under
+// `new_name` (relink the children list, keep content/size). Only for
+// RAMFS nodes (backing 0); FAT rename is create-copy-delete in
+// syscall.cpp. Returns 0 / -1.
+int fs_ram_relink_node(struct fs_node* node, struct fs_node* new_parent,
+                       const char* new_name);
+
+// v0.3 FR-08: release the node's cached content using the correct
+// owner (heap malloc / FAT arena / staging). Sets content = NULL so
+// the next fs_ensure_content() re-reads lazily from disk. Only call
+// this when no reader holds the buffer (syscall.cpp checks the fd
+// tables of every task first).
+void fs_content_release(struct fs_node* node);
 
 // Make sure a node's content is readable (node->content != NULL for
 // non-empty files). RAMFS nodes: no-op. FAT32 nodes: lazy whole-file

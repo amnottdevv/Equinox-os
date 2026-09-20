@@ -1,14 +1,17 @@
 // ============================================================
 //  net_lwip.c — lwIP <-> NE2000 <-> Equinox OS shell glue
 // ------------------------------------------------------------
-//  Model: NO_SYS=1 cooperative polling.
-//    * net_poll()      : drain NIC RX -> pbuf -> ethernet_input,
-//                        then sys_check_timeouts(). ALWAYS runs
-//                        with IF=0 (cli-guard) -> no re-entrancy
-//                        between IRQ0 / IRQ9 / tasks.
-//    * net_timer_tick(): IRQ0 hook (timer.cpp) — polling heart.
-//    * ne2000_isr      : IRQ9 hook (idt.cpp) — instant poll.
-//    * sys_now()       : from get_tick() (PIT 100 Hz).
+//  Model: NO_SYS=1 cooperative polling, v0.3 FR-09 two-stage:
+//    * ne2000_isr (IRQ9): ONLY copies frames from the NIC into the
+//      RX RING (bounded memcpy, no lwIP) — heavy traffic can no
+//      longer stall the timer/keyboard/mouse IRQs.
+//    * net_service()    : drains the ring -> pbuf -> ethernet_input
+//      + sys_check_timeouts(). Runs in TASK context only: the
+//      dedicated "net" kernel task (net_task_loop), the boot-time
+//      DHCP wait, and blocking waits (mget/ping). ALWAYS under
+//      net_lock (cli-guard) -> no re-entrancy.
+//    * net_poll()       : legacy alias of net_service() (task ctx).
+//    * sys_now()        : from get_tick() (PIT 100 Hz).
 //
 //  This file is compiled as C++ (the makefile .c rule uses g++),
 //  while lwIP files are compiled as plain C — interop is safe
@@ -18,12 +21,14 @@
 #include <stddef.h>
 
 #include "net.h"
-#include "ne2000.h"
+#include "nic.h"
+#include "ne2000.h"      /* NE_MAXFRAME only (driver detail) */
 #include "tls_client.h"              /* v0.1: mget https:// (BearSSL) */
 
 #include "library/header/stdio.h"
 #include "library/header/libstring.h"
 #include "library/header/timer.h"
+#include "library/header/task.h"   /* v0.3 FR-09: nettask */
 
 #include "lwip/init.h"
 #include "lwip/netif.h"
@@ -78,7 +83,7 @@ static err_t low_level_output(struct netif* netif, struct pbuf* p) {
     int len = pbuf_copy_partial(p, net_txbuf, p->tot_len, 0);
     if (len <= 0) return ERR_BUF;
 
-    if (ne2000_send(net_txbuf, len) == 0) {
+    if (nic_send(net_txbuf, len) == 0) {
         st_tx++;
         return ERR_OK;
     }
@@ -91,7 +96,7 @@ static err_t netif_init_cb(struct netif* netif) {
     netif->output      = etharp_output;
     netif->linkoutput  = low_level_output;
     netif->hwaddr_len  = 6;
-    memcpy(netif->hwaddr, ne2000_mac(), 6);
+    memcpy(netif->hwaddr, nic_mac(), 6);
     netif->mtu         = 1500;
     netif->flags       = NETIF_FLAG_BROADCAST | NETIF_FLAG_ETHARP;
     return ERR_OK;
@@ -99,9 +104,11 @@ static err_t netif_init_cb(struct netif* netif) {
 
 // ---------------- API: init / poll -------------------------
 int net_init(void) {
-    if (!ne2000_init()) {
-        printf("net: NE2000 not found at 0x300 irq %d - network off\n",
-               NE_IRQ);
+    /* v0.3 (FR-13): the stack talks to the active NIC via the
+     * registry (kernel/net/nic.c) — ne2000 is just the first driver.
+     * net_nic_init() also reports recognized PCI NICs (e1000...). */
+    if (!net_nic_init()) {
+        printf("net: no NIC driver claimed a card - network off\n");
         return 0;
     }
 
@@ -142,7 +149,10 @@ int net_init(void) {
 
     uint32_t t0 = sys_now();
     while (!dhcp_supplied_address(&nif) && (sys_now() - t0) < 3000) {
-        /* busy-wait; the IRQ0 timer runs net_poll -> DORA */
+        /* v0.3 FR-09: no tasks exist yet (this runs BEFORE
+         * task_init0) and IRQ0 no longer services lwIP — poll the
+         * RX ring + timers ourselves right here. */
+        net_service();
     }
 
     int dhcp_ok = dhcp_supplied_address(&nif);
@@ -156,7 +166,7 @@ int net_init(void) {
         dhcp_mode = 1;
     }
 
-    const uint8_t* m = ne2000_mac();
+    const uint8_t* m = nic_mac();
     printf("net: ne0 up  mac %02x:%02x:%02x:%02x:%02x:%02x\n",
            m[0], m[1], m[2], m[3], m[4], m[5]);
     /* ip4addr_ntoa uses ONE static buffer -> one printf per address. */
@@ -168,45 +178,147 @@ int net_init(void) {
     return 1;
 }
 
-void net_poll(void) {
-    if (!net_up) return;
+/* ============================================================
+ *  v0.3 FR-09 — RX RING (ISR -> task decoupling)
+ * ------------------------------------------------------------
+ *  Single producer (IRQ9 ISR) + single consumer (net_service in
+ *  task context). 16 x 1536 B slots in .bss. When the ring is
+ *  full the ISR drops the frame (counted) — lwIP/TCP retransmits
+ *  recover; the timer/keyboard IRQs are never held hostage.
+ * ============================================================ */
+#define NET_RX_RING       16u
+#define NET_RX_FRAME_MAX  1536u
 
+static volatile uint32_t rxr_head = 0;   /* producer cursor (ISR)     */
+static volatile uint32_t rxr_tail = 0;   /* consumer cursor (task)    */
+static uint16_t          rxr_len[NET_RX_RING];
+static uint8_t           rxr_buf[NET_RX_RING][NET_RX_FRAME_MAX];
+static volatile uint32_t rxr_drops = 0;
+
+/* IRQ9 context: pull frames off the NIC into the ring. Returns the
+ * number of frames stored. NO lwIP calls here — memcpy + cursors. */
+int net_rxr_drain_isr(void) {
+    int stored = 0;
+    while (1) {
+        uint32_t h = rxr_head;
+        uint32_t next = (h + 1u) % NET_RX_RING;
+        if (next == rxr_tail) { rxr_drops++; break; }    /* ring full */
+        int len = nic_recv(rxr_buf[h], NET_RX_FRAME_MAX);
+        if (len <= 0) break;                             /* NIC empty */
+        rxr_len[h] = (uint16_t)len;
+        asm volatile("" ::: "memory");   /* publish len before cursor */
+        rxr_head = next;
+        stored++;
+    }
+    return stored;
+}
+
+/* Task context: feed every ringed frame to lwIP + run the timers.
+ * Returns the number of frames accepted. This is the ONLY place
+ * lwIP processes input now. */
+int net_service(void) {
+    if (!net_up) return 0;
     uint32_t f = net_lock();
+    int fed = 0;
 
-    /* 1. Drain the NIC ring (bounded so IRQs stay short) */
-    for (int i = 0; i < 16; i++) {
-        int len = ne2000_recv(net_rxbuf, sizeof(net_rxbuf));
-        if (len <= 0) {
-            if (len < 0) st_drop++;
-            break;
-        }
+    while (rxr_tail != rxr_head) {
+        uint32_t t = rxr_tail;
+        uint16_t len = rxr_len[t];
         struct pbuf* p = pbuf_alloc(PBUF_RAW, (u16_t)len, PBUF_POOL);
         if (p == NULL) {
             st_drop++;                   /* pool exhausted: drop  */
-            continue;
-        }
-        pbuf_take(p, net_rxbuf, (u16_t)len);
-        if (nif.input(p, &nif) != ERR_OK) {
-            pbuf_free(p);
-            st_drop++;
         } else {
-            st_rx++;
+            pbuf_take(p, rxr_buf[t], (u16_t)len);
+            if (nif.input(p, &nif) != ERR_OK) {
+                pbuf_free(p);
+                st_drop++;
+            } else {
+                st_rx++;
+                fed++;
+            }
         }
+        rxr_tail = (t + 1u) % NET_RX_RING;
+        asm volatile("" ::: "memory");
     }
 
-    /* 2. lwIP TCP/ARP/ICMP timers */
+    /* lwIP TCP/ARP/ICMP/DNS timers */
     sys_check_timeouts();
 
     net_unlock(f);
+    return fed;
 }
 
+/* Legacy alias — TASK CONTEXT ONLY since v0.3 (the ISRs no longer
+ * call this; they enqueue into the RX ring instead). */
+void net_poll(void) {
+    net_service();
+}
+
+/* v0.3 FR-09: IRQ0 no longer runs the stack (kept for ABI — no-op). */
 void net_timer_tick(void) {
-    if (net_up) net_poll();
+}
+
+/* ---- the "net" kernel task ----------------------------------
+ * A console-less round-robin task that services the stack ~100 Hz
+ * (and hot-drains with yields while frames keep arriving). Created
+ * by net_start_task() from kernel_main AFTER task_init0(). */
+/* task.h (included above, extern "C") provides task_create_kernel /
+ * task_kernel_start / task_sleep with the right linkage. */
+
+static struct Task* g_net_task = NULL;   /* forward (defined below) */
+
+static void net_task_loop(void* arg) {
+    (void)arg;
+    task_kernel_start();                /* first-activation setup    */
+    while (1) {
+        int fed = net_service();
+        if (fed > 0) {
+            /* traffic in flight: yield, then drain again immediately */
+            asm volatile("pause" ::: "memory");
+            int more = net_service();
+            if (more == 0) task_sleep(10);
+            else task_yield();
+        } else {
+            task_sleep(10);             /* idle: 100 Hz heartbeat    */
+        }
+    }
+}
+
+int net_start_task(void) {
+    if (!net_up) return 0;              /* no NIC: nothing to service */
+    g_net_task = task_create_kernel("net", net_task_loop, NULL);
+    return g_net_task ? 1 : 0;
+}
+
+/* v0.3 debug: ring + nettask state for the `netdbg` shell command —
+ * diagnoses the "network dies after heavy disk I/O" hunt. */
+extern "C" int task_sched_lock_depth(void);
+
+void net_dbg_dump(void) {
+    printf("netdbg: ring head=%u tail=%u drops=%u\n",
+           rxr_head, rxr_tail, rxr_drops);
+    printf("netdbg: isr=%u rx=%u tx=%u drop=%u SCHEDLOCK=%d\n",
+           nic_irq_count(), st_rx, st_tx, st_drop,
+           task_sched_lock_depth());
+    if (g_net_task) {
+        const char* st = "?";
+        switch (g_net_task->state) {
+            case 0: st = "FREE"; break;
+            case 1: st = "READY"; break;
+            case 2: st = "RUNNING"; break;
+            case 3: st = "BLOCKED"; break;
+            case 4: st = "DEAD"; break;
+        }
+        printf("netdbg: nettask state=%s sleep_until=%u now=%u used=%d\n",
+               st, g_net_task->sleep_until, get_tick(), g_net_task->used);
+    } else {
+        printf("netdbg: nettask NOT created\n");
+    }
 }
 
 // ---------------- info / getters ---------------------------
 int              net_is_up(void)        { return net_up; }
-const uint8_t*   net_mac(void)          { return ne2000_mac(); }
+const uint8_t*   net_mac(void)          { return nic_mac(); }
 uint32_t         net_rx_packets(void)   { return st_rx; }
 uint32_t         net_tx_packets(void)   { return st_tx; }
 uint32_t         net_drops(void)        { return st_drop; }
@@ -216,7 +328,7 @@ void net_print_info(void) {
         printf("net: down (no NIC)\n");
         return;
     }
-    const uint8_t* m = ne2000_mac();
+    const uint8_t* m = nic_mac();
     printf("ne0  HWaddr %02x:%02x:%02x:%02x:%02x:%02x\n",
            m[0], m[1], m[2], m[3], m[4], m[5]);
     /* NOTE: lwIP 2.1.3 ip4addr_ntoa uses ONE static buffer — three
@@ -228,7 +340,7 @@ void net_print_info(void) {
     printf("  gateway %s\n", ipaddr_ntoa(&nif.gw));
     printf("     RX %u  TX %u  drop %u  irq %u  ovw %u\n",
            st_rx, st_tx, st_drop,
-           ne2000_irq_count(), ne2000_rx_overflow());
+           nic_irq_count(), nic_rx_overflow());
 }
 
 // ---------------- ICMP ping (raw API) ----------------------
@@ -484,7 +596,7 @@ void net_get_info(uint32_t* w) {
     w[2] = nif.ip_addr.addr;
     w[3] = nif.netmask.addr;
     w[4] = nif.gw.addr;
-    const uint8_t* m = ne2000_mac();
+    const uint8_t* m = nic_mac();
     w[5] = (uint32_t)m[0] | ((uint32_t)m[1] << 8)
          | ((uint32_t)m[2] << 16) | ((uint32_t)m[3] << 24);
     w[6] = (uint32_t)m[4] | ((uint32_t)m[5] << 8);

@@ -12,6 +12,9 @@ void timer_handler(void* frame);
 uint32_t get_tick(void);
 void sleep_ms(uint32_t ms);
 
+/* Phase A: the new dispatch, called by the asm stub isr_32 (it can context-switch). */
+void task_irq_dispatch(void);
+
 /* Returns the timer frequency (Hz). */
 uint32_t timer_freq_hz(void);
 

@@ -13,6 +13,8 @@
 
 #include "fs_fat32_internal.h"
 #include "header/fs_fat32.h"
+#include "header/fs_ram.h"   /* v0.3 FR-08: fs_content_release / cont_owner */
+#include "header/task.h"   // Phase A: sched-lock
 #include "header/stdio.h"
 #include "header/malloc.h"
 #include "header/libstring.h"
@@ -329,12 +331,13 @@ static int dirent_update(struct fs_node* node) {
 // ===================================================================
 
 int fat32_create_file(struct fs_node* dir, const char* name) {
-    if (!dir || !dir->is_dir || dir->backing != 1) return -1;
-    if (!name || !name[0]) return -2;
-    if (strlen(name) > FAT_NAME_MAX) return -3;
-    if (!g_fat.writable) return -4;
+    task_sched_lock();   /* Phase A: no preemption mid-storage-operation */
+    if (!dir || !dir->is_dir || dir->backing != 1) { task_sched_unlock(); return -1; }
+    if (!name || !name[0]) { task_sched_unlock(); return -2; }
+    if (strlen(name) > FAT_NAME_MAX) { task_sched_unlock(); return -3; }
+    if (!g_fat.writable) { task_sched_unlock(); return -4; }
     fat32_populate_dir(dir);
-    if (fs_find_child(dir, name)) return -5;            // exists
+    if (fs_find_child(dir, name)) { task_sched_unlock(); return -5; }
 
     // short name + LFN decision
     uint8_t sfn[11];
@@ -347,7 +350,7 @@ int fat32_create_file(struct fs_node* dir, const char* name) {
     //   LFN name        -> re-mangle with the classic ~1..~9 numeric
     //                       tails until the short name is free
     if (!needs_lfn) {
-        if (sfn_taken(dir, sfn)) return -5;             // duplicate 8.3
+        if (sfn_taken(dir, sfn)) { task_sched_unlock(); return -5; }
     } else {
         if (sfn_taken(dir, sfn)) {
             int found = 0;
@@ -364,6 +367,7 @@ int fat32_create_file(struct fs_node* dir, const char* name) {
             if (!found) {
                 printf("FAT32: no free 8.3 alias for '%s' (~1..~9 taken)\n",
                        name);
+                task_sched_unlock();
                 return -10;
             }
         }
@@ -376,30 +380,34 @@ int fat32_create_file(struct fs_node* dir, const char* name) {
     struct grow_ctx g;
     if (dir_find_free_run(dir, need, slots, &g) != 0) {
         printf("FAT32: directory full / grow failed\n");
+        task_sched_unlock();
         return -7;
     }
 
     struct dos_datetime dt = fat_rtc_now();
     if (dirent_write_run(slots, need, name, sfn, FAT_ATTR_ARCHIVE,
-                         0, 0, dt) != 0) return -8;
+                         0, 0, dt) != 0) { task_sched_unlock(); return -8; }
 
     // RAM mirror node: position = the 8.3 slot
     struct fs_node* n = fat_new_node(dir, name, 0, 0, 0,
                                      slots[need - 1].lba,
                                      slots[need - 1].index,
                                      (uint16_t)lfn_n, sfn);
-    if (!n) return -9;
+    if (!n) { task_sched_unlock(); return -9; }
     fat_fsinfo_sync();                  // dir may have grown (1 cluster)
+    task_sched_unlock();
     return 0;
+    task_sched_unlock();
 }
 
 int fat32_create_dir(struct fs_node* dir, const char* name) {
-    if (!dir || !dir->is_dir || dir->backing != 1) return -1;
-    if (!name || !name[0]) return -2;
-    if (strlen(name) > FAT_NAME_MAX) return -3;
-    if (!g_fat.writable) return -4;
+    task_sched_lock();   /* Phase A: no preemption mid-storage-operation */
+    if (!dir || !dir->is_dir || dir->backing != 1) { task_sched_unlock(); return -1; }
+    if (!name || !name[0]) { task_sched_unlock(); return -2; }
+    if (strlen(name) > FAT_NAME_MAX) { task_sched_unlock(); return -3; }
+    if (!g_fat.writable) { task_sched_unlock(); return -4; }
     fat32_populate_dir(dir);
-    if (fs_find_child(dir, name)) return -5;
+    if (fs_find_child(dir, name)) { task_sched_unlock(); return -5; }
 
     uint8_t sfn[11];
     int needs_lfn = !name_is_plain_sfn(name);
@@ -407,7 +415,7 @@ int fat32_create_dir(struct fs_node* dir, const char* name) {
 
     // v0.2 write hardening: same real-8.3 collision policy as files
     if (!needs_lfn) {
-        if (sfn_taken(dir, sfn)) return -5;
+        if (sfn_taken(dir, sfn)) { task_sched_unlock(); return -5; }
     } else if (sfn_taken(dir, sfn)) {
         int found = 0;
         for (int t = 1; t <= 9; t++) {
@@ -422,6 +430,7 @@ int fat32_create_dir(struct fs_node* dir, const char* name) {
         if (!found) {
             printf("FAT32: no free 8.3 alias for '%s' (~1..~9 taken)\n",
                    name);
+            task_sched_unlock();
             return -10;
         }
     }
@@ -429,13 +438,13 @@ int fat32_create_dir(struct fs_node* dir, const char* name) {
     int lfn_n = needs_lfn ? (int)((strlen(name) + 12) / 13) : 0;
     int need  = 1 + lfn_n;
     struct dir_slot slots[24];
-    if (need > (int)(sizeof(slots) / sizeof(slots[0]))) return -6;
+    if (need > (int)(sizeof(slots) / sizeof(slots[0]))) { task_sched_unlock(); return -6; }
     struct grow_ctx g;
-    if (dir_find_free_run(dir, need, slots, &g) != 0) return -7;
+    if (dir_find_free_run(dir, need, slots, &g) != 0) { task_sched_unlock(); return -7; }
 
     // allocate + zero the directory cluster (flush each sector)
     uint32_t nc = fat_alloc_cluster();
-    if (nc == 0) return -8;
+    if (nc == 0) { task_sched_unlock(); return -8; }
     uint64_t nlba = fat_cluster_lba(nc);
     for (uint8_t s = 0; s < g_fat.sec_per_clus; s++) {
         fat_cache_zero(nlba + s);
@@ -446,7 +455,7 @@ int fat32_create_dir(struct fs_node* dir, const char* name) {
     struct dos_datetime dt = fat_rtc_now();
     {
         uint8_t* sec = fat_cache_get(nlba);
-        if (!sec) return -9;
+        if (!sec) { task_sched_unlock(); return -9; }
         uint8_t dot[11]   = { '.',' ',' ',' ',' ',' ',' ',' ',' ',' ',' ' };
         uint8_t dotdot[11]= { '.','.',' ',' ',' ',' ',' ',' ',' ',' ',' ' };
         dirent_fill(sec + 0, dot, FAT_ATTR_DIR, nc, 0, dt);
@@ -465,16 +474,19 @@ int fat32_create_dir(struct fs_node* dir, const char* name) {
                                      slots[need - 1].lba,
                                      slots[need - 1].index,
                                      (uint16_t)lfn_n, sfn);
-    if (!n) return -11;
+    if (!n) { task_sched_unlock(); return -11; }
     fat_fsinfo_sync();                  // new dir cluster + maybe grow
+    task_sched_unlock();
     return 0;
+    task_sched_unlock();
 }
 
 int fat32_write_file(struct fs_node* file, const uint8_t* data,
                      uint32_t len) {
-    if (!file || file->backing != 1 || file->is_dir) return -1;
-    if (!g_fat.writable) return -2;
-    if (len && !data) return -3;
+    task_sched_lock();   /* Phase A: no preemption mid-storage-operation */
+    if (!file || file->backing != 1 || file->is_dir) { task_sched_unlock(); return -1; }
+    if (!g_fat.writable) { task_sched_unlock(); return -2; }
+    if (len && !data) { task_sched_unlock(); return -3; }
 
     uint32_t cb       = g_fat.cluster_bytes;
     uint32_t need_cl  = (len + cb - 1) / cb;
@@ -499,6 +511,7 @@ int fat32_write_file(struct fs_node* file, const uint8_t* data,
         if (dirent_update(file) != 0) {
             file->size = old_size;               // restore the mirror
             file->first_cluster = first;
+            task_sched_unlock();
             return -8;
         }
         if (first >= 2) fat_free_chain(first);
@@ -507,6 +520,7 @@ int fat32_write_file(struct fs_node* file, const uint8_t* data,
         first = fat_alloc_chain(need_cl);
         if (first == 0) {
             printf("FAT32: volume full\n");
+            task_sched_unlock();
             return -4;
         }
         added = first;                          // whole chain is new
@@ -524,6 +538,7 @@ int fat32_write_file(struct fs_node* file, const uint8_t* data,
             uint32_t add = fat_alloc_chain(need_cl - have);
             if (add == 0) {
                 printf("FAT32: volume full\n");
+                task_sched_unlock();
                 return -4;
             }
             fat_entry_set(c, add);
@@ -589,26 +604,46 @@ int fat32_write_file(struct fs_node* file, const uint8_t* data,
 mirror_refresh:
     // ---- RAM mirror -----------------------------------------------
     // refresh the RAM cache: point at a COPY of the new data (the
-    // caller's buffer is often stack memory). Arena first (is_ref 1,
-    // never freed), heap as fallback for small files; when neither
-    // is available the content stays NULL and re-reads lazily.
-    if (file->content && !file->is_ref) free(file->content);
-    file->content = NULL;
-    file->is_ref  = 0;
-    if (len > 0) {
-        uint8_t* cache = fat_arena_alloc_public(len);
-        if (cache) {
-            for (uint32_t i = 0; i < len; i++) cache[i] = data[i];
-            file->content = (char*)cache;
-            file->is_ref  = 1;
-        } else if (len <= 262144) {
-            file->content = (char*)malloc(len);
-            if (file->content)
-                for (uint32_t i = 0; i < len; i++)
-                    file->content[i] = (char)data[i];
+    // caller's buffer is often stack memory). Arena first (cont_owner 2,
+    // v0.3: reclaimable via fat_arena_free), heap as fallback for small
+    // files; when neither is available the content stays NULL and
+    // re-reads lazily.
+    //
+    // v0.3 FR-01 (UAF fix): `data` may BE the old file->content (the
+    // flush-from-cache path used by SYS_CLOSE). Fill the NEW cache
+    // first and release the old buffer only afterwards.
+    {
+        char*    old_content = file->content;
+        uint8_t  old_owner   = file->cont_owner;
+        uint8_t  old_ref     = file->is_ref;
+        file->content = NULL;
+        file->is_ref  = 0;
+        file->cont_owner = 0;
+        if (len > 0) {
+            uint8_t* cache = fat_arena_alloc_public(len);
+            if (cache) {
+                for (uint32_t i = 0; i < len; i++) cache[i] = data[i];
+                file->content = (char*)cache;
+                file->is_ref  = 1;
+                file->cont_owner = 2;
+            } else if (len <= 262144) {
+                file->content = (char*)malloc(len);
+                if (file->content)
+                    for (uint32_t i = 0; i < len; i++)
+                        file->content[i] = (char)data[i];
+            }
+        }
+        /* release the OLD cache (owner-aware) AFTER the copy */
+        if (old_content) {
+            if (!old_ref && old_owner == 0) {
+                free(old_content);
+            } else if (old_ref && old_owner == 2) {
+                fat_arena_free(old_content);
+            }
         }
     }
     fat_fsinfo_sync();                  // one FSInfo write per operation
+    task_sched_unlock();
     return 0;
 
 write_fail:
@@ -630,9 +665,17 @@ write_fail:
         if (added == first) first = 0;   // brand-new chain, all gone
     }
     // drop any stale cache so the next read reflects the dirent truth
-    if (file->content && !file->is_ref) free(file->content);
-    file->content = NULL;
-    file->is_ref  = 0;
+    // (v0.3 FR-08: owner-aware — arena caches are reclaimed too)
+    if (file->content) {
+        uint8_t own = file->cont_owner;
+        uint8_t ref = file->is_ref;
+        char*   c   = file->content;
+        file->content = NULL;
+        file->is_ref  = 0;
+        file->cont_owner = 0;
+        if (!ref && own == 0) free(c);
+        else if (ref && own == 2) fat_arena_free(c);
+    }
     file->size = old_size;
     file->first_cluster = (old_size == 0) ? 0 : first;
     // NOTE: when added == first (new file) the dirent still says
@@ -643,19 +686,22 @@ write_fail:
     // first < 2, i.e. old_size == 0).
     printf("FAT32: write failed, chain rolled back\n");
     fat_fsinfo_sync();
+    task_sched_unlock();
     return -6;
+    task_sched_unlock();
 }
 
 int fat32_delete(struct fs_node* node) {
-    if (!node || node->backing != 1 || !node->parent) return -1;
-    if (!g_fat.writable) return -2;
+    task_sched_lock();   /* Phase A: no preemption mid-storage-operation */
+    if (!node || node->backing != 1 || !node->parent) { task_sched_unlock(); return -1; }
+    if (!g_fat.writable) { task_sched_unlock(); return -2; }
     if (node->is_dir) {
         fat32_populate_dir(node);
         // v0.2 write hardening: -4 = "directory not empty", the SAME
         // code the shell (rm/rmdir) and fs_delete_node already use —
         // the old -3 printed a second, differently-worded message on
         // top of the shell's "rm: failed".
-        if (node->children) return -4;
+        if (node->children) { task_sched_unlock(); return -4; }
     }
 
     // mark the dirent run 0xE5: LFN entries (same or earlier sectors,
@@ -666,10 +712,10 @@ int fat32_delete(struct fs_node* node) {
     int      idx  = node->dirent_index;
     for (uint32_t k = 0; k < total; k++) {
         uint8_t* sec = fat_cache_get(lba);
-        if (!sec) return -4;
+        if (!sec) { task_sched_unlock(); return -4; }
         uint8_t* e = sec + idx * 32;
         // sanity: the 8.3 slot must not already be free
-        if (k == 0 && (e[0] == 0xE5 || e[0] == 0x00)) return -5;
+        if (k == 0 && (e[0] == 0xE5 || e[0] == 0x00)) { task_sched_unlock(); return -5; }
         e[0] = 0xE5;
         g_fat.cache_dirty = 1;
         // step back one entry, crossing sector boundaries backwards
@@ -704,8 +750,9 @@ int fat32_delete(struct fs_node* node) {
     if (node->first_cluster >= 2)
         fat_free_chain(node->first_cluster);
 
-    // unlink the RAM mirror node (content: heap caches freed, arena
-    // caches (is_ref) abandoned by design)
+    // unlink the RAM mirror node (v0.3 FR-08: ALL caches are released
+    // owner-aware — the arena is a free-list now, so arena caches are
+    // reclaimed instead of abandoned)
     struct fs_node* parent = node->parent;
     struct fs_node* prev = NULL;
     struct fs_node* c = parent->children;
@@ -718,10 +765,12 @@ int fat32_delete(struct fs_node* node) {
         prev = c;
         c = c->next;
     }
-    if (node->content && !node->is_ref) free(node->content);
+    fs_content_release(node);
     free(node);
     fat_fsinfo_sync();                  // data chain was freed
+    task_sched_unlock();
     return 0;
+    task_sched_unlock();
 }
 
 // fat_arena_alloc_public() lives in fs_fat32.cpp (arena owner).

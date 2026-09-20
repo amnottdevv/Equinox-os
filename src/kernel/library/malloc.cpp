@@ -1,5 +1,6 @@
 #include "header/malloc.h"
 #include "header/stdio.h"   // printf for malloc_stats
+#include "header/task.h"   // Phase A: per-task MRP arena
 #include <stdint.h>
 #include <stddef.h>
 
@@ -38,6 +39,23 @@
 #define KERNEL_HEAP_START 0x300000u
 #define KERNEL_HEAP_MAX   0x500000u
 
+/* v0.3 TOOLS RELEASE (29 eqbuild tools): the main 2 MB heap is not
+ * enough for the RAMFS at build time — eqbuild writes ~34 KB .mrp
+ * products while the boot modules + sources already fill ~1.2 MB,
+ * and the freed .c blocks are too fragmented for contiguous 34 KB
+ * allocations (OOM at tool #13). FIX: extend the kernel heap with
+ * the FREE physical gap between USER_STACK_END (0x2702000) and the
+ * GRUB module staging area (0x2800000) — ~1 MB, identity-mapped
+ * supervisor pages (paging.cpp maps all of low 64 MB), claimed by
+ * nothing else (see usermode.h). The kernel arena becomes TWO
+ * physical regions on ONE address-ordered free list; coalesce()
+ * and realloc() only merge PHYSICALLY ADJACENT blocks so the two
+ * regions can never be fused into a phantom block spanning the
+ * gap. */
+#define KERNEL_HEAP_EXT_START 0x2702000u
+#define KERNEL_HEAP_EXT_END   0x2800000u
+
+
 #define MRP_HEAP_START    0x500000u
 #define MRP_HEAP_MAX      0x2600000u   /* == USER_ARENA_END (usermode.h) */
 
@@ -56,9 +74,9 @@ static uint32_t kernel_heap_start(void) {
 
 struct block_header {
     uint32_t        magic;
-    size_t          size;    // ukuran payload (TIDAK termasuk header ini)
+    size_t          size;    // payload size (NOT counting this header)
     uint8_t         free;
-    block_header*   next;    // block fisik berikutnya (address-ordered)
+    block_header*   next;    // next physical block (address-ordered)
 };
 
 struct heap_arena {
@@ -68,8 +86,25 @@ struct heap_arena {
     uint8_t         inited;
 };
 
-static heap_arena kernel_arena = { 0, KERNEL_HEAP_MAX, nullptr, 0 };
-static heap_arena mrp_arena    = { MRP_HEAP_START,    MRP_HEAP_MAX,    nullptr, 0 };
+static heap_arena kernel_arena = { 0, KERNEL_HEAP_EXT_END, nullptr, 0 };
+
+/* Phase A — the MRP arena is now PER-TASK (field Task::mrp_arena).
+ * The task_mrp_arena layout (task.h) MUST be identical to heap_arena
+ * — guarded by the static_assert below. Before tasks exist (boot),
+ * a static fallback is used (the legacy behavior).
+ * Note: a task's arena VMA = the 0x500000+ window mapped onto its
+ * physical chunk (task.cpp) — the first allocation is still
+ * 0x500010, exactly matching the .mrp link convention. */
+static heap_arena mrp_fallback = { MRP_HEAP_START, MRP_HEAP_MAX, nullptr, 0 };
+
+static_assert(sizeof(heap_arena) == sizeof(struct task_mrp_arena),
+              "task_mrp_arena layout != heap_arena (see task.h)");
+
+static inline heap_arena* mrp_a(void) {
+    struct Task* t = task_current();
+    if (t) return (heap_arena*)&t->mrp_arena;
+    return &mrp_fallback;
+}
 
 static inline size_t align_up(size_t size) {
     return (size + 7u) & ~((size_t)7u);
@@ -97,7 +132,7 @@ static inline int size_sane(heap_arena* a, size_t size) {
 
 static inline void arena_init(heap_arena* a) {
     if (a->inited) return;
-    if (a->start == 0) a->start = kernel_heap_start();   /* kernel arena dinamis */
+    if (a->start == 0) a->start = kernel_heap_start();   /* dynamic kernel arena */
     block_header* first = (block_header*)a->start;
     first->magic = BLOCK_MAGIC;
     first->size  = (a->max - a->start) - sizeof(block_header);
@@ -105,6 +140,22 @@ static inline void arena_init(heap_arena* a) {
     first->next  = nullptr;
     a->head = first;
     a->inited = 1;
+
+    /* v0.3 TOOLS: the KERNEL arena spans TWO physical regions (main
+     * 2 MB below 0x500000 + the ~1 MB gap above the user stack, see
+     * KERNEL_HEAP_EXT_*). Trim the first block to the main region and
+     * chain a second free block for the extension on the same
+     * address-ordered free list. MRP/task arenas stay single-region. */
+    if (a == &kernel_arena) {
+        first->size = (KERNEL_HEAP_MAX - a->start) - sizeof(block_header);
+        block_header* second = (block_header*)KERNEL_HEAP_EXT_START;
+        second->magic = BLOCK_MAGIC;
+        second->size  = (KERNEL_HEAP_EXT_END - KERNEL_HEAP_EXT_START)
+                        - sizeof(block_header);
+        second->free  = 1;
+        second->next  = nullptr;
+        first->next   = second;
+    }
 }
 
 static block_header* arena_find_fit(heap_arena* a, size_t size) {
@@ -134,7 +185,15 @@ static void arena_split(block_header* blk, size_t size) {
 }
 
 static void arena_coalesce(heap_arena* a, block_header* blk) {
-    while (blk->next && blk->next->free) {
+    /* v0.3 TOOLS: merge only PHYSICALLY ADJACENT neighbors — the
+     * kernel arena is two regions; list-adjacent blocks across the
+     * 0x500000..0x2702000 gap must NOT be fused (a phantom block
+     * spanning the gap would hand out memory owned by the user
+     * pool/stacks). For single-region arenas nothing changes: their
+     * list-adjacent free blocks are always physically adjacent. */
+    while (blk->next && blk->next->free &&
+           (uintptr_t)blk + sizeof(block_header) + blk->size
+               == (uintptr_t)blk->next) {
         block_header* nxt = blk->next;
         blk->size += sizeof(block_header) + nxt->size;
         blk->next = nxt->next;
@@ -142,10 +201,14 @@ static void arena_coalesce(heap_arena* a, block_header* blk) {
 
     block_header* cur = a->head;
     while (cur && cur->next != blk) cur = cur->next;
-    if (cur && cur->free) {
+    if (cur && cur->free &&
+        (uintptr_t)cur + sizeof(block_header) + cur->size
+            == (uintptr_t)blk) {
         cur->size += sizeof(block_header) + blk->size;
         cur->next = blk->next;
-        while (cur->next && cur->next->free) {
+        while (cur->next && cur->next->free &&
+               (uintptr_t)cur + sizeof(block_header) + cur->size
+                   == (uintptr_t)cur->next) {
             block_header* nxt = cur->next;
             cur->size += sizeof(block_header) + nxt->size;
             cur->next = nxt->next;
@@ -177,11 +240,11 @@ static void arena_free(heap_arena* a, void* ptr) {
     block_header* blk = (block_header*)((uintptr_t)ptr - sizeof(block_header));
 
     if (blk->magic != BLOCK_MAGIC) {
-        printf("[malloc] PANIC: heap corruption terdeteksi di free(0x%x)\n", (uint32_t)(uintptr_t)ptr);
+        printf("[malloc] PANIC: heap corruption detected at free(0x%x)\n", (uint32_t)(uintptr_t)ptr);
         return;
     }
     if (blk->free) {
-        printf("[malloc] WARNING: double-free terdeteksi di 0x%x, diabaikan\n", (uint32_t)(uintptr_t)ptr);
+        printf("[malloc] WARNING: double-free detected at 0x%x, ignored\n", (uint32_t)(uintptr_t)ptr);
         return;
     }
 
@@ -262,8 +325,11 @@ extern "C" void* realloc(void* ptr, size_t new_size) {
 
         // FIX(M3): a pointer outside the kernel heap range is invalid. The old code
         // read blk->magic straight from a wild address -> wild read / kernel page fault.
-    if ((uintptr_t)ptr < (uintptr_t)KERNEL_HEAP_START ||
-        (uintptr_t)ptr >= (uintptr_t)KERNEL_HEAP_MAX) {
+    // v0.3 TOOLS: the kernel heap is TWO regions (main + extension).
+    if (!((uintptr_t)ptr >= (uintptr_t)KERNEL_HEAP_START &&
+          (uintptr_t)ptr <  (uintptr_t)KERNEL_HEAP_MAX) &&
+        !((uintptr_t)ptr >= (uintptr_t)KERNEL_HEAP_EXT_START &&
+          (uintptr_t)ptr <  (uintptr_t)KERNEL_HEAP_EXT_END)) {
         printf("[malloc] PANIC: realloc() on a pointer outside the heap 0x%x\n", (uint32_t)(uintptr_t)ptr);
         return nullptr;
     }
@@ -275,7 +341,7 @@ extern "C" void* realloc(void* ptr, size_t new_size) {
     block_header* blk = (block_header*)((uintptr_t)ptr - sizeof(block_header));
     if (blk->magic != BLOCK_MAGIC) {
         irq_restore(f);
-        printf("[malloc] PANIC: realloc() pada pointer invalid 0x%x\n", (uint32_t)(uintptr_t)ptr);
+        printf("[malloc] PANIC: realloc() on an invalid pointer 0x%x\n", (uint32_t)(uintptr_t)ptr);
         return nullptr;
     }
 
@@ -288,6 +354,10 @@ extern "C" void* realloc(void* ptr, size_t new_size) {
     }
 
     if (blk->next && blk->next->free &&
+        /* v0.3 TOOLS: adjacency guard — never fuse blocks across the
+         * two-region gap (see arena_coalesce). */
+        (uintptr_t)blk + sizeof(block_header) + blk->size
+            == (uintptr_t)blk->next &&
         blk->size + sizeof(block_header) + blk->next->size >= aligned) {
         block_header* nxt = blk->next;
         blk->size += sizeof(block_header) + nxt->size;
@@ -319,14 +389,15 @@ extern "C" void free(void* ptr) {
 // ==================== Debug ====================
 extern "C" void malloc_stats(void) {
     size_t used  = arena_used(&kernel_arena);
-    size_t total = KERNEL_HEAP_MAX - (kernel_arena.inited ? (size_t)kernel_arena.start
-                                                         : (size_t)KERNEL_HEAP_START);
+    size_t total = (KERNEL_HEAP_MAX - (kernel_arena.inited ? (size_t)kernel_arena.start
+                                                           : (size_t)KERNEL_HEAP_START))
+                   + (KERNEL_HEAP_EXT_END - KERNEL_HEAP_EXT_START);
     uint32_t pct = total ? (uint32_t)((used * 100) / total) : 0;
     printf("Heap: %u / %u bytes used (%u%%)\n", (uint32_t)used, (uint32_t)total, pct);
     printf("Free blocks: %u, largest free: %u bytes\n",
            arena_free_block_count(&kernel_arena), (uint32_t)arena_largest_free(&kernel_arena));
     if (!arena_check_integrity(&kernel_arena)) {
-        printf("[malloc] WARNING: heap integrity check GAGAL!\n");
+        printf("[malloc] WARNING: heap integrity check FAILED!\n");
     }
 }
 
@@ -335,8 +406,11 @@ extern "C" uint32_t get_heap_used(void) {
 }
 
 extern "C" uint32_t get_heap_total(void) {
-    return KERNEL_HEAP_MAX - (kernel_arena.inited ? (uint32_t)kernel_arena.start
-                                                  : (uint32_t)KERNEL_HEAP_START);
+    /* v0.3 TOOLS: main region + the extension region. */
+    uint32_t main_sz = KERNEL_HEAP_MAX - (kernel_arena.inited
+                        ? (uint32_t)kernel_arena.start
+                        : (uint32_t)KERNEL_HEAP_START);
+    return main_sz + (KERNEL_HEAP_EXT_END - KERNEL_HEAP_EXT_START);
 }
 
 extern "C" uint32_t get_heap_free_blocks(void) {
@@ -354,30 +428,51 @@ extern "C" int heap_check_integrity(void) {
 // ==================== MRP program heap (used by the .mrp loader) ====================
 
 extern "C" void mrp_heap_init(void) {
-    mrp_arena.inited = 0;
-    mrp_arena.head = nullptr;
-    arena_init(&mrp_arena);
+    heap_arena* a = mrp_a();
+    a->inited = 0;
+    a->head = nullptr;
+    arena_init(a);
 }
 
 extern "C" void* mrp_alloc(size_t size) {
     uint32_t f = irq_save();
-    void* p = arena_alloc(&mrp_arena, size);
+    void* p = arena_alloc(mrp_a(), size);
     irq_restore(f);
     return p;
 }
 
+/* v0.3 FR-03: free a single MRP-arena block. The arena has been a
+ * split+coalesce free-list since v2 — only the syscall wrapper was
+ * missing, so SYS_MALLOC could never be paired with a free(). Range
+ * + magic checks live in arena_free (wild/double frees are reported
+ * and ignored there, not fatal). */
+extern "C" int mrp_free(void* ptr) {
+    if (!ptr) return 0;
+    uint32_t f = irq_save();
+    heap_arena* a = mrp_a();
+    if ((uintptr_t)ptr < a->start || (uintptr_t)ptr >= a->max) {
+        irq_restore(f);
+        return -1;                  /* not an arena pointer */
+    }
+    arena_free(a, ptr);
+    irq_restore(f);
+    return 0;
+}
+
 extern "C" void mrp_free_all(void) {
     uint32_t f = irq_save();
-    mrp_arena.inited = 0;
-    mrp_arena.head = nullptr;
-    arena_init(&mrp_arena);
+    heap_arena* a = mrp_a();
+    a->inited = 0;
+    a->head = nullptr;
+    arena_init(a);
     irq_restore(f);
 }
 
 extern "C" uint32_t get_mrp_heap_used(void) {
-    return (uint32_t)arena_used(&mrp_arena);
+    return (uint32_t)arena_used(mrp_a());
 }
 
 extern "C" uint32_t get_mrp_heap_total(void) {
-    return MRP_HEAP_MAX - MRP_HEAP_START;
+    heap_arena* a = mrp_a();
+    return (uint32_t)(a->inited || a->max ? (a->max - a->start) : 0);
 }

@@ -34,6 +34,7 @@ int heap_check_integrity(void);
 // This region has its own free-list with a separate API.
 void  mrp_heap_init(void);
 void* mrp_alloc(size_t size);
+int   mrp_free(void* ptr);    // v0.3 FR-03: free ONE block (0 = ok / -1 = not an arena pointer)
 void  mrp_free_all(void); // release ALL program allocations (called when the program exits)
 uint32_t get_mrp_heap_used(void);
 uint32_t get_mrp_heap_total(void);

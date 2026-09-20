@@ -28,7 +28,8 @@
 #include "header/syscall.h"
 #include "header/stdio.h"       // printf, put_char, print_string, print_int, gets, getkey
 #include "header/fs_ram.h"      // fs_get_root, fs_find_child, fs_get_node_from_path
-#include "header/malloc.h"      // mrp_alloc (arena .mrp)
+#include "header/fs_fat32.h"    // v0.3 FR-01/FR-08: fat32_write_file, fat_arena_free
+#include "header/malloc.h"      // mrp_alloc (arena .mrp), mrp_free, realloc
 #include "header/timer.h"       // get_tick, sleep_ms
 #include "header/mrp_loader.h"  // mrp_run (exec .mrp from RAMFS)
 #include "header/vesa.h"        // framebuffer getters + draw (syscalls 20-22)
@@ -36,6 +37,7 @@
 #include "header/libstring.h"  // memcpy/memcmp (blit fast path v10.10)
 #include "header/libaudio.h"    // audio_tone_on/off (syscall 25)
 #include "header/usermode.h"    // user3_terminate + region user (v10.7)
+#include "header/task.h"        // Phase A: per-task fd/cwd/args + graphics focus gate
 #include "net/net.h"             // v10.12 Phase C: net_get_info / net_ping_raw
 #include <stdint.h>
 #include <stddef.h>
@@ -76,30 +78,48 @@ asm(
 );
 
 // ============================================================
-//  2. FILE DESCRIPTOR TABLE (RAMFS)
+//  2. FILE DESCRIPTOR TABLE — Phase A: PER-TASK
 // ------------------------------------------------------------
 //  fd 0/1/2 = console (stdin/stdout/stderr) — node == NULL.
 //  fd 3..SYS_MAX_FDS-1 = read-only RAMFS file + read position.
-//  A single global table (no per-process one yet) — good enough for
-//  single-tasking; move to per-process when multitasking arrives.
+//  The sys_fd_entry struct lives in task.h (field Task::fds).
+//  The macros keep the legacy code shape (fd_table[i].node etc.).
 // ============================================================
 #define SYS_MAX_FDS 16
 
-struct sys_fd_entry {
-    struct fs_node* node;   // NULL = free slot / console
-    uint32_t pos;           // next read position (sequential)
-};
+static struct sys_fd_entry  fd_table_fallback[SYS_MAX_FDS];
+static struct fs_node*      cwd_fallback = NULL;
+static char                 args_fallback[256];
 
-static struct sys_fd_entry fd_table[SYS_MAX_FDS];
+static inline struct sys_fd_entry* task_fds_cur(void) {
+    struct Task* t = task_current();
+    return t ? t->fds : fd_table_fallback;
+}
+static inline struct fs_node*& proc_cwd_ref(void) {
+    struct Task* t = task_current();
+    if (t) return t->cwd;
+    return cwd_fallback;
+}
+static inline char* task_args_cur(void) {
+    struct Task* t = task_current();
+    return t ? t->args : args_fallback;
+}
+
+#define fd_table   (task_fds_cur())
+#define proc_cwd   (proc_cwd_ref())
+#define g_run_args (task_args_cur())
+
+/* v0.3 (FR-02): defined in the pipe section (section 4d, below
+ * the file syscalls) — forward-declared because sys_read/sys_write
+ * dispatch to them. */
+static uint32_t pipe_read(uint32_t fd, char* buf, uint32_t len);
+static uint32_t pipe_write(uint32_t fd, const char* buf, uint32_t len);
 
 // ============================================================
 //  3a. PROCESS CWD — set by the shell before running a .mrp tool.
-//  Relative paths in open()/exec()/mkfile() resolve against this
-//  directory, so `mtcc main.c` works from whatever directory the
-//  user is currently in (not hard-wired to root like before).
+//  Phase A: now PER-TASK (field Task::cwd) — every shell/console has
+//  its own working directory. Accessed via the proc_cwd macro.
 // ============================================================
-static struct fs_node* proc_cwd = NULL;
-
 void syscall_set_cwd(struct fs_node* cwd) {
     proc_cwd = (cwd && cwd->is_dir) ? cwd : fs_get_root();
 }
@@ -240,8 +260,11 @@ static uint32_t sys_exec(uint32_t path_, uint32_t a2, uint32_t a3) {
      * FIX(audit V3 #1): exec from INSIDE a still-running .mrp program
      * (nested) is rejected by mrp_run with MRP_RUN_ERR_BUSY -> SYS_EBUSY (-9).
      * Before: the MRP arena was reset -> the caller's code got overwritten
-     * -> a deterministic #GP/#UD panic every time a nested exec was called. */
-    int r = mrp_run(node->parent, node->name);
+     * -> a deterministic #GP/#UD panic every time a nested exec was called.
+     * Phase A.1: DOOM regression fix — the arena hint is now derived from
+     * the program name (24 MB for doom) instead of the old flat 2 MB,
+     * which could not even hold the shareware WAD (4.2 MB). */
+    int r = mrp_run_hint(node->parent, node->name, mrp_arena_hint_for(node->name));
     switch (r) {
         case MRP_RUN_OK:            return 0;
         case MRP_RUN_ERR_NOT_FOUND: return (uint32_t)SYS_ENOENT;
@@ -255,9 +278,104 @@ static uint32_t sys_exec(uint32_t path_, uint32_t a2, uint32_t a3) {
 // ---- 3: getpid() ----
 static uint32_t sys_getpid(uint32_t a1, uint32_t a2, uint32_t a3) {
     (void)a1; (void)a2; (void)a3;
-    /* Single-tasking: the only "process" is the kernel task.
-     * Number 1 is consistent with init/PID 1 on UNIX-like systems. */
-    return 1;
+    /* Phase A: the task's real PID (task_getpid, fallback 1 for boot context). */
+    return (uint32_t)(task_getpid() ? (uint32_t)task_getpid() : 1);
+}
+
+// ============================================================
+//  4a. v0.3 FR-01/FR-08 — FILE WRITE-BACK HELPERS
+// ------------------------------------------------------------
+//  Model: writes land in the in-memory content buffer at the fd
+//  offset; the fd is marked dirty. ONE whole-file write-through
+//  (fat32_write_file) happens on close — the same primitive the
+//  MKFILE path uses, so cluster-chain growth/shrink, dirent and
+//  FSInfo stay consistent. RAMFS nodes are their own truth (no
+//  flush). Buffer growth: arena first for FAT-backed files (big),
+//  kernel heap as fallback / for RAMFS.
+// ============================================================
+
+/* Grow the file buffer to newsz (> f->size). Zero-fills the new
+ * tail (a write past EOF leaves a hole, POSIX-style). Returns 0 /
+ * -1 = out of memory. is_ref/cont_owner bookkeeping is kept exact
+ * so a later fs_content_release() frees through the right owner. */
+static int fd_file_grow(struct fs_node* f, uint32_t newsz) {
+    if (newsz <= f->size) return 0;
+
+    if (!f->content) {
+        /* empty / truncated file: fresh buffer */
+        uint8_t* nb = (f->backing == 1) ? fat_arena_alloc_public(newsz)
+                                        : NULL;
+        int arena = (nb != NULL);
+        if (!nb) nb = (uint8_t*)malloc(newsz);
+        if (!nb) return -1;
+        memset(nb, 0, newsz);
+        f->content    = (char*)nb;
+        f->size       = newsz;
+        f->is_ref     = arena ? 1 : 0;
+        f->cont_owner = arena ? 2 : 0;
+        return 0;
+    }
+
+    if (f->is_ref) {
+        /* staging (owner 1) or arena (owner 2): materialize a NEW
+         * buffer + copy — the old one is released owner-aware. */
+        uint8_t* nb = (f->backing == 1) ? fat_arena_alloc_public(newsz)
+                                        : NULL;
+        int arena = (nb != NULL);
+        if (!nb) {
+            nb = (uint8_t*)malloc(newsz);
+            if (!nb) return -1;
+        }
+        memcpy(nb, f->content, f->size);
+        memset(nb + f->size, 0, newsz - f->size);
+        if (f->cont_owner == 2) {
+            fat_arena_free(f->content);      /* arena: reclaim (FR-08) */
+        } /* owner 1 (GRUB staging): not ours, leave it */
+        f->content    = (char*)nb;
+        f->size       = newsz;
+        f->is_ref     = arena ? 1 : 0;
+        f->cont_owner = arena ? 2 : 0;
+        return 0;
+    }
+
+    /* heap-owned: try realloc, then the arena for big FAT files */
+    char* nb = (char*)realloc(f->content, newsz);
+    if (nb) {
+        memset(nb + f->size, 0, newsz - f->size);
+        f->content = nb;
+        f->size    = newsz;
+        return 0;
+    }
+    if (f->backing == 1) {
+        uint8_t* ab = fat_arena_alloc_public(newsz);
+        if (ab) {
+            memcpy(ab, f->content, f->size);
+            memset(ab + f->size, 0, newsz - f->size);
+            free(f->content);
+            f->content    = (char*)ab;
+            f->size       = newsz;
+            f->is_ref     = 1;
+            f->cont_owner = 2;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+/* Push the in-memory content of a dirty FAT-backed fd to disk with
+ * ONE whole-file write (fat32_write_file refreshes the RAM cache
+ * itself — UAF-safe since v0.3). RAMFS = no-op. 0 / errno. */
+static uint32_t fd_flush_dirty(uint32_t fd) {
+    struct sys_fd_entry* e = &fd_table[fd];
+    struct fs_node* n = e->node;
+    if (!n) return (uint32_t)SYS_EBADF;
+    if (!e->dirty) return 0;
+    if (n->backing != 1) { e->dirty = 0; return 0; }   /* RAMFS: own truth */
+
+    int r = fat32_write_file(n, (const uint8_t*)n->content, n->size);
+    e->dirty = 0;
+    if (r != 0) return (uint32_t)SYS_EIO;
+    return 0;
 }
 
 // ---- 4: write(fd, buf, len) ----
@@ -275,11 +393,42 @@ static uint32_t sys_write(uint32_t fd, uint32_t buf_, uint32_t len) {
     }
     if (fd == SYS_FD_STDIN) return (uint32_t)SYS_EBADF;   // write to stdin
 
-    if (fd >= SYS_MAX_FDS || !fd_table[fd].node)
+    if (fd >= SYS_MAX_FDS) return (uint32_t)SYS_EBADF;
+
+    /* v0.3 (FR-02): a pipe write end — blocking ring write. */
+    if (!fd_table[fd].node && fd_table[fd].pipe)
+        return pipe_write(fd, buf, len);
+
+    if (!fd_table[fd].node)
         return (uint32_t)SYS_EBADF;
 
-    /* Writing to RAMFS files is not supported yet (needs an fs append API — v2). */
-    return (uint32_t)SYS_ENOTSUP;
+    /* v0.3 FR-01: writable fds — modify the in-memory content at the
+     * current offset (O_APPEND always writes at EOF), grow the buffer
+     * on demand (hole zero-filled) and mark the fd dirty; ONE FAT
+     * write-through happens at close() (see fd_flush_dirty). */
+    struct sys_fd_entry* e = &fd_table[fd];
+    struct fs_node* f = e->node;
+    if (f->is_dir) return (uint32_t)SYS_EISDIR;
+
+    uint32_t acc = e->mode & 0x3u;
+    if (acc != SYS_O_WRONLY && acc != SYS_O_RDWR)
+        return (uint32_t)SYS_EBADF;            /* fd opened read-only */
+
+    if (len > 0x400000u) return (uint32_t)SYS_EINVAL;   /* 4 MB per write */
+
+    if (fs_ensure_content(f) != 0) return (uint32_t)SYS_EIO;
+
+    uint32_t pos = (e->mode & SYS_O_APPEND) ? f->size : e->pos;
+    if (pos + len > f->size) {
+        if (fd_file_grow(f, pos + len) != 0)
+            return (uint32_t)SYS_ENOMEM;
+    }
+    if (len) {
+        memcpy(f->content + pos, buf, len);
+        e->pos    = pos + len;
+        e->dirty  = 1;
+    }
+    return len;
 }
 
 // ---- 5: read(fd, buf, len) — file RAMFS sequential ----
@@ -290,7 +439,13 @@ static uint32_t sys_read(uint32_t fd, uint32_t buf_, uint32_t len) {
         return (uint32_t)SYS_EFAULT;
     if (fd <= SYS_FD_STDERR) return (uint32_t)SYS_ENOTSUP;  // console: use READLINE/GETKEY
 
-    if (fd >= SYS_MAX_FDS || !fd_table[fd].node)
+    if (fd >= SYS_MAX_FDS) return (uint32_t)SYS_EBADF;
+
+    /* v0.3 (FR-02): a pipe read end — blocking ring read. */
+    if (!fd_table[fd].node && fd_table[fd].pipe)
+        return pipe_read(fd, buf, len);
+
+    if (!fd_table[fd].node)
         return (uint32_t)SYS_EBADF;
 
     struct fs_node* f = fd_table[fd].node;
@@ -313,6 +468,8 @@ static uint32_t sys_read(uint32_t fd, uint32_t buf_, uint32_t len) {
 }
 
 // ---- 6: open(path) — open a RAMFS file read-only ----
+// v0.3: now a thin wrapper over the full flag path (sys_open2) with
+// flags = O_RDONLY — the legacy ABI (single argument) is unchanged.
 static uint32_t sys_open(uint32_t path_, uint32_t a2, uint32_t a3) {
     (void)a2; (void)a3;
     const char* path = (const char*)(uintptr_t)path_;
@@ -329,6 +486,9 @@ static uint32_t sys_open(uint32_t path_, uint32_t a2, uint32_t a3) {
         if (!fd_table[fd].node) {
             fd_table[fd].node = node;
             fd_table[fd].pos  = 0;
+            fd_table[fd].mode = SYS_O_RDONLY;   /* v0.3: read-only legacy */
+            fd_table[fd].dirty = 0;
+            fd_table[fd].dcur = NULL;
             return fd;
         }
     }
@@ -336,13 +496,51 @@ static uint32_t sys_open(uint32_t path_, uint32_t a2, uint32_t a3) {
 }
 
 // ---- 7: close(fd) ----
+// v0.3 FR-01/FR-08: a writable fd flushes its dirty content to disk
+// (ONE whole-file write-through for FAT), then — when this was the
+// LAST fd referencing a FAT-backed node — the content cache is
+// RELEASED (arena/heap) so sequentially reading many files does not
+// exhaust the 8 MB disk arena. RAMFS contents are never dropped
+// (the RAM copy IS the file).
+static uint32_t fd_close_index(uint32_t fd) {
+    struct sys_fd_entry* e = &fd_table[fd];
+    struct fs_node* n = e->node;
+    uint32_t ret = 0;
+
+    if (e->dirty) {
+        uint32_t fr = fd_flush_dirty(fd);
+        if (fr != 0) ret = fr;                  /* flush error surfaced */
+    }
+
+    /* FR-08: drop the FAT cache when no other fd (any task) still
+     * references the node. mrp_bootloader staging refs (cont_owner 1)
+     * are skipped inside fs_content_release. */
+    if (n && n->backing == 1 && task_fd_count_node(n, (int)fd) == 0) {
+        fs_content_release(n);
+    }
+
+    e->node  = nullptr;
+    e->pos   = 0;
+    e->mode  = 0;
+    e->dirty = 0;
+    e->dcur  = nullptr;
+    return ret;
+}
+
 static uint32_t sys_close(uint32_t fd, uint32_t a2, uint32_t a3) {
     (void)a2; (void)a3;
     if (fd < 3 || fd >= SYS_MAX_FDS) return (uint32_t)SYS_EBADF;
+    /* v0.3 (FR-02): a pipe end — refcount drop + wake + EOF. */
+    if (!fd_table[fd].node && fd_table[fd].pipe) {
+        struct kpipe* p = fd_table[fd].pipe;
+        uint32_t end = fd_table[fd].pipe_end;
+        fd_table[fd].pipe = NULL;
+        fd_table[fd].pipe_end = 0;
+        kpipe_end_ref(p, end, -1);
+        return 0;
+    }
     if (!fd_table[fd].node)          return (uint32_t)SYS_EBADF;
-    fd_table[fd].node = nullptr;
-    fd_table[fd].pos  = 0;
-    return 0;
+    return fd_close_index(fd);
 }
 
 // ---- 8: getkey() — keyboard non-blocking ----
@@ -405,18 +603,16 @@ static uint32_t sys_sleep(uint32_t ms, uint32_t a2, uint32_t a3) {
 }
 
 // ---- 15: getargs(buf, maxlen) ----
-// The last arguments stored by the shell via syscall_set_args()
-// before mrp_run(). Used by programs such as tcc.mrp to know which
-// file to compile (`run tcc.mrp hello.c`).
-static char g_run_args[256];
-
+// Arguments string disimpan PER-TASK (Task::args) — shell/console
+// each keeps its own last program arguments.
 void syscall_set_args(const char* args) {
     if (!args) args = "";
+    char* dst = task_args_cur();
     uint32_t i = 0;
-    for (; i < sizeof(g_run_args) - 1 && args[i]; i++) {
-        g_run_args[i] = args[i];
+    for (; i < TASK_ARGS_MAX - 1 && args[i]; i++) {
+        dst[i] = args[i];
     }
-    g_run_args[i] = '\0';
+    dst[i] = '\0';
 }
 
 static uint32_t sys_getargs(uint32_t buf_, uint32_t maxlen, uint32_t a3) {
@@ -596,8 +792,23 @@ static uint32_t sys_fbinfo(uint32_t info_, uint32_t a2, uint32_t a3) {
 // Color is a raw 32-bit value written as-is into the framebuffer
 // (0x00RRGGBB in the standard 32bpp mode). Out-of-range coordinates
 // are clipped silently by vesa_draw_pixel.
+// Phase A.1: gated on console focus — an unfocused task is suspended
+// (SIGTTOU-style) instead of painting over the visible terminal.
+// v0.3 (FR-17): also clipped to the calling task's draw window.
 static uint32_t sys_putpixel(uint32_t x, uint32_t y, uint32_t color) {
     if (!vesa_is_available()) return (uint32_t)SYS_ENOTSUP;
+    if (!task_console_draw_gate()) return 0;      /* killed: skip */
+    struct Task* t = task_current();
+    if (t && t->clip_on) {
+        int px = (int)x, py = (int)y;
+        if (px < t->clip_x || py < t->clip_y ||
+            px >= t->clip_x + t->clip_w ||
+            py >= t->clip_y + t->clip_h) return 0;   /* outside the window */
+    }
+    /* v0.3 fix: mark BEFORE the first pixel lands — the mark
+     * takes the text snapshot + CLEARS the screen, so calling it
+     * after the draw used to WIPE that very draw. */
+    console_canvas_mark();
     vesa_draw_pixel((uint16_t)x, (uint16_t)y, color);
     return 0;
 }
@@ -608,11 +819,87 @@ static uint32_t sys_putpixel(uint32_t x, uint32_t y, uint32_t color) {
 // (low 16 bits = position, high 16 bits = size). Morph.h's fill_rect()
 // wrapper does the packing; mtcc users pack inline:
 //     fill_rect(x | (w << 16), y | (h << 16), color);
+// Phase A.1: gated on console focus (see sys_putpixel).
+// v0.3 (FR-17): intersected with the task's draw window.
 static uint32_t sys_fillrect(uint32_t xw, uint32_t yh, uint32_t color) {
     if (!vesa_is_available()) return (uint32_t)SYS_ENOTSUP;
-    vesa_fill_rect((uint16_t)(xw & 0xFFFF), (uint16_t)(yh & 0xFFFF),
-                   (uint16_t)(xw >> 16),    (uint16_t)(yh >> 16),
-                   color);
+    if (!task_console_draw_gate()) return 0;      /* killed: skip */
+    int x = (int)(xw & 0xFFFF), w = (int)(xw >> 16);
+    int y = (int)(yh & 0xFFFF), h = (int)(yh >> 16);
+    struct Task* t = task_current();
+    if (t && t->clip_on) {
+        int x2 = x + w, y2 = y + h;
+        int cx2 = t->clip_x + t->clip_w, cy2 = t->clip_y + t->clip_h;
+        if (x < t->clip_x) x = t->clip_x;
+        if (y < t->clip_y) y = t->clip_y;
+        if (x2 > cx2) x2 = cx2;
+        if (y2 > cy2) y2 = cy2;
+        w = x2 - x; h = y2 - y;
+        if (w <= 0 || h <= 0) return 0;             /* fully clipped */
+    }
+    /* v0.3 fix: mark BEFORE the fill — see sys_putpixel. The
+     * box the earlier T9 run lost was wiped by exactly this ordering. */
+    console_canvas_mark();
+    vesa_fill_rect((uint16_t)x, (uint16_t)y, (uint16_t)w, (uint16_t)h, color);
+    return 0;
+}
+
+// ---- 53: setclip(x|w<<16, y|h<<16) — per-task draw window (FR-17) ----
+// Defines the rectangle the CALLING task may draw into (put_pixel /
+// fill_rect / draw_line are clipped to it). w or h == 0 clears the
+// clip (full-screen). The rect is clamped to the screen so a task
+// cannot smuggle negative/huge bounds past the gate.
+static uint32_t sys_setclip(uint32_t xw, uint32_t yh, uint32_t unused3) {
+    (void)unused3;                       /* table ABI: fixed 3-arg signature */
+    if (!vesa_is_available()) return (uint32_t)SYS_ENOTSUP;
+    struct Task* t = task_current();
+    if (!t) return (uint32_t)SYS_EPERM;            /* boot context: no task */
+    int x = (int)(xw & 0xFFFF), w = (int)(xw >> 16);
+    int y = (int)(yh & 0xFFFF), h = (int)(yh >> 16);
+    if (w == 0 || h == 0) { t->clip_on = 0; return 0; }
+    if (w < 0 || h < 0) return (uint32_t)SYS_EINVAL;
+    int sw = (int)vesa_get_width(), sh = (int)vesa_get_height();
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > sw) w = sw - x;
+    if (y + h > sh) h = sh - y;
+    if (w <= 0 || h <= 0) return (uint32_t)SYS_EINVAL;
+    t->clip_x = x; t->clip_y = y; t->clip_w = w; t->clip_h = h;
+    t->clip_on = 1;
+    return 0;
+}
+
+// ---- 54: drawline(x0|y0<<16, x1|y1<<16, color) — Bresenham (FR-18) ----
+// Clipped to the task window + focus-gated like every draw syscall.
+static uint32_t sys_drawline(uint32_t p0, uint32_t p1, uint32_t color) {
+    if (!vesa_is_available()) return (uint32_t)SYS_ENOTSUP;
+    if (!task_console_draw_gate()) return 0;      /* killed: skip */
+    int x0 = (int)(p0 & 0xFFFF), y0 = (int)(p0 >> 16);
+    int x1 = (int)(p1 & 0xFFFF), y1 = (int)(p1 >> 16);
+    struct Task* t = task_current();
+    int clip_on = (t && t->clip_on);
+    int cx0 = 0, cy0 = 0, cx1 = 0x7FFFFFFF, cy1 = 0x7FFFFFFF;
+    if (clip_on) {
+        cx0 = t->clip_x; cy0 = t->clip_y;
+        cx1 = t->clip_x + t->clip_w; cy1 = t->clip_y + t->clip_h;
+    }
+    int dx = (x1 > x0) ? (x1 - x0) : (x0 - x1);
+    int dy = (y1 > y0) ? (y1 - y0) : (y0 - y1);
+    int sx = (x0 < x1) ? 1 : -1;
+    int sy = (y0 < y1) ? 1 : -1;
+    int err = dx - dy;
+    int marked = 0;   /* v0.3 fix: canvas starts BEFORE the first visible pixel */
+    for (;;) {
+        if (x0 >= 0 && y0 >= 0 && x0 < 0x10000 && y0 < 0x10000 &&
+            (!clip_on || (x0 >= cx0 && y0 >= cy0 && x0 < cx1 && y0 < cy1))) {
+            if (!marked) { console_canvas_mark(); marked = 1; }
+            vesa_draw_pixel((uint16_t)x0, (uint16_t)y0, color);
+        }
+        if (x0 == x1 && y0 == y1) break;
+        int e2 = err * 2;
+        if (e2 > -dy) { err -= dy; x0 += sx; }
+        if (e2 <  dx) { err += dx; y0 += sy; }
+    }
     return 0;
 }
 
@@ -632,6 +919,9 @@ static uint32_t sys_pollkey(uint32_t a1, uint32_t a2, uint32_t a3) {
 // Fills a morph_mouse_t (see syscall.h). The kernel folds relative PS/2
 // deltas into an absolute position clamped to the screen; before any
 // movement the reported position is the screen center.
+// Phase A: a task whose console is NOT focused gets a frozen position
+// (mouse deltas belong to the ACTIVE console — prevents a background
+// DOOM from spinning while the user aims the mouse in another one).
 static uint32_t sys_mouse(uint32_t state_, uint32_t a2, uint32_t a3) {
     (void)a2; (void)a3;
     morph_mouse_t* st = (morph_mouse_t*)(uintptr_t)state_;
@@ -643,6 +933,10 @@ static uint32_t sys_mouse(uint32_t state_, uint32_t a2, uint32_t a3) {
     int32_t x, y;
     uint8_t buttons;
     mouse_get_state(&x, &y, &buttons);
+    struct Task* t = task_current();
+    if (t && t->console != console_active_id()) {
+        x = 0; y = 0; buttons = 0;   /* not the focused console: frozen mouse */
+    }
     st->x = x;
     st->y = y;
     st->buttons = buttons;
@@ -904,6 +1198,7 @@ static uint16_t blit_sx[BLIT_MAX_DIM];   /* src x per dst x */
 static uint16_t blit_sy[BLIT_MAX_DIM];   /* src y per dst y */
 static uint32_t blit_trow[BLIT_MAX_DIM]; /* one scaled row (temp) */
 static uint8_t  blit_shadow[BLIT_SHADOW_CAP];
+static int      blit_shadow_pid = -1;    /* task owning the shadow (see below) */
 
 struct blit_mode_cache {
     uint32_t w, h, flags;                /* key + rebuild tables */
@@ -941,6 +1236,11 @@ static uint32_t sys_setpal(uint32_t pal_, uint32_t a2, uint32_t a3) {
 // ---- 30: blit(src, w|h<<16, flags) — 8bpp -> LFB 32bpp scaled ----
 // The v10.10 fast path (see the blit cache block comment above).
 // The per-pixel fallback path (v10.9) remains available for large buffers.
+// Phase A.1: gated on console focus (see sys_putpixel) — a background
+// DOOM is suspended instead of repainting the visible terminal.
+// The row-diff shadow is single-instance: when a DIFFERENT task blits
+// (two dooms on two consoles), the saved rows belong to the other
+// frame — force one full redraw instead of diffing foreign data.
 static uint32_t sys_blit(uint32_t src_, uint32_t dims, uint32_t flags) {
     const uint8_t* src = (const uint8_t*)(uintptr_t)src_;
     uint32_t w = dims & 0xFFFFu;
@@ -957,6 +1257,18 @@ static uint32_t sys_blit(uint32_t src_, uint32_t dims, uint32_t flags) {
     if (!vesa_is_available() || !vesa_get_framebuffer())
         return (uint32_t)SYS_ENOTSUP;
     if (vesa_get_bpp() != 32) return (uint32_t)SYS_ENOTSUP;
+
+    if (!task_console_draw_gate()) return 0;      /* killed: skip */
+
+    {
+        struct Task* bt = task_current();
+        int pid = bt ? bt->pid : 0;
+        if (pid != blit_shadow_pid) {
+            blit_shadow_pid = pid;
+            blit_force_full = 1;             /* shadow belongs to another frame */
+        }
+    }
+    console_canvas_mark();
 
     uint32_t fb   = vesa_get_framebuffer();
     uint32_t fw   = vesa_get_width();
@@ -1103,6 +1415,12 @@ static uint32_t sys_mousedelta(uint32_t dxdy_, uint32_t a2, uint32_t a3) {
     int32_t dx, dy;
     uint8_t buttons;
     mouse_get_delta(&dx, &dy, &buttons);
+    /* Phase A: a task that is not the focused console gets a ZERO
+     * delta — mouse-look belongs to the game on the visible console. */
+    struct Task* t = task_current();
+    if (t && t->console != console_active_id()) {
+        dx = 0; dy = 0; buttons = 0;
+    }
     dxdy[0] = dx;
     dxdy[1] = dy;
     return (uint32_t)buttons;
@@ -1133,6 +1451,626 @@ static uint32_t sys_netping(uint32_t ip_, uint32_t a2, uint32_t a3) {
         return 0;
     if (!net_is_up()) return 0;
     return (uint32_t)net_ping_raw(ip, 4);
+}
+
+// ---- 36: spawn(path, arena_hint) — Phase B: create a NEW user task ----
+// Non-blocking: the .mrp program runs in its own task (physical arena +
+// page dir + own stack) and shares the SPAWNER's console (output
+// the program shares the caller's console — like a UNIX child on the
+// same terminal). Returns the new PID (>0), or a negative errno.
+//
+// Path resolution MIRRORS the shell `spawn` command: the caller's cwd first, then
+// fallback /equinox/tools dan /equinox/games (exact + auto .mrp) —
+// supaya program user cukup `task_spawn("bgcount.mrp")` tanpa path
+// absolut, persis seperti mengetik command di shell.
+static struct fs_node* spawn_lookup_in(struct fs_node* dir, const char* name) {
+    if (!dir || !name || !name[0]) return NULL;
+    struct fs_node* n = fs_find_child(dir, name);
+    if (n && !n->is_dir) return n;
+    char mrp_name[86];
+    snprintf(mrp_name, sizeof(mrp_name), "%s.mrp", name);
+    n = fs_find_child(dir, mrp_name);
+    if (n && !n->is_dir) return n;
+    return NULL;
+}
+
+static uint32_t sys_spawn(uint32_t path_, uint32_t arena_hint, uint32_t a3) {
+    (void)a3;
+    const char* path = (const char*)(uintptr_t)path_;
+    if (!path || !path[0]) return (uint32_t)SYS_EINVAL;
+    if (syscall_from_user() && !user_str_ok(path)) return (uint32_t)SYS_EFAULT;
+    struct fs_node* node = syscall_resolve(path);
+    if (!node) {
+        /* Phase B fallback: /equinox/tools then /equinox/games.
+         * (syscall_resolve already tried the caller's cwd above.) */
+        node = spawn_lookup_in(syscall_resolve("/equinox/tools"), path);
+        if (!node) node = spawn_lookup_in(syscall_resolve("/equinox/games"), path);
+    }
+    if (!node)        return (uint32_t)SYS_ENOENT;
+    if (node->is_dir) return (uint32_t)SYS_EISDIR;
+
+    struct Task* t = task_create_user(NULL, node->parent, node->name,
+                                      task_args_cur(), arena_hint);
+    if (!t) return (uint32_t)SYS_ENOMEM;    /* slot full / pool exhausted / bad file */
+    return (uint32_t)t->pid;
+}
+
+// ---- 37: yield() — Phase B: give the CPU to the next task ----
+static uint32_t sys_yield(uint32_t a1, uint32_t a2, uint32_t a3) {
+    (void)a1; (void)a2; (void)a3;
+    task_yield();
+    return 0;
+}
+
+// ---- 38: taskinfo(u32 info[]) — Phase C: the task list for `ps` ----
+// info[] (user, at least 1 + 4*MAX_TASKS u32): info[0] = the task count N,
+// then N entries {pid, state, kind, console}. Returns N (or errno).
+static uint32_t sys_taskinfo(uint32_t buf_, uint32_t a2, uint32_t a3) {
+    (void)a2; (void)a3;
+    uint32_t* w = (uint32_t*)(uintptr_t)buf_;
+    if (!w) return (uint32_t)SYS_EINVAL;
+    uint32_t need = (1 + MAX_TASKS * TASK_INFO_COLS) * sizeof(uint32_t);
+    if (syscall_from_user() && !user_range_ok(buf_, need))
+        return (uint32_t)SYS_EFAULT;
+    uint32_t n = task_fill_info(w + 1, MAX_TASKS);
+    w[0] = n;
+    return n;
+}
+
+// ---- 39: kill(pid) — Phase C: mark a task dead ----
+// 0 = success; negative = errno (the task is reaped async by the scheduler).
+static uint32_t sys_kill(uint32_t pid_, uint32_t a2, uint32_t a3) {
+    (void)a2; (void)a3;
+    int r = task_kill((int)pid_);
+    if (r == 0)   return 0;
+    if (r == -1)  return (uint32_t)SYS_EINVAL;   /* pid <= 0 */
+    if (r == -2)  return (uint32_t)SYS_EINVAL;   /* kill itself */
+    return (uint32_t)SYS_ENOENT;
+}
+
+// ============================================================
+//  4c. v0.3 FR-01 — FULL FILE SYSCALLS (open flags, unlink,
+//  mkdir/rmdir, rename, stat/readdir/fstat) + FR-03 free()
+// ============================================================
+
+/* Split "dir/name" into (parent node, name pointer). Resolves the
+ * directory part relative to proc_cwd. Returns 0 / errno; on success
+ * *out_parent + *out_name point into the ORIGINAL path string. */
+static uint32_t fd_split_path(const char* path,
+                              struct fs_node** out_parent,
+                              const char** out_name) {
+    *out_parent = NULL;
+    *out_name   = NULL;
+    if (!path || !path[0]) return (uint32_t)SYS_EINVAL;
+
+    const char* last_slash = NULL;
+    for (const char* q = path; *q; q++)
+        if (*q == '/') last_slash = q;
+
+    if (!last_slash) {
+        *out_parent = proc_cwd ? proc_cwd : fs_get_root();
+        *out_name   = path;
+    } else if (last_slash == path) {
+        *out_parent = fs_get_root();               /* "/name" */
+        *out_name   = path + 1;
+    } else {
+        uint32_t m = (uint32_t)(last_slash - path);
+        if (m >= 256) return (uint32_t)SYS_EINVAL;
+        char dirpart[256];
+        for (uint32_t i = 0; i < m; i++) dirpart[i] = path[i];
+        dirpart[m] = '\0';
+        struct fs_node* parent = syscall_resolve(dirpart);
+        if (!parent || !parent->is_dir) return (uint32_t)SYS_ENOENT;
+        *out_parent = parent;
+        *out_name   = last_slash + 1;
+    }
+    if (!(*out_name)[0]) return (uint32_t)SYS_EINVAL;
+    return 0;
+}
+
+/* ---- 40: open2(path, flags) — full POSIX-ish open ---- */
+static uint32_t sys_open2(uint32_t path_, uint32_t flags, uint32_t a3) {
+    (void)a3;
+    const char* path = (const char*)(uintptr_t)path_;
+    if (syscall_from_user() && !user_str_ok(path)) return (uint32_t)SYS_EFAULT;
+    if (!path || !path[0]) return (uint32_t)SYS_EINVAL;
+
+    /* reject unknown bits (acc 0x3 + CREAT/TRUNC/APPEND/EXCL/DIR) */
+    if (flags & ~0x1F03u) return (uint32_t)SYS_EINVAL;
+
+    uint32_t acc      = flags & 0x3u;
+    int      want_dir = (flags & SYS_O_DIR) != 0;
+
+    struct fs_node* node = syscall_resolve(path);
+    if (node && (flags & SYS_O_CREAT) && (flags & SYS_O_EXCL))
+        return (uint32_t)SYS_EEXIST;               /* O_CREAT|O_EXCL */
+
+    if (!node) {
+        if (!(flags & SYS_O_CREAT)) return (uint32_t)SYS_ENOENT;
+        if (want_dir)               return (uint32_t)SYS_ENOENT;  /* use mkdir() */
+
+        struct fs_node* parent;
+        const char* name;
+        uint32_t sr = fd_split_path(path, &parent, &name);
+        if (sr != 0) return sr;
+
+        int r = fs_create_file(parent, name, NULL);
+        if (r == -2) return (uint32_t)SYS_EEXIST;
+        if (r == -7) return (uint32_t)SYS_EINVAL;
+        if (r != 0)  return (uint32_t)SYS_EIO;
+
+        node = fs_find_child(parent, name);
+        if (!node) return (uint32_t)SYS_EIO;
+    }
+
+    if (want_dir) {
+        if (!node->is_dir) return (uint32_t)SYS_EINVAL;    /* not a directory */
+        if (node->backing == 1 && !node->populated)
+            fat32_populate_dir(node);                     /* lazy mirror */
+    } else {
+        if (node->is_dir) return (uint32_t)SYS_EISDIR;
+        /* load the content up front (read AND write paths need it) */
+        if (fs_ensure_content(node) != 0) return (uint32_t)SYS_EIO;
+    }
+
+    /* O_TRUNC: the size goes to 0 immediately; the FAT write-through
+     * happens at close() via the dirty mark (truncate-to-0 is the
+     * len == 0 path of fat32_write_file). */
+    uint32_t dirty = 0;
+    if ((flags & SYS_O_TRUNC) && !node->is_dir && acc != SYS_O_RDONLY) {
+        if (node->size != 0 || node->content) {
+            if (node->backing == 1) {
+                /* drop the cache, defer the on-disk truncate to close */
+                fs_content_release(node);
+                node->size = 0;
+                dirty = 1;
+            } else {
+                /* RAMFS: truncate in memory (the RAM copy IS the file) */
+                fs_content_release(node);
+                node->size = 0;
+            }
+        }
+    }
+
+    for (uint32_t fd = 3; fd < SYS_MAX_FDS; fd++) {
+        if (!fd_table[fd].node) {
+            fd_table[fd].node  = node;
+            fd_table[fd].pos   = 0;
+            fd_table[fd].mode  = flags;
+            fd_table[fd].dirty = dirty;
+            fd_table[fd].dcur  = want_dir ? node->children : NULL;
+            return fd;
+        }
+    }
+    return (uint32_t)SYS_EMFILE;
+}
+
+/* ---- 41: unlink(path) — remove a FILE ---- */
+static uint32_t sys_unlink(uint32_t path_, uint32_t a2, uint32_t a3) {
+    (void)a2; (void)a3;
+    const char* path = (const char*)(uintptr_t)path_;
+    if (syscall_from_user() && !user_str_ok(path)) return (uint32_t)SYS_EFAULT;
+
+    struct fs_node* node = syscall_resolve(path);
+    if (!node)        return (uint32_t)SYS_ENOENT;
+    if (node->is_dir) return (uint32_t)SYS_EISDIR;   /* rmdir for dirs */
+    if (!node->parent) return (uint32_t)SYS_EBUSY;   /* root cannot vanish */
+
+    int r = fs_delete_node(node->parent, node->name);
+    if (r == 0)   return 0;
+    if (r == -2)  return (uint32_t)SYS_ENOENT;
+    if (r == -4)  return (uint32_t)SYS_EISDIR;
+    if (r == -9)  return (uint32_t)SYS_EBUSY;
+    return (uint32_t)SYS_EIO;
+}
+
+/* ---- 42: mkdir(path) ---- */
+static uint32_t sys_mkdir(uint32_t path_, uint32_t a2, uint32_t a3) {
+    (void)a2; (void)a3;
+    const char* path = (const char*)(uintptr_t)path_;
+    if (syscall_from_user() && !user_str_ok(path)) return (uint32_t)SYS_EFAULT;
+
+    struct fs_node* parent;
+    const char* name;
+    uint32_t sr = fd_split_path(path, &parent, &name);
+    if (sr != 0) return sr;
+    if (fs_find_child(parent, name)) return (uint32_t)SYS_EEXIST;
+
+    int r = fs_create_dir(parent, name);
+    if (r == 0)  return 0;
+    if (r == -2) return (uint32_t)SYS_EEXIST;
+    if (r == -7 || r == -8) return (uint32_t)SYS_EINVAL;
+    if (r == -3) return (uint32_t)SYS_ENOMEM;
+    return (uint32_t)SYS_EIO;
+}
+
+/* ---- 43: rmdir(path) — remove an EMPTY directory ---- */
+static uint32_t sys_rmdir(uint32_t path_, uint32_t a2, uint32_t a3) {
+    (void)a2; (void)a3;
+    const char* path = (const char*)(uintptr_t)path_;
+    if (syscall_from_user() && !user_str_ok(path)) return (uint32_t)SYS_EFAULT;
+
+    struct fs_node* node = syscall_resolve(path);
+    if (!node)         return (uint32_t)SYS_ENOENT;
+    if (!node->is_dir) return (uint32_t)SYS_EINVAL;   /* not a directory */
+    if (!node->parent) return (uint32_t)SYS_EBUSY;
+
+    /* FAT dirs lazily populate — force the mirror before the empty test
+     * (an unpopulated dir LOOKS empty but is not). */
+    if (node->backing == 1 && !node->populated) fat32_populate_dir(node);
+    if (node->children) return (uint32_t)SYS_EINVAL;  /* not empty */
+
+    int r = fs_delete_node(node->parent, node->name);
+    if (r == 0)   return 0;
+    if (r == -4)  return (uint32_t)SYS_EINVAL;       /* not empty */
+    if (r == -9)  return (uint32_t)SYS_EBUSY;
+    return (uint32_t)SYS_EIO;
+}
+
+/* ---- 44: rename(old, new) ----
+ * RAMFS: relink the node (works for files AND directories).
+ * FAT32: create-copy-delete for FILES; directories -> ENOTSUP
+ * (a FAT dirent-run rewrite is future work, see FR-11). */
+static uint32_t sys_rename(uint32_t old_, uint32_t new_, uint32_t a3) {
+    (void)a3;
+    const char* oldp = (const char*)(uintptr_t)old_;
+    const char* newp = (const char*)(uintptr_t)new_;
+    if (syscall_from_user()
+        && (!user_str_ok(oldp) || !user_str_ok(newp)))
+        return (uint32_t)SYS_EFAULT;
+    if (!oldp || !oldp[0] || !newp || !newp[0]) return (uint32_t)SYS_EINVAL;
+
+    struct fs_node* src = syscall_resolve(oldp);
+    if (!src) return (uint32_t)SYS_ENOENT;
+
+    struct fs_node* dst_parent;
+    const char* dst_name;
+    uint32_t sr = fd_split_path(newp, &dst_parent, &dst_name);
+    if (sr != 0) return sr;
+    if (src == dst_parent) return (uint32_t)SYS_EINVAL;      /* onto itself */
+    struct fs_node* existing = fs_find_child(dst_parent, dst_name);
+    if (existing) {
+        /* renaming onto a directory, or dir onto anything: refuse */
+        if (existing->is_dir || src->is_dir) return (uint32_t)SYS_EEXIST;
+        /* replace: POSIX rename() unlinks the target — do the same */
+        int d = fs_delete_node(existing->parent, existing->name);
+        if (d != 0) return (uint32_t)SYS_EIO;
+    }
+
+    if (src->is_dir && dst_parent->backing == 1)
+        return (uint32_t)SYS_ENOTSUP;               /* FAT dir rename */
+
+    if (src->backing == 0 && dst_parent->backing == 0) {
+        /* RAMFS relink: unlink from the old parent, insert at the new */
+        if (fs_ram_relink_node(src, dst_parent, dst_name) != 0)
+            return (uint32_t)SYS_EIO;
+        return 0;
+    }
+
+    /* FAT (file): copy the content + delete the source. */
+    if (src->is_dir) return (uint32_t)SYS_ENOTSUP;
+    if (fs_ensure_content(src) != 0) return (uint32_t)SYS_EIO;
+    int w = fs_write_binary(dst_parent, dst_name,
+                            (const uint8_t*)src->content, src->size);
+    if (w != 0) return (uint32_t)SYS_EIO;
+    int d2 = fs_delete_node(src->parent, src->name);
+    if (d2 != 0) return (uint32_t)SYS_EIO;
+    return 0;
+}
+
+/* ---- 45: stat(path, morph_stat_t*) ---- */
+static uint32_t fd_fill_stat(struct fs_node* n, morph_stat_t* st) {
+    st->size    = n->is_dir ? 0 : n->size;
+    st->is_dir  = n->is_dir ? 1 : 0;
+    st->backing = n->backing;
+    st->mode    = 0;
+    return 0;
+}
+
+static uint32_t sys_stat(uint32_t path_, uint32_t st_, uint32_t a3) {
+    (void)a3;
+    const char* path = (const char*)(uintptr_t)path_;
+    morph_stat_t* st = (morph_stat_t*)(uintptr_t)st_;
+    if (!st) return (uint32_t)SYS_EINVAL;
+    if (syscall_from_user()
+        && (!user_str_ok(path) || !user_range_ok(st_, sizeof(*st))))
+        return (uint32_t)SYS_EFAULT;
+
+    struct fs_node* node = syscall_resolve(path);
+    if (!node) return (uint32_t)SYS_ENOENT;
+    return fd_fill_stat(node, st);
+}
+
+/* ---- 46: readdir(fd, morph_dirent_t*) — one entry per call ----
+ * The fd must be opened with SYS_O_DIR. Returns 1 = entry filled,
+ * 0 = end of directory, negative = errno. */
+static uint32_t sys_readdir(uint32_t fd, uint32_t de_, uint32_t a3) {
+    (void)a3;
+    morph_dirent_t* de = (morph_dirent_t*)(uintptr_t)de_;
+    if (!de) return (uint32_t)SYS_EINVAL;
+    if (syscall_from_user() && !user_range_ok(de_, sizeof(*de)))
+        return (uint32_t)SYS_EFAULT;
+
+    if (fd < 3 || fd >= SYS_MAX_FDS) return (uint32_t)SYS_EBADF;
+    struct sys_fd_entry* e = &fd_table[fd];
+    struct fs_node* dir = e->node;
+    if (!dir)            return (uint32_t)SYS_EBADF;
+    if (!dir->is_dir)    return (uint32_t)SYS_EINVAL;   /* not a directory */
+    if (!(e->mode & SYS_O_DIR)) return (uint32_t)SYS_EBADF; /* not a dir fd */
+
+    struct fs_node* c = e->dcur;
+    if (!c) return 0;                                 /* end of directory */
+    de->is_dir = c->is_dir ? 1 : 0;
+    de->size   = c->is_dir ? 0 : c->size;
+    uint32_t i = 0;
+    for (; i < sizeof(de->name) - 1 && c->name[i]; i++) de->name[i] = c->name[i];
+    de->name[i] = '\0';
+    e->dcur = c->next;
+    return 1;
+}
+
+/* ---- 47: fstat(fd, morph_stat_t*) ---- */
+static uint32_t sys_fstat(uint32_t fd, uint32_t st_, uint32_t a3) {
+    (void)a3;
+    morph_stat_t* st = (morph_stat_t*)(uintptr_t)st_;
+    if (!st) return (uint32_t)SYS_EINVAL;
+    if (syscall_from_user() && !user_range_ok(st_, sizeof(*st)))
+        return (uint32_t)SYS_EFAULT;
+
+    if (fd < 3 || fd >= SYS_MAX_FDS) return (uint32_t)SYS_EBADF;
+    struct fs_node* n = fd_table[fd].node;
+    if (!n) return (uint32_t)SYS_EBADF;
+    return fd_fill_stat(n, st);
+}
+
+/* ---- 48: free(ptr) — release an SYS_MALLOC block (FR-03) ---- */
+static uint32_t sys_free(uint32_t ptr_, uint32_t a2, uint32_t a3) {
+    (void)a2; (void)a3;
+    void* p = (void*)(uintptr_t)ptr_;
+    if (syscall_from_user() && ptr_ != 0 && !user_range_ok(ptr_, 1))
+        return (uint32_t)SYS_EFAULT;
+    int r = mrp_free(p);
+    return (r == 0) ? 0 : (uint32_t)SYS_EINVAL;
+}
+
+// ============================================================
+//  v0.3 (FR-02): PIPES — anonymous kernel ring buffers.
+// ------------------------------------------------------------
+//  A pipe is a 4 KB kernel ring buffer + two ref-counted ends.
+//  SYS_PIPE hands out two fds: fds[0] = read end, fds[1] = write
+//  end. Pipe fds travel across SYS_SPAWN (a child inherits the
+//  PARENT'S pipe fds — file fds are still never inherited, FR-01).
+//  Semantics (POSIX-like, cooperative scheduler):
+//    read : blocks while the buffer is empty AND writers > 0;
+//           returns 0 (EOF) when the last write end closes.
+//    write: blocks while the buffer is full AND readers > 0;
+//           returns -SYS_EIO (broken pipe) when readers == 0.
+//  Kill while blocked = -SYS_EIO (partial counts win). A same-task
+//  write that fills the buffer it then reads from is a self-deadlock
+//  (documented — do not pipeline within one task).
+// ============================================================
+#define KPIPE_MAX   8
+#define KPIPE_BUF   4096
+
+struct kpipe {
+    int      alive;                 /* slot in use                       */
+    uint8_t  buf[KPIPE_BUF];        /* ring storage                      */
+    uint32_t rd, wr;                /* ring indices                      */
+    uint32_t count;                 /* buffered bytes                    */
+    int      readers;               /* open read ends (fd table + spawn) */
+    int      writers;               /* open write ends                   */
+};
+
+static struct kpipe kpipes[KPIPE_MAX];
+
+/* Park the CURRENT task on a pipe (data / end-state may change). */
+static int pipe_block(struct kpipe* p) {
+    struct Task* me = task_current();
+    if (!me || !task_sched_active()) return 0;   /* boot ctx: no block */
+    me->wait_pipe  = p;
+    me->state      = TASK_BLOCKED;
+    me->sleep_until = 0xFFFFFFFFu;
+    schedule();
+    me->wait_pipe = NULL;
+    return me->killed;                           /* 1 = abort the I/O   */
+}
+
+/* Public: task.cpp uses it for spawn inheritance (+1) and task
+ * teardown (-1). Wakes the counterpart after a state change and
+ * frees the object when both ends are gone. */
+void kpipe_end_ref(struct kpipe* p, uint32_t end, int delta) {
+    if (!p || !p->alive) return;
+    if (end == 0) p->readers += delta;
+    else          p->writers += delta;
+    if (p->readers <= 0 && p->writers <= 0) {
+        p->alive = 0;
+        p->count = 0;
+        p->rd = p->wr = 0;
+    }
+    task_wake_pipe(p);   /* EOF / broken-pipe / space may be waiting */
+}
+
+/* ---- pipe read end (fd backed by a kpipe) ---- */
+static uint32_t pipe_read(uint32_t fd, char* buf, uint32_t len) {
+    struct kpipe* p = fd_table[fd].pipe;
+    uint32_t total = 0;
+    while (total < len) {
+        if (p->count > 0) {
+            uint32_t n = len - total;
+            if (n > p->count) n = p->count;
+            for (uint32_t i = 0; i < n; i++) {
+                buf[total + i] = p->buf[p->rd];
+                p->rd = (p->rd + 1) % KPIPE_BUF;
+            }
+            p->count -= n;
+            total += n;
+            task_wake_pipe(p);      /* space appeared for blocked writers */
+            continue;
+        }
+        if (p->writers <= 0) return total;       /* EOF (0 when empty)   */
+        if (pipe_block(p)) return total ? total : (uint32_t)SYS_EIO;
+    }
+    return total;
+}
+
+/* ---- pipe write end (fd backed by a kpipe) ---- */
+static uint32_t pipe_write(uint32_t fd, const char* buf, uint32_t len) {
+    struct kpipe* p = fd_table[fd].pipe;
+    if (p->readers <= 0) return (uint32_t)SYS_EIO;    /* broken pipe    */
+    uint32_t total = 0;
+    while (total < len) {
+        uint32_t space = KPIPE_BUF - p->count;
+        if (space > 0) {
+            uint32_t n = len - total;
+            if (n > space) n = space;
+            for (uint32_t i = 0; i < n; i++) {
+                p->buf[p->wr] = buf[total + i];
+                p->wr = (p->wr + 1) % KPIPE_BUF;
+            }
+            p->count += n;
+            total += n;
+            task_wake_pipe(p);      /* data arrived for blocked readers  */
+            continue;
+        }
+        if (pipe_block(p)) return total ? total : (uint32_t)SYS_EIO;
+        if (p->readers <= 0) return total ? total : (uint32_t)SYS_EIO;
+    }
+    return total;
+}
+
+/* ---- 49: wait(pid, u32* status) — blocking waitpid (FR-02) ---- */
+static uint32_t sys_wait(uint32_t pid_, uint32_t status_, uint32_t a3) {
+    (void)a3;
+    if (syscall_from_user() && status_ != 0
+        && !user_range_ok(status_, sizeof(uint32_t)))
+        return (uint32_t)SYS_EFAULT;
+    uint32_t status = 0;
+    int r = task_wait_pid((int)pid_, &status);
+    if (r < 0) return (uint32_t)SYS_ECHILD;
+    if (status_ != 0) *(uint32_t*)(uintptr_t)status_ = status;
+    return (uint32_t)r;                    /* the reaped child's pid */
+}
+
+/* ---- 50: pipe(int fds[2]) — create a pipe (FR-02) ---- */
+static uint32_t sys_pipe(uint32_t fds_, uint32_t a2, uint32_t a3) {
+    (void)a2; (void)a3;
+    uint32_t* fds = (uint32_t*)(uintptr_t)fds_;
+    if (!fds) return (uint32_t)SYS_EINVAL;
+    if (syscall_from_user() && !user_range_ok(fds_, 2 * sizeof(uint32_t)))
+        return (uint32_t)SYS_EFAULT;
+
+    struct kpipe* p = NULL;
+    for (int i = 0; i < KPIPE_MAX; i++) {
+        if (!kpipes[i].alive) { p = &kpipes[i]; break; }
+    }
+    if (!p) return (uint32_t)SYS_ENOMEM;   /* too many pipes */
+
+    /* two free fd slots (3+); assign fd[0] = read end, fd[1] = write */
+    int rfd = -1, wfd = -1;
+    for (uint32_t fd = 3; fd < SYS_MAX_FDS; fd++) {
+        if (fd_table[fd].node == NULL && fd_table[fd].pipe == NULL) {
+            if (rfd < 0)      rfd = (int)fd;
+            else if (wfd < 0) { wfd = (int)fd; break; }
+        }
+    }
+    if (rfd < 0 || wfd < 0) return (uint32_t)SYS_EMFILE;
+
+    p->alive = 1;
+    p->rd = p->wr = 0;
+    p->count = 0;
+    p->readers = 1;
+    p->writers = 1;
+
+    fd_table[rfd].node = NULL; fd_table[rfd].pipe = p; fd_table[rfd].pipe_end = 0;
+    fd_table[rfd].pos = 0; fd_table[rfd].mode = 0; fd_table[rfd].dirty = 0; fd_table[rfd].dcur = NULL;
+    fd_table[wfd].node = NULL; fd_table[wfd].pipe = p; fd_table[wfd].pipe_end = 1;
+    fd_table[wfd].pos = 0; fd_table[wfd].mode = 0; fd_table[wfd].dirty = 0; fd_table[wfd].dcur = NULL;
+
+    fds[0] = (uint32_t)rfd;
+    fds[1] = (uint32_t)wfd;
+    return 0;
+}
+
+/* ---- 51: meminfo(u32 w[6]) — FR-05 accounting for userland ----
+ *  w[0]=pool total KB, w[1]=pool free KB, w[2]=faulted-in user KB,
+ *  w[3]=live tasks, w[4]=zombies, w[5]=0 (reserved). */
+static uint32_t sys_meminfo(uint32_t w_, uint32_t a2, uint32_t a3) {
+    (void)a2; (void)a3;
+    uint32_t* w = (uint32_t*)(uintptr_t)w_;
+    if (!w) return (uint32_t)SYS_EINVAL;
+    if (syscall_from_user() && !user_range_ok(w_, 6 * sizeof(uint32_t)))
+        return (uint32_t)SYS_EFAULT;
+    w[0] = task_user_phys_total_bytes() / 1024u;
+    w[1] = task_user_phys_free_bytes() / 1024u;
+    w[2] = (task_pages_user_total() * 0x1000u) / 1024u;
+    w[3] = 0;
+    w[4] = 0;
+    uint32_t info[1 + MAX_TASKS * TASK_INFO_COLS];
+    uint32_t n = task_fill_info(info + 1, MAX_TASKS);
+    w[3] = n;
+    for (uint32_t i = 0; i < n; i++) {
+        if (info[1 + i * TASK_INFO_COLS + 1] == (uint32_t)TASK_DEAD) w[4]++;
+    }
+    w[5] = 0;
+    return 0;
+}
+
+/* ---- 52: spawn2(path, hint, args) — spawn with explicit args ---- */
+static uint32_t sys_spawn_common(const char* path, uint32_t arena_hint,
+                                 const char* args) {
+    if (!path || !path[0]) return (uint32_t)SYS_EINVAL;
+    struct fs_node* node = syscall_resolve(path);
+    if (!node) {
+        /* Phase B fallback: /equinox/tools then /equinox/games. */
+        node = spawn_lookup_in(syscall_resolve("/equinox/tools"), path);
+        if (!node) node = spawn_lookup_in(syscall_resolve("/equinox/games"), path);
+    }
+    if (!node)        return (uint32_t)SYS_ENOENT;
+    if (node->is_dir) return (uint32_t)SYS_EISDIR;
+
+    struct Task* t = task_create_user(NULL, node->parent, node->name,
+                                      args, arena_hint);
+    if (!t) return (uint32_t)SYS_ENOMEM;
+    return (uint32_t)t->pid;
+}
+
+static uint32_t sys_spawn2(uint32_t path_, uint32_t arena_hint, uint32_t args_) {
+    const char* path = (const char*)(uintptr_t)path_;
+    const char* args = (const char*)(uintptr_t)args_;
+    if (syscall_from_user()) {
+        if (!path || !user_str_ok(path)) return (uint32_t)SYS_EFAULT;
+        if (args_ != 0 && !user_str_ok(args)) return (uint32_t)SYS_EFAULT;
+    }
+    return sys_spawn_common(path, arena_hint, args_ ? args : "");
+}
+
+/* v0.3: release every PIPE end of a task WITHOUT a disk flush.
+ * Called from task reaping (IRQ context) — pipes have no dirty state,
+ * but the refcounts must drop and blocked counterparts must wake. */
+void syscall_task_close_pipes(struct Task* t) {
+    if (!t) return;
+    for (int fd = 3; fd < SYS_MAX_FDS; fd++) {
+        struct kpipe* p = t->fds[fd].pipe;
+        if (p) {
+            kpipe_end_ref(p, t->fds[fd].pipe_end, -1);
+            t->fds[fd].pipe     = NULL;
+            t->fds[fd].pipe_end = 0;
+        }
+    }
+}
+
+/* ---------------------------------------------------------------
+ *  v0.3 FR-01: flush + close EVERY fd of the CURRENT task.
+ *  Called from the .mrp loader when a program exits (so a program
+ *  that forgets close() still gets its writes flushed) and from
+ *  task reaping (spawned tasks that die with open fds).
+ * --------------------------------------------------------------- */
+void syscall_fd_flush_all(void) {
+    for (uint32_t fd = 3; fd < SYS_MAX_FDS; fd++) {
+        if (fd_table[fd].node) {
+            fd_close_index(fd);
+        }
+    }
 }
 
 // ============================================================
@@ -1178,6 +2116,25 @@ static const sys_fn_t syscall_table[SYS_COUNT] = {
     sys_mousedelta,    /* 33  mousedelta(int32 dxdy[2])      */
     sys_netinfo,       /* 34  netinfo(u32 w[10])             */
     sys_netping,       /* 35  netping(const char* ip)         */
+    sys_spawn,         /* 36  spawn(path, arena_hint)  Phase B */
+    sys_yield,         /* 37  yield()                  Phase B */
+    sys_taskinfo,      /* 38  taskinfo(u32[])          Phase C */
+    sys_kill,          /* 39  kill(pid)                Phase C */
+    sys_open2,         /* 40  open2(path, flags)       v0.3 FR-01 */
+    sys_unlink,        /* 41  unlink(path)             v0.3 FR-01 */
+    sys_mkdir,         /* 42  mkdir(path)              v0.3 FR-01 */
+    sys_rmdir,         /* 43  rmdir(path)              v0.3 FR-01 */
+    sys_rename,        /* 44  rename(old, new)         v0.3 FR-01 */
+    sys_stat,          /* 45  stat(path, stat*)        v0.3 FR-01 */
+    sys_readdir,       /* 46  readdir(fd, dirent*)     v0.3 FR-01 */
+    sys_fstat,         /* 47  fstat(fd, stat*)         v0.3 FR-01 */
+    sys_free,          /* 48  free(ptr)                v0.3 FR-03 */
+    sys_wait,          /* 49  wait(pid, status*)      FR-02 */
+    sys_pipe,          /* 50  pipe(fds[2])            FR-02 */
+    sys_meminfo,       /* 51  meminfo(w[6])           v0.3 FR-05 */
+    sys_spawn2,        /* 52  spawn2(path,hint,args)  FR-02 */
+    sys_setclip,       /* 53  setclip(x|w<<16,y|h<<16) FR-17 */
+    sys_drawline,      /* 54  drawline(x0|y0<<16,x1|y1<<16,c) FR-18 */
 };
 
 static_assert(sizeof(syscall_table) / sizeof(syscall_table[0]) == SYS_COUNT,
@@ -1213,6 +2170,12 @@ extern "C" void syscall_dispatch(uint32_t* regs) {
     uint32_t ret = syscall_table[num](a1, a2, a3);
     regs[7] = ret;                        // return -> EAX slot
 
+    /* v0.3 SAFETY NET: a storage path that leaked the sched lock
+     * would starve all sleeping tasks (nettask!). Detect + release +
+     * report. (See fat32_read_whole early returns for the original
+     * leak this caught.) */
+    task_sched_force_unlock();
+
     /* SYS_EXIT from a ring 3 program = end of the program's life: divert
      * to the terminate path (noreturn). iret is not executed — the
      * interrupt stack is abandoned, TSS.ESP0 is ready for the next program. */
@@ -1228,8 +2191,11 @@ extern "C" void syscall_dispatch(uint32_t* regs) {
 // ============================================================
 void syscall_init(void) {
     for (uint32_t fd = 0; fd < SYS_MAX_FDS; fd++) {
-        fd_table[fd].node = nullptr;
-        fd_table[fd].pos  = 0;
+        fd_table[fd].node  = nullptr;
+        fd_table[fd].pos   = 0;
+        fd_table[fd].mode  = 0;      /* v0.3 FR-01: SYS_O_RDONLY */
+        fd_table[fd].dirty = 0;      /* v0.3 FR-01: no pending write */
+        fd_table[fd].dcur  = nullptr; /* v0.3 FR-01: readdir cursor */
     }
 }
 
@@ -1237,10 +2203,10 @@ void syscall_list(void) {
     printf("Equinox OS syscall interface (int 0x80):\n");
     printf("  [v10.7] caller ring 0 (shell) / ring 3 (program .mrp)\n");
     printf("  ABI: EAX=number, EBX/ECX/EDX=args, EAX=return (negative=error)\n");
-    printf("  fd : 0=stdin 1=stdout 2=stderr, 3+ = RAMFS file (read-only)\n");
+    printf("  fd : 0=stdin 1=stdout 2=stderr, 3+ = file (RO via open, RW via open2)\n");
     printf("   1  exit(status)            end the program, status -> caller\n");
     printf("   2  exec(path)              run a .mrp from RAMFS (nested -> EBUSY)\n");
-    printf("   3  getpid()                caller pid (single-task: 1)\n");
+    printf("   3  getpid()                caller pid (Phase A: the real task PID)\n");
     printf("   4  write(fd, buf, len)     write to the console\n");
     printf("   5  read(fd, buf, len)      read a RAMFS file (0 = EOF)\n");
     printf("   6  open(path)              open a RAMFS file -> fd (3+)\n");
@@ -1273,4 +2239,21 @@ void syscall_list(void) {
     printf("  33  mousedelta(int32[2])      raw PS/2 delta -> button mask\n");
     printf("  34  netinfo(u32 w[10])        network status (ip/mac/counter)\n");
     printf("  35  netping(ip)               4x blocking ICMP echo -> 0..4\n");
+    printf("  36  spawn(path, hint)         Phase B: new .mrp task -> pid\n");
+    printf("  37  yield()                   Phase B: give the CPU to other tasks\n");
+    printf("  38  taskinfo(u32[])           Phase C: task list (ps)\n");
+    printf("  39  kill(pid)                 Phase C: terminate a task\n");
+    printf("  40  open2(path, flags)        v0.3: open with O_* flags -> fd\n");
+    printf("  41  unlink(path)              v0.3: remove a file\n");
+    printf("  42  mkdir(path)               v0.3: create a directory\n");
+    printf("  43  rmdir(path)               v0.3: remove an empty directory\n");
+    printf("  44  rename(old, new)          v0.3: rename/move a file\n");
+    printf("  45  stat(path, stat*)         v0.3: {size,is_dir,backing,mode}\n");
+    printf("  46  readdir(fd, dirent*)      v0.3: 1 per call, 0 = end (O_DIR)\n");
+    printf("  47  fstat(fd, stat*)          v0.3: stat by descriptor\n");
+    printf("  48  free(ptr)                 v0.3: free one malloc block\n");
+    printf("  49  wait(pid, status*)        v0.3: blocking waitpid -> pid\n");
+    printf("  50  pipe(fds[2])              v0.3: create a pipe (4 KB ring)\n");
+    printf("  51  meminfo(w[6])             v0.3: pool stats + demand pages\n");
+    printf("  52  spawn2(path,hint,args)    v0.3: spawn with explicit args\n");
 }
