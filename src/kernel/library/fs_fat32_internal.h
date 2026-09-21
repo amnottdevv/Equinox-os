@@ -134,8 +134,9 @@ struct fs_node* fat_new_node(struct fs_node* parent, const char* name,
                              uint64_t dirent_lba, uint16_t dirent_idx,
                              uint16_t lfn_count, const uint8_t sfn[11]);
 
-// Arena bump-alloc (owner: fs_fat32.cpp; 16-byte aligned, never freed).
-uint8_t* fat_arena_alloc_public(uint32_t bytes);
+// Arena alloc (owner: fs_fat32.cpp; free-list since v0.3 FR-08).
+// Declared in the PUBLIC fs_fat32.h (extern "C") — syscall.cpp also
+// uses it for write-buffer growth.
 
 // Node name limit (matches fs_node::name[64])
 #define FAT_NAME_MAX 63

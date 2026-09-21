@@ -86,8 +86,8 @@ static void page_user(void) {
                 /* FIX(audit V3 #2): input value[64] -> temp[32] wajib
                  * bounded. It used to be safe ONLY because width was hardcoded to 25
                  * (tui_input_handle limits len < width-1); if width
-                 * dinaikkan -> stack overflow senyap. Guard eksplisit
-                 * biar keamanan gak titip ke nilai width. */
+                 * grows -> silent stack overflow. An explicit guard so
+                 * safety does not depend on the width value. */
                 strncpy(temp_username, input_username.value, sizeof(temp_username) - 1);
                 temp_username[sizeof(temp_username) - 1] = '\0';
             } else {
