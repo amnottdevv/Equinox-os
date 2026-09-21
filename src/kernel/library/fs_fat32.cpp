@@ -10,7 +10,6 @@
 
 #include "fs_fat32_internal.h"
 #include "header/fs_fat32.h"
-#include "header/task.h"   // Phase A: sched-lock
 #include "header/ata.h"
 #include "header/stdio.h"
 #include "header/malloc.h"
@@ -29,17 +28,11 @@ static void (*fat_boot_log)(const char*) = NULL;
 //  ARENA — file-content cache memory
 // ------------------------------------------------------------
 //  FAT-backed file contents are cached OUTSIDE the 2 MB kernel
-//  heap: an allocator placed right after the GRUB module staging
-//  area (0x2800000 + 12 MB = 0x3400000). Identity-mapped by
-//  paging_init (0-64 MB), supervisor pages.
-//
-//  v0.3 FR-08: the arena is now a FREE-LIST (address-ordered blocks
-//  with split + coalesce, same design as malloc.cpp) instead of a
-//  bump pointer. A cache is released with fat_arena_free() when the
-//  last fd referencing the file closes (fs_content_release), so
-//  reading many files in sequence no longer exhausts the arena.
-//  Arena-cached nodes carry is_ref = 1 AND cont_owner = 2 so the
-//  generic release path knows to route the pointer back here.
+//  heap: a bump allocator placed right after the GRUB module
+//  staging area (0x2800000 + 12 MB = 0x3400000). Identity-mapped
+//  by paging_init (0-64 MB), supervisor pages, never freed — a
+//  cache is dropped by forgetting the pointer, which is why
+//  arena-cached nodes carry is_ref = 1 (free() must skip them).
 //
 //  The usable size is clamped against the multiboot upper-memory
 //  figure so a machine with less than 64 MB degrades gracefully
@@ -48,19 +41,8 @@ static void (*fat_boot_log)(const char*) = NULL;
 #define FAT_ARENA_BASE 0x3400000u
 #define FAT_ARENA_SIZE 0x800000u        // 8 MB -> ends at 60 MB
 
-struct fat_block {
-    uint32_t magic;       /* 0x46415400 "FAT" + NUL — corruption canary */
-    uint32_t size;        /* payload size (without this 16-byte header)  */
-    uint8_t  free_flag;
-    uint8_t  pad[3];      /* keep the header 16 bytes, 16-aligned        */
-    struct fat_block* next;   /* next block, address-ordered            */
-};
-#define FAT_BLOCK_MAGIC  0x46415400u
-#define FAT_MIN_SPLIT    64u
-
-static struct fat_block* arena_head = NULL;   /* NULL = not initialized */
+static uint8_t* arena_cur = (uint8_t*)FAT_ARENA_BASE;
 static uint32_t arena_limit = 0;
-static uint32_t arena_bump   = 0;             /* high-water mark (stats) */
 
 static void fat_arena_init(uint32_t mem_upper_bytes) {
     uint32_t room = 0;
@@ -68,89 +50,19 @@ static void fat_arena_init(uint32_t mem_upper_bytes) {
         room = mem_upper_bytes - FAT_ARENA_BASE;
     if (room > FAT_ARENA_SIZE) room = FAT_ARENA_SIZE;
     arena_limit = room;
-    arena_bump  = 0;
-    arena_head  = NULL;                 /* lazily laid out on first alloc */
+    arena_cur   = (uint8_t*)FAT_ARENA_BASE;
 }
 
-/* Internal: first-fit allocation over the block list. 16-byte aligned
- * payload, splits large free blocks, returns NULL when exhausted. */
+// Align to 16 bytes; returns NULL when the arena is exhausted.
 static uint8_t* fat_arena_alloc(uint32_t bytes) {
-    if (bytes == 0 || arena_limit < sizeof(struct fat_block)) return NULL;
-    uint32_t need = (bytes + 15u) & ~15u;
-
-    if (!arena_head) {
-        /* first allocation: lay out one big free block */
-        struct fat_block* first = (struct fat_block*)FAT_ARENA_BASE;
-        first->magic = FAT_BLOCK_MAGIC;
-        first->size  = arena_limit - sizeof(struct fat_block);
-        first->free_flag = 1;
-        first->next  = NULL;
-        arena_head = first;
-    }
-
-    for (struct fat_block* b = arena_head; b; b = b->next) {
-        if (!b->free_flag || b->size < need) continue;
-        /* split when the remainder is worth a header */
-        if (b->size - need >= sizeof(struct fat_block) + FAT_MIN_SPLIT) {
-            struct fat_block* nb =
-                (struct fat_block*)((uint8_t*)b + sizeof(*b) + need);
-            nb->magic = FAT_BLOCK_MAGIC;
-            nb->size  = b->size - need - sizeof(struct fat_block);
-            nb->free_flag = 1;
-            nb->next  = b->next;
-            b->size   = need;
-            b->next   = nb;
-        }
-        b->free_flag = 0;
-        uint32_t off = (uint32_t)(uintptr_t)b + sizeof(*b) - FAT_ARENA_BASE;
-        if (off + sizeof(*b) + b->size > arena_bump)
-            arena_bump = off + sizeof(*b) + b->size;
-        return (uint8_t*)b + sizeof(struct fat_block);
-    }
-    return NULL;      /* no fit: arena fragmented or full */
+    uint32_t used = (uint32_t)(arena_cur - (uint8_t*)FAT_ARENA_BASE);
+    if (bytes == 0 || used + bytes > arena_limit) return NULL;
+    uint8_t* p = arena_cur;
+    arena_cur += (bytes + 15u) & ~15u;
+    return p;
 }
 
-/* v0.3 FR-08: return a fat_arena_alloc() payload to the pool.
- * Coalesces with the physical neighbors. Out-of-range pointers are
- * ignored (the caller may hand us kernel-heap/staging pointers by
- * mistake — never crash on those). */
-void fat_arena_free(void* ptr) {
-    if (!ptr) return;
-    uint32_t p = (uint32_t)(uintptr_t)ptr;
-    if (p < FAT_ARENA_BASE + sizeof(struct fat_block) ||
-        p >= FAT_ARENA_BASE + arena_limit)
-        return;
-    struct fat_block* b = (struct fat_block*)(p - sizeof(struct fat_block));
-    if (b->magic != FAT_BLOCK_MAGIC || b->free_flag) return;  /* wild/double free */
-    b->free_flag = 1;
-    /* coalesce forward */
-    while (b->next && b->next->free_flag) {
-        struct fat_block* nx = b->next;
-        b->size += sizeof(*b) + nx->size;
-        b->next  = nx->next;
-    }
-    /* coalesce backward: find the predecessor by walking (the list is
-     * address-ordered, so the predecessor of a middle block is unique) */
-    struct fat_block* prev = NULL;
-    for (struct fat_block* c = arena_head; c && c != b; c = c->next) prev = c;
-    if (prev && prev->free_flag) {
-        prev->size += sizeof(*b) + b->size;
-        prev->next  = b->next;
-        /* coalesce the merged block forward as well */
-        while (prev->next && prev->next->free_flag) {
-            struct fat_block* nx = prev->next;
-            prev->size += sizeof(*prev) + nx->size;
-            prev->next  = nx->next;
-        }
-    }
-}
-
-uint32_t fat32_arena_used(void) {
-    uint32_t used = 0;
-    for (struct fat_block* b = arena_head; b; b = b->next)
-        if (!b->free_flag) used += sizeof(*b) + b->size;
-    return used;
-}
+uint32_t fat32_arena_used(void)  { return (uint32_t)(arena_cur - (uint8_t*)FAT_ARENA_BASE); }
 uint32_t fat32_arena_total(void) { return arena_limit; }
 
 // Arena access for the write path (fs_fat32_write.cpp).
@@ -667,15 +579,10 @@ void fat32_populate_dir(struct fs_node* dir) {
 // ===================================================================
 
 int fat32_read_whole(struct fs_node* file) {
-    task_sched_lock();   /* Phase A: no preemption mid-storage-operation */
-    if (!file || file->backing != 1 || file->is_dir) { task_sched_unlock(); return -1; }
-    /* v0.3 LEAK FIX: these early returns used to LEAK the sched lock
-     * (schedule() bails while locked -> wake_scan never runs -> every
-     * sleeping task, e.g. the nettask, starves -> the network dies).
-     * Found via SCHEDLOCK=2 after "cp" into /mnt. */
-    if (file->content) { task_sched_unlock(); return 0; }   // already cached
-    if (file->size == 0) { task_sched_unlock(); return 0; } // empty: NULL fine
-    if (file->first_cluster < 2) { task_sched_unlock(); return -2; }
+    if (!file || file->backing != 1 || file->is_dir) return -1;
+    if (file->content) return 0;                    // already cached
+    if (file->size == 0) return 0;                  // empty: NULL is fine
+    if (file->first_cluster < 2) return -2;         // size>0 but no chain?
 
     // v0.2 write hardening: this read bypasses the sector cache — a
     // dirty line left by a FAILED earlier write would hand us stale
@@ -694,11 +601,10 @@ int fat32_read_whole(struct fs_node* file) {
         if (bufsz > 262144) {
             printf("FAT32: %u KB too large for cache (arena full)\n",
                    (unsigned)(bufsz / 1024));
-            task_sched_unlock();
             return -3;
         }
         buf = (uint8_t*)malloc(bufsz);
-        if (!buf) { task_sched_unlock(); return -3; }
+        if (!buf) return -3;
         heap = 1;
     }
     memset(buf, 0, bufsz);
@@ -729,7 +635,6 @@ int fat32_read_whole(struct fs_node* file) {
             uint64_t lba = fat_cluster_lba(cluster) + sec_off;
             if (fat_rd_sectors(lba, nsec, buf + offset + sec_off * 512) != 0) {
                 if (heap) free(buf);
-                task_sched_unlock();
                 return -4;
             }
             sec_off += nsec;
@@ -740,11 +645,8 @@ int fat32_read_whole(struct fs_node* file) {
     }
 
     file->content = (char*)buf;
-    file->is_ref  = heap ? 0 : 1;    // arena memory: skip kernel free()
-    file->cont_owner = heap ? 0 : 2; /* v0.3 FR-08: 2 = FAT arena (fat_arena_free) */
-    task_sched_unlock();
+    file->is_ref  = heap ? 0 : 1;    // arena memory: never free()
     return 0;
-    task_sched_unlock();
 }
 
 // ===================================================================

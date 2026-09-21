@@ -1,5 +1,4 @@
 #include "header/fs_ram.h"
-#include "header/task.h"   // Phase A: sched-lock
 #include "header/stdio.h"
 #include "header/malloc.h"
 #include "header/itoa_atoi.h"   // strlen, strcpy, strcat, strcmp
@@ -26,23 +25,6 @@ static void fs_node_init_v02(struct fs_node* n) {
     n->dirent_index  = 0;
     for (int i = 0; i < 11; i++) n->sfn[i] = 0;
     n->mnt           = NULL;
-    n->cont_owner    = 0;   /* v0.3 FR-08: heap until told otherwise */
-}
-
-/* v0.3 FR-08: owner-aware content release (heap / FAT arena /
- * GRUB staging). Leaves size untouched so a later
- * fs_ensure_content() re-reads the same bytes from disk. */
-void fs_content_release(struct fs_node* node) {
-    if (!node || !node->content) return;
-    if (node->cont_owner == 0 && !node->is_ref) {
-        free(node->content);
-    } else if (node->cont_owner == 2 && node->is_ref) {
-        fat_arena_free(node->content);      /* v0.3: reclaimable arena */
-    }
-    /* cont_owner == 1 (GRUB staging): never freed */
-    node->content    = NULL;
-    node->is_ref     = 0;
-    node->cont_owner = 0;
 }
 
 int fs_ensure_content(struct fs_node* node) {
@@ -126,12 +108,11 @@ struct fs_node* fs_find_child(struct fs_node* parent, const char* name) {
  * raised a -Wunused-function warning. */
 
 // ====================================================================
-//                        CREATE FILE / DIRECTORY
+//                        BUAT FILE / DIREKTORI
 // ====================================================================
 
 int fs_create_file(struct fs_node* parent, const char* name, const char* content) {
-    task_sched_lock();   /* Phase A: no preemption mid-storage-operation */
-    if (!parent || !parent->is_dir) { task_sched_unlock(); return -1; }
+    if (!parent || !parent->is_dir) return -1;
     if (!name || !name[0]) return -8;             // FIX: NULL/empty name
     if (strlen(name) >= FS_NAME_MAX) return -7;   // FIX: name > 63 chars = heap overflow
     if (fs_find_child(parent, name)) return -2; // already exists
@@ -144,16 +125,14 @@ int fs_create_file(struct fs_node* parent, const char* name, const char* content
         /* -5 = the 8.3 alias is taken by a file whose LONG name
          * differs (e.g. "my_docum.txt" vs "My Document.txt") — the
          * name effectively exists, report it in fs_ram's vocabulary */
-        if (ret == -5) { task_sched_unlock(); return -2; }
-        if (ret != 0) { task_sched_unlock(); return ret; }
+        if (ret == -5) return -2;
+        if (ret != 0) return ret;
         if (content) {
             struct fs_node* n = fs_find_child(parent, name);
-            if (!n) { task_sched_unlock(); return -3; }
-            task_sched_unlock();
+            if (!n) return -3;
             return fat32_write_file(n, (const uint8_t*)content,
                                     (uint32_t)strlen(content));
         }
-        task_sched_unlock();
         return 0;
     }
 
@@ -166,7 +145,6 @@ int fs_create_file(struct fs_node* parent, const char* name, const char* content
     new_node->name[nlen] = '\0';
     new_node->is_dir = 0;
     new_node->is_ref = 0;
-    new_node->cont_owner = 0;   /* RAMFS files are kernel-heap owned */
     new_node->parent = parent;
     new_node->children = NULL;
 
@@ -175,7 +153,6 @@ int fs_create_file(struct fs_node* parent, const char* name, const char* content
         new_node->content = (char*)malloc(len + 1);
         if (!new_node->content) {
             free(new_node);
-            task_sched_unlock();
             return -3;
         }
         strcpy(new_node->content, content);
@@ -190,11 +167,7 @@ int fs_create_file(struct fs_node* parent, const char* name, const char* content
     parent->children = new_node;
     fs_node_init_v02(new_node);
 
-    task_sched_unlock();
-
-    task_sched_unlock();
     return 0;
-    task_sched_unlock();
 }
 
 // ====================================================================
@@ -202,9 +175,8 @@ int fs_create_file(struct fs_node* parent, const char* name, const char* content
 // ====================================================================
 int fs_write_binary(struct fs_node* parent, const char* name,
                      const uint8_t* data, uint32_t len) {
-    task_sched_lock();   /* Phase A: no preemption mid-storage-operation */
-    if (!parent || !parent->is_dir) { task_sched_unlock(); return -1; }
-    if (!data) { task_sched_unlock(); return -5; }
+    if (!parent || !parent->is_dir) return -1;
+    if (!data) return -5;
 
     /* v0.2: FAT32 parent — full write-through (create when missing,
      * resize the cluster chain, update the dirent, refresh cache). */
@@ -212,11 +184,10 @@ int fs_write_binary(struct fs_node* parent, const char* name,
         struct fs_node* node = fs_find_child(parent, name);
         if (!node) {
             int ret = fat32_create_file(parent, name);
-            if (ret != 0) { task_sched_unlock(); return ret; }
+            if (ret != 0) return ret;
             node = fs_find_child(parent, name);
         }
-        if (!node || node->is_dir) { task_sched_unlock(); return -6; }
-        task_sched_unlock();
+        if (!node || node->is_dir) return -6;
         return fat32_write_file(node, data, len);
     }
 
@@ -226,27 +197,26 @@ int fs_write_binary(struct fs_node* parent, const char* name,
         // File does not exist yet -> create it (empty) first, then fill it in
         // manually below (NOT via the strlen-based fs_create_file(content)).
         int ret = fs_create_file(parent, name, nullptr);
-        if (ret != 0) { task_sched_unlock(); return ret; }
+        if (ret != 0) return ret;
         node = fs_find_child(parent, name);
-        if (!node) { task_sched_unlock(); return -3; }
+        if (!node) return -3;
     } else if (node->is_dir) {
-        task_sched_unlock();
         return -6; // that name is already taken by a directory
     }
 
     // Discard the old contents (if any) before swapping in the new buffer.
-    // v0.3 FR-08: owner-aware release (heap / arena / staging); an
-    // overwritten staging file turns into a normal heap copy
-    // (is_ref reset to 0) exactly as before.
-    fs_content_release(node);
+    // v10.9: an is_ref node (zero-copy module staging) is NOT freed --
+    // its pointer does not belong to the kernel heap. An overwritten
+    // staging file turns into a normal heap copy (is_ref reset to 0).
+    if (node->content && !node->is_ref) {
+        free(node->content);
+    }
     node->content = nullptr;
     node->is_ref = 0;
-    node->cont_owner = 0;
 
     node->content = (char*)malloc(len);
     if (!node->content) {
         node->size = 0;
-        task_sched_unlock();
         return -3; // out of memory
     }
 
@@ -258,9 +228,7 @@ int fs_write_binary(struct fs_node* parent, const char* name,
     for (uint32_t i = 0; i < len; i++) dst[i] = src[i];
 
     node->size = len;
-    task_sched_unlock();
     return 0;
-    task_sched_unlock();
 }
 
 // ====================================================================
@@ -299,11 +267,12 @@ int fs_reference_binary(struct fs_node* parent, const char* name,
     }
 
     // Detach the old contents WITHOUT free when it is also a zero-copy ref.
-    fs_content_release(node);
-    node->content = (char*)(uintptr_t)data; // staging-owned — do not free
+    if (node->content && !node->is_ref) {
+        free(node->content);
+    }
+    node->content = (char*)(uintptr_t)data; // milik staging — jangan free
     node->size    = len;
     node->is_ref  = 1;
-    node->cont_owner = 1;                    /* GRUB staging */
     return 0;
 }
 
@@ -375,9 +344,9 @@ int fs_delete_node(struct fs_node* parent, const char* name) {
             // unlink
             if (prev) prev->next = curr->next;
             else parent->children = curr->next;
-            // free the content for files (v10.9: except zero-copy
-            // module-staging refs — those pointers are not kernel-heap owned)
-            fs_content_release(curr);
+            // bebaskan konten jika file (v10.9: kecuali zero-copy ref
+            // module staging — pointer itu bukan milik heap kernel)
+            if (curr->content && !curr->is_ref) free(curr->content);
             free(curr);
             return 0;
         }
@@ -385,53 +354,6 @@ int fs_delete_node(struct fs_node* parent, const char* name) {
         curr = curr->next;
     }
     return -2; // not found
-}
-
-// ====================================================================
-//  v0.3 FR-01: RAMFS RENAME (relink)
-// --------------------------------------------------------------------
-//  Moves an existing RAMFS node to another parent / name. The content
-//  buffer moves with the node (no copy). Works for files AND dirs
-//  (the children move with the parent pointer automatically).
-// ====================================================================
-int fs_ram_relink_node(struct fs_node* node, struct fs_node* new_parent,
-                       const char* new_name) {
-    task_sched_lock();
-    if (!node || !new_parent || !new_parent->is_dir || !new_name || !new_name[0]) {
-        task_sched_unlock();
-        return -1;
-    }
-    if (strlen(new_name) >= FS_NAME_MAX) { task_sched_unlock(); return -1; }
-    if (node->backing != 0 || new_parent->backing != 0) {
-        task_sched_unlock();
-        return -1;                    /* FAT nodes: syscall rename path */
-    }
-    /* name taken in the destination (the caller unlinked it already,
-     * but a racing create could have snuck in — single CPU, still be
-     * safe) */
-    if (fs_find_child(new_parent, new_name)) { task_sched_unlock(); return -1; }
-
-    /* unlink from the old parent */
-    struct fs_node* op = node->parent;
-    if (op) {
-        if (op->children == node) op->children = node->next;
-        else {
-            struct fs_node* c = op->children;
-            while (c && c->next != node) c = c->next;
-            if (c) c->next = node->next;
-        }
-    }
-
-    /* rename + relink */
-    size_t nlen = strlen(new_name);
-    for (size_t i = 0; i < nlen; i++) node->name[i] = new_name[i];
-    node->name[nlen] = '\0';
-    node->parent = new_parent;
-    node->next   = new_parent->children;
-    new_parent->children = node;
-
-    task_sched_unlock();
-    return 0;
 }
 
 // ====================================================================
@@ -581,7 +503,7 @@ int fs_change_dir(struct fs_node** cwd, const char* path) {
         struct fs_node* current = *cwd;
         int i = 0;
         while (path_copy[i]) {
-            // find '/' or the end
+            // cari '/' atau akhir
             int start = i;
             while (path_copy[i] && path_copy[i] != '/') i++;
             char old = path_copy[i];
