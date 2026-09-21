@@ -1,6 +1,8 @@
 #ifndef PAGING_H
 #define PAGING_H
 
+#include <stdint.h>
+
 /*
  * ============================================================================
  *  paging.h — Identity-mapped paging with a supervisor/user split (v10.7)
@@ -40,6 +42,10 @@ void paging_init(void);
 
 /* 1 = paging is active (used by the `memmap` diagnostics). */
 int paging_is_active(void);
+
+/* Phase A: the kernel page-directory template — used by shell tasks.
+ * User tasks build their own directory from this template. */
+uint32_t* paging_kernel_dir(void);
 
 #ifdef __cplusplus
 }

@@ -3,63 +3,75 @@
 #include "header/timer.h"
 #include "header/ps2_mouse.h"
 #include "header/color.h"
-#include "header/libstring.h"   // snprintf (bounded) utk detail panic
+#include "header/libstring.h"   // snprintf (bounded) for panic details
 #include "header/panic.h"       // panic_enter / panic_screen
 #include "header/syscall.h"     // isr_128 — entry gate syscall int 0x80
 #include "header/usermode.h"    // user3_report_fault — kill program ring 3 (v10.7)
+#include "header/task.h"        // Phase A: per-console keyboard + F1/F2
+
+// Phase A: the new IRQ0 stub (asm in timer.cpp) — it can context-switch.
+extern "C" void isr_32(void);
 #include <stdint.h>
 
 // ============================================================
-//  KEYBOARD RING BUFFER (v10.5)
-//  - IRQ1 handler pushes raw scancodes into kbd_ring
-//  - getkey() / getchar() / pollkey() consume via the three
-//    keyboard_* functions below (same C API as before)
-//  - 128 slots (power of two, see ringbuf.h) absorbs typematic
-//    bursts + E0-prefixed sequences without loss
-//  - overflow policy: drop-NEWEST (typing order must never scramble)
+//  KEYBOARD PER-CONSOLE (Phase A — multitasking)
+//  IRQ1 pushes scancodes into the FOCUSED console's ring (the
+//  active console). F1/F2 (scancodes 0x3B/0x3C) are intercepted
+//  and turned into global requests (g_req_new_console /
+//  g_req_prev_console) processed by the timer. Readers (getkey
+//  etc.) drain the ring of the CURRENT task's console — each
+//  console's shell reads its own queue.
 // ============================================================
 #include "header/ringbuf.h"
-static RingBuffer<uint8_t, 128> kbd_ring;
+#define KBD_CONSOLES 8
+static RingBuffer<uint8_t, 128> con_kbd[KBD_CONSOLES];
 
-extern "C" int keyboard_has_data(void) {
-    return kbd_ring.count() > 0;   /* lock-free, may lag one item */
+/* The console drained by the current task (fallback: the active console). */
+static inline int kbd_console_current(void) {
+    struct Task* t = task_current();
+    int c = t ? t->console : -1;
+    if (c < 0 || c >= KBD_CONSOLES) c = console_active_id();
+    if (c < 0 || c >= KBD_CONSOLES) c = 0;
+    return c;
 }
 
-/* Blocking pop. Busy-waits until an IRQ pushes a scancode; the cli/sti
- * inside RingBuffer::pop() re-enables interrupts between attempts, so
- * IRQ1 can still land and fill the ring. Atomicity of each pop vs IRQ1
- * is inherited from the ring primitive (this replaces the old manual
- * pushf/cli sequence that fixed the I5 tail-RMW race). */
+extern "C" int keyboard_has_data(void) {
+    return con_kbd[kbd_console_current()].count() > 0;
+}
+
+/* Blocking pop. hlt waits for the next interrupt (100 Hz timer or
+ * key) — CPU-friendly and the scheduler still gets its tick. Pop vs
+ * IRQ1 atomicity is guaranteed by the ring primitive (internal cli/sti). */
 extern "C" uint8_t keyboard_read_byte(void) {
     uint8_t data;
-    while (!kbd_ring.pop(&data)) {
-        // busy-wait until data arrives (the interrupt fills the ring)
+    int con = kbd_console_current();
+    while (!con_kbd[con].pop(&data)) {
+        asm volatile("hlt");
     }
     return data;
 }
 
-/* Non-blocking pop for game loops (SYS_POLLKEY): return one scancode
- * if there is one, -1 when the ring is empty. The pop stays atomic
- * with respect to IRQ1 via the ring primitive's internal guard. */
+/* Non-blocking pop for game loops (SYS_POLLKEY). */
 extern "C" int keyboard_read_byte_noblock(void) {
     uint8_t data;
-    if (!kbd_ring.pop(&data)) return -1;
+    if (!con_kbd[kbd_console_current()].pop(&data)) return -1;
     return (int)data;
 }
 
-/* Diagnostics for the `ringstats` shell command: pending count, dropped
- * count and the keyboard ring capacity. */
+/* Shell `ringstats` diagnostics (the current task's console ring). */
 extern "C" void keyboard_ring_stats(uint32_t* count, uint32_t* drops,
                                     uint32_t* cap) {
-    if (count) *count = kbd_ring.count();
-    if (drops) *drops = kbd_ring.drops();
-    if (cap)   *cap   = kbd_ring.capacity();
+    RingBuffer<uint8_t, 128>* r = &con_kbd[kbd_console_current()];
+    if (count) *count = r->count();
+    if (drops) *drops = r->drops();
+    if (cap)   *cap   = r->capacity();
 }
 
 // ============================================================
 //  HANDLER EKSTERNAL
 // ============================================================
-extern "C" void timer_handler(void* frame);
+// Phase A: the timer now uses the asm stub isr_32 (timer.cpp),
+// not the GCC-interrupt timer_handler — the old declaration is unused.
 
 // v10.11: NE2000 ISA NIC — IRQ9 (vector 41). Driver: kernel/net/ne2000.c
 extern "C" __attribute__((interrupt)) void ne2000_isr(void* frame);
@@ -159,6 +171,10 @@ static void exception_panic(uint8_t vec, uint32_t err_code, void* frame) {
         eip = ((const interrupt_frame_t*)frame)->eip;
     }
 
+    /* Phase A: a panic always renders on the ACTIVE console (not the
+     * faulting task's console — that may be a background console). */
+    term_force_active_output();
+
     const char* name = (vec < 32) ? exception_names[vec] : "Unknown exception";
 
     // Per-exception detail, built on the stack with bounded snprintf
@@ -193,7 +209,7 @@ static void exception_panic(uint8_t vec, uint32_t err_code, void* frame) {
 //  Exception TANPA error code: vectors 0-7, 9, 15-31
 //    → signature: void handler(void* frame)
 //
-//  Exception DENGAN error code: vectors 8, 10-14
+//  Exception WITH error code: vectors 8, 10-14
 //    → signature: void handler(void* frame, uint32_t err_code)
 //
 //  GCC __attribute__((interrupt)) handles the prologue/epilogue
@@ -205,13 +221,13 @@ static void exception_panic(uint8_t vec, uint32_t err_code, void* frame) {
 //  instructions that could trigger recursive #NM.
 // ============================================================
 
-// --- Macro: exception TANPA error code ---
+// --- Macro: exception WITHOUT error code ---
 #define DEFINE_ISR_NOERR(n)                                             \
     extern "C" __attribute__((interrupt)) void isr_##n(void* frame) {  \
         exception_panic(n, 0, frame);                                   \
     }
 
-// --- Macro: exception DENGAN error code ---
+// --- Macro: exception WITH error code ---
 #define DEFINE_ISR_ERR(n)                                                    \
     extern "C" __attribute__((interrupt)) void isr_##n(void* frame,         \
                                                      uint32_t err_code) { \
@@ -233,10 +249,22 @@ DEFINE_ISR_ERR(10)     // #TS  Invalid TSS            [error code]
 DEFINE_ISR_ERR(11)     // #NP  Segment Not Present    [error code]
 DEFINE_ISR_ERR(12)     // #SS  Stack-Segment Fault     [error code]
 DEFINE_ISR_ERR(13)     // #GP  General Protection Fault [error code]
-DEFINE_ISR_ERR(14)     // #PF  Page Fault              [error code]
+// v0.3 (FR-06): #PF gets a custom body — BEFORE the kill/panic
+// path, the demand-paging hook gets a chance to satisfy the fault
+// (a reserved, non-present user page: allocate + zero + map + resume
+// the faulting instruction). task_demand_fault() returns 0 for every
+// "real" fault (guard page, unmapped hole, supervisor bug) which then
+// falls through to the existing ring-3-kill / kernel-panic path.
+extern "C" __attribute__((interrupt)) void isr_14(void* frame,
+                                                  uint32_t err_code) {
+    uint32_t cr2;
+    asm volatile("mov %%cr2, %0" : "=r"(cr2));
+    if (task_demand_fault(cr2, err_code)) return;   /* handled: iret */
+    exception_panic(14, err_code, frame);
+}
 DEFINE_ISR_NOERR(15)   //      Reserved
 DEFINE_ISR_NOERR(16)   // #MF  x87 FPU Error
-DEFINE_ISR_ERR(17)     // #AC  Alignment Check  [error code] FIX: CPU push err code utk #AC
+DEFINE_ISR_ERR(17)     // #AC  Alignment Check  [error code] FIX: CPU pushes an error code for #AC
 DEFINE_ISR_NOERR(18)   // #MC  Machine Check
 DEFINE_ISR_NOERR(19)   // #XM  SIMD Floating-Point
 DEFINE_ISR_NOERR(20)   // #VE  Virtualization Exception
@@ -253,26 +281,35 @@ DEFINE_ISR_NOERR(30)   //      Reserved
 DEFINE_ISR_NOERR(31)   //      Reserved
 
 // ============================================================
-//  KEYBOARD IRQ1 HANDLER (interrupt-driven)
+//  KEYBOARD IRQ1 HANDLER (interrupt-driven, per-console + F1/F2)
 // ============================================================
 extern "C" __attribute__((interrupt)) void irq1_handler(void* frame) {
     (void)frame;
 
-    /* FIX(I2): check the 8042 status first. Bit 0 = output buffer has
-     * data, bit 5 = the byte belongs to AUX (the mouse). The old code
-     * did a blind inb(0x60) -> on real hardware mouse bytes could mix into the keyboard buffer. */
+    /* FIX(I2): check the 8042 status first. Bit0 = output-buffer data,
+     * bit5 = the byte belongs to AUX (the mouse). */
     uint8_t st = inb(0x64);
     if (st & 0x01) {                 // data present
         uint8_t data = inb(0x60);
         if (st & 0x20) {
-            // a mouse byte strayed in via IRQ1 -> route to the mouse parser
             mouse_handle_byte(data);
+        } else if (data == 0x3B) {
+            /* F1 (make) — request a NEW shell/console. */
+            g_req_new_console = 1;
+        } else if (data == 0xBB) {
+            /* F1 release — ignored. */
+        } else if (data == 0x3C) {
+            /* F2 (make) — focus the PREVIOUS console. */
+            g_req_prev_console = 1;
+        } else if (data == 0xBC) {
+            /* F2 release — ignored. */
         } else {
-            // drop-newest on overflow (policy: typing order is sacred)
-            kbd_ring.push(data);
+            /* regular scancode -> push into the FOCUSED (active) console ring. */
+            int foc = console_active_id();
+            if (foc < 0 || foc >= KBD_CONSOLES) foc = 0;
+            con_kbd[foc].push(data);
         }
     }
-    // (if bit 0 = 0, a spurious IRQ - just EOI)
 
     // Send EOI to the master PIC
     outb(0x20, 0x20);
@@ -292,9 +329,10 @@ extern "C" __attribute__((interrupt)) void mouse_handler(void* frame) {
         if (st & 0x20) {
             mouse_handle_byte(data);
         } else {
-            // a keyboard byte strayed in via IRQ12 -> push it into the
-            // keyboard ring, don't poison the mouse packet state machine.
-            kbd_ring.push(data);
+            // keyboard byte strayed in via IRQ12 -> focused console ring
+            int foc = console_active_id();
+            if (foc < 0 || foc >= KBD_CONSOLES) foc = 0;
+            con_kbd[foc].push(data);
         }
     }
     outb(0xA0, 0x20);
@@ -428,8 +466,10 @@ void idt_init() {
 
     // ============================================================
     //  HARDWARE IRQ HANDLERS (vectors 32-47)
+    //  Phase A: vector 32 = isr_32 (the new asm stub in timer.cpp —
+    //  pushal + call timer_dispatch_c; it can context-switch).
     // ============================================================
-    idt_set_gate(32, (uint32_t)timer_handler,   sel, flags);   // IRQ0  Timer
+    idt_set_gate(32, (uint32_t)isr_32,          sel, flags);   // IRQ0  Timer
     idt_set_gate(33, (uint32_t)irq1_handler,     sel, flags);   // IRQ1  Keyboard
     idt_set_gate(39, (uint32_t)spurious_irq7,   sel, flags);   // IRQ7  Spurious
     idt_set_gate(41, (uint32_t)ne2000_isr,      sel, flags);   // IRQ9  NE2000 (v10.11)

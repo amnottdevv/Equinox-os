@@ -97,6 +97,15 @@ int                 fat32_mount_is_writable(void);
 uint32_t fat32_arena_used(void);
 uint32_t fat32_arena_total(void);
 
+// v0.3 FR-08: return a fat_arena_alloc_public() payload to the
+// free-list pool (called by fs_content_release in fs_ram.cpp).
+// Out-of-range / wild pointers are ignored, never fatal.
+void fat_arena_free(void* ptr);
+
+// v0.3 FR-01: arena allocation for syscall write buffers (growing
+// FAT-backed files). Returns NULL when the arena has no fit.
+uint8_t* fat_arena_alloc_public(uint32_t bytes);
+
 #ifdef __cplusplus
 }
 #endif

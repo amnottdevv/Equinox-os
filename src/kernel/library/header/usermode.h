@@ -46,6 +46,9 @@ extern "C" {
  *  0x02600000 - 0x02600FFF  USER   trampoline page (exit stub at 0x2600000)
  *  0x02601000 - 0x02601FFF  SUPER  GUARD page (stack overflow detection)
  *  0x02602000 - 0x02701FFF  USER   user stack 1 MB (initial ESP = 0x2702000)
+ *  0x02702000 - 0x027FFFFF  SUPER  kernel heap EXTENSION (v0.3 tools release:
+ *                                 malloc.cpp 2-region arena — ~1 MB more for
+ *                                 the RAMFS so eqbuild fits 29 tool builds)
  *  0x02800000 - 0x033FFFFF  SUPER  GRUB module staging (WAD zero-copy, v10.9)
  *  Every other address (kernel, kernel heap, below 64 MB
  *  and the framebuffer) = supervisor (U/S=0) → access from CPL 3 = #PF.
@@ -106,6 +109,18 @@ void user3_report_fault(uint8_t vec, uint32_t err_code, uint32_t eip);
 
 /* Shell `memmap` command helper: prints the region map + paging status. */
 void usermode_print_memmap(void);
+
+/* Phase A (multitasking):
+ *   tss_set_esp0(esp0)      — set TSS.ESP0 to the current task's kernel stack
+ *                             (called by the scheduler on every context switch).
+ *   usermode_int_stack_top() — top of user_int_stack (the CPL3->CPL0 stack of task 0).
+ *   user3_launch4(entry, user_esp, arg, save) — per-task variant: the resume
+ *                             point is written into the caller task's u3_save*.
+ */
+void     tss_set_esp0(uint32_t esp0);
+uint32_t usermode_int_stack_top(void);
+uint32_t user3_launch4(uint32_t entry, uint32_t user_esp, uint32_t arg,
+                       void* save_area);
 
 #ifdef __cplusplus
 }
