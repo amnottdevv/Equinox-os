@@ -1,88 +1,89 @@
 # .mrp Loader + Free-list malloc — v1
 
-## What changed / was added
+## Yang berubah / ditambah
 
 **Kernel (`kernel/library/`)**
-- `malloc.cpp` — fully replaced the bump allocator with a **free-list allocator**
-  (split + coalesce + canary). Two separate arenas:
-  - Kernel heap: `0x300000 - 0x500000` (2 MB) — regular `malloc/free/calloc/realloc`
-  - MRP arena: `0x500000 - 0x900000` (4 MB) — dedicated to `.mrp` programs,
-    completely reset every time a new program is about to run
-    (`mrp_heap_init()`) and after it finishes (`mrp_free_all()`)
-- `header/malloc.h` — new declarations: `heap_check_integrity()`,
-  `get_heap_free_blocks()`, `get_heap_largest_free()`, `mrp_alloc()`, etc.
-- `header/mrp_format.h` — the `.mrp` header format (18 bytes) + `is_valid_mrp()`
-- `header/mrp_loader.h` + `mrp_loader.cpp` — the loader: validate -> copy into
-  the MRP arena -> `call` the entry point -> `mrp_free_all()`
-- `fs_ram.cpp` / `fs_ram.h` — added `fs_write_binary()` (byte-safe, unlike the
-  old `strcpy`-based writer, so `.mrp` files whose content is machine code are
-  not truncated at the first `0x00` byte)
-- `kernel.cpp` — new shell command: `run <name.mrp>`
+- `malloc.cpp` — diganti total dari bump allocator jadi **free-list allocator**
+  (split + coalesce + canary). Dua arena terpisah:
+  - Kernel heap: `0x300000 - 0x500000` (2 MB) — `malloc/free/calloc/realloc` biasa
+  - MRP arena: `0x500000 - 0x900000` (4 MB) — khusus program `.mrp`, di-reset
+    total tiap kali program baru mau jalan (`mrp_heap_init()`) dan sesudah
+    program selesai (`mrp_free_all()`)
+- `header/malloc.h` — deklarasi baru: `heap_check_integrity()`,
+  `get_heap_free_blocks()`, `get_heap_largest_free()`, `mrp_alloc()`, dll.
+- `header/mrp_format.h` — format header `.mrp` (18 byte) + `is_valid_mrp()`
+- `header/mrp_loader.h` + `mrp_loader.cpp` — loader: validasi -> copy ke MRP
+  arena -> `call` ke entry point -> `mrp_free_all()`
+- `fs_ram.cpp` / `fs_ram.h` — tambah `fs_write_binary()` (byte-safe, bukan
+  `strcpy`-based, supaya file `.mrp` yang isinya machine code gak kepotong
+  di byte `0x00`)
+- `kernel.cpp` — command shell baru: `run <nama.mrp>`
 
 **Userland (`mrp_user/`)**
-- `mrp_api.h` — the `mrp_api_t` struct (MUST match the kernel version exactly)
-  + the `MRP_ENTRY` macro
-- `link_mrp.ld` — the linker script that places `_start` at offset 0
-- `hello.cpp` — example program: print + read input + print again
-- `mrp_pack.py` — compile .cpp -> link -> objcopy -> wrap with the `.mrp` header
+- `mrp_api.h` — struct `mrp_api_t` (HARUS sama persis dengan versi kernel)
+  + macro `MRP_ENTRY`
+- `link_mrp.ld` — linker script yang naro `_start` di offset 0
+- `hello.cpp` — contoh program: print + baca input + print lagi
+- `mrp_pack.py` — compile .cpp -> link -> objcopy -> bungkus header `.mrp`
 
-## How to use
+## Cara pakai
 
 ```bash
-# compile + pack in one step (needs i686-elf-g++ on PATH)
+# compile + pack sekaligus (butuh i686-elf-g++ di PATH)
 python3 mrp_user/mrp_pack.py mrp_user/hello.cpp hello.mrp
 
-# or if you already have your own .bin (e.g. from another toolchain / future TCC)
+# atau kalau udah punya .bin sendiri (misal dari toolchain lain / TCC nanti)
 python3 mrp_user/mrp_pack.py --from-bin program.bin program.mrp hello.mrp
 ```
 
-Then put `hello.mrp` into the Equinox OS RAMFS and run:
+Lalu masukkan `hello.mrp` ke RAMFS Equinox OS dan jalankan:
 ```
 root@equinox:/$ run hello.mrp
 ```
 
-## Open items (decide / implement yourself)
+## ⚠️ Yang BELUM diselesaikan (perlu kamu putuskan/lakukan sendiri)
 
-0. **[FIXED — bug history]** An early version of `link_mrp.ld` linked against
-   address `0`, while the code actually runs at `0x500010` (the MRP arena).
-   Because the build uses `-fno-pic`, every access to static variables /
-   string literals resolved to the wrong address at run time (garbage reads /
-   crashes). Fixed: `link_mrp.ld` now links at `0x500010`, exactly the address
-   `mrp_alloc()` hands out at run time (deterministic because
-   `mrp_heap_init()` always resets the arena before loading new code).
-   **If you change `sizeof(block_header)` in `malloc.cpp` or move
-   `MRP_HEAP_START`, the `0x500010` in `link_mrp.ld` MUST be adjusted too** —
-   see the detailed comment in that file.
-1. **How `.mrp` files get into the RAMFS.** The Equinox OS RAMFS can currently
-   only be filled from the shell (`ccfile`, text only) — there is no path for
-   binary files from outside QEMU. The easiest option: add a **GRUB multiboot
-   module** (`module /boot/hello.mrp` in `grub.cfg`), then read
-   `mb_info->mods_addr` in `kernel_main()` and call `fs_write_binary()` to
-   stage the content into the RAMFS at boot. Not implemented in that iteration
-   because the scope was the loader + malloc, but it is the next blocker you
-   will hit as soon as you test `run` for real in QEMU.
-2. **`.bss` in user programs can inflate the `.mrp` file size** — `objcopy
-   -O binary` writes `.bss` as literal zero bytes into the file. Fine for
-   small programs, but avoid large static buffers (`static char
-   buf[100000];`); use `api->alloc()` at run time when you need a lot.
-3. **No global-constructor support yet** (static objects with non-trivial
-   constructors). For now, stick to plain / POD static variables.
-4. **Still Ring 0** — `.mrp` programs have FULL access to kernel memory, not
-   a sandbox. This was always planned to be fixed in the Ring 3 step.
+0. **[FIXED — riwayat bug]** Versi awal `link_mrp.ld` link ke alamat `0`,
+   padahal code beneran dijalanin di `0x500010` (MRP arena). Karena compile
+   pakai `-fno-pic`, itu bikin semua akses ke variabel statis/string
+   literal salah alamat begitu program run (baca garbage / crash). Sudah
+   diperbaiki: `link_mrp.ld` sekarang link ke `0x500010`, persis alamat
+   yang dikasih `mrp_alloc()` pas runtime (deterministik karena
+   `mrp_heap_init()` selalu reset arena dulu sebelum load code baru).
+   **Kalau kamu ubah `sizeof(block_header)` di `malloc.cpp` atau posisi
+   `MRP_HEAP_START`, angka `0x500010` di `link_mrp.ld` WAJIB disesuaikan
+   juga** — lihat komentar detail di file itu.
+1. **Cara file `.mrp` masuk ke RAMFS.** RAMFS Equinox OS sekarang cuma bisa
+   diisi lewat shell (`ccfile`, text only) — belum ada jalur buat masukin
+   file biner dari luar QEMU. Opsi yang paling gampang: tambah **GRUB
+   multiboot module** (`module /boot/hello.mrp` di `grub.cfg`), lalu baca
+   `mb_info->mods_addr` di `kernel_main()` dan panggil `fs_write_binary()`
+   buat naro isinya ke RAMFS saat boot. Belum saya buatkan karena scope
+   kali ini fokus loader + malloc, tapi ini blocker berikutnya yang bakal
+   kamu hit begitu mau tes `run` beneran di QEMU.
+2. **`.bss` di program user bisa nge-gembungin ukuran `.mrp`** — `objcopy
+   -O binary` menuliskan `.bss` sebagai byte nol literal di file. Untuk
+   program kecil gapapa, tapi hindari buffer statis gede (`static char
+   buf[100000];`), pakai `api->alloc()` runtime kalau butuh banyak.
+3. **Belum ada dukungan global constructor** (static object dengan
+   constructor non-trivial). Untuk sekarang, cukup pakai variabel statis
+   polos / POD.
+4. **Masih Ring 0** — program `.mrp` punya akses PENUH ke memori kernel,
+   bukan sandbox. Ini emang rencananya baru diperbaiki di step Ring 3.
 
-## Why the design looks like this (short version)
+## Kenapa desainnya begini (ringkas)
 
-- **Why not a binary string literal as the signature?** Long text signatures
-  ("0110101...") are expensive to verify and fragile in the face of different
-  encodings/whitespace. A 4-byte magic (`"MRP1"`) + checksum is far cheaper
-  and unambiguous.
-- **Why is `entry_offset` always 0?** The linker script puts `_start` first
-  via the `.start` section. That removes any need for ELF symbol-table
-  parsing in the packer — assuming offset 0 is enough, and `mrp_pack.py`
-  automatically verifies it with `nm` as a sanity check.
-- **Why syscalls via a function-pointer struct instead of `int 0x80`?** At
-  Ring 0 there is no privilege transition, so calling through a pointer is
-  sufficient and much simpler. The ABI shape (one struct holding all
-  "syscalls") deliberately mirrors int 0x80 so that programs written now will
-  not need rewriting when the Ring 3 migration happens — only the calling
-  mechanism changes.
+- **Kenapa bukan literal string biner sebagai signature?** Signature teks
+  panjang gak jelas ("0110101...") mahal dicek & rawan gagal karena
+  encoding/whitespace beda. Magic 4-byte (`"MRP1"`) + checksum jauh lebih
+  murah dan gak ambigu.
+- **Kenapa `entry_offset` selalu 0?** Linker script naro `_start` di paling
+  depan lewat section `.start`. Ini ngilangin kebutuhan parsing symbol
+  table ELF di packer — cukup asumsi offset 0, diverifikasi otomatis oleh
+  `mrp_pack.py` pakai `nm` sebagai sanity check.
+- **Kenapa syscall lewat struct function-pointer, bukan `int 0x80`?** Di
+  Ring 0 gak ada privilege transition, jadi `call` lewat pointer udah
+  cukup dan jauh lebih simpel. Pola ABI-nya (satu struct berisi semua
+  "syscall") sengaja mirip int 0x80 supaya program yang udah ditulis
+  sekarang gak perlu ditulis ulang pas migrasi ke Ring 3 nanti — cuma
+  mekanisme pemanggilannya yang beda.

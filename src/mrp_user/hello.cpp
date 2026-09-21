@@ -22,14 +22,14 @@ extern "C" __attribute__((section(".start")))
 void _start(void* legacy_api) {
     (void)legacy_api;   // pure syscalls now — the legacy argument is ignored
 
-    print("Hello from a .mrp program!\n");
-    print("What is your name? ");
+    print("Halo dari program .mrp!\n");
+    print("Siapa nama kamu? ");
 
     readline(name_buf, (int)sizeof(name_buf));
 
-    print("Hello, ");
+    print("Halo, ");
     print(name_buf);
-    print("! Now back to the shell...\n");
+    print("! Sekarang balik ke shell...\n");
 
     exit(0);
 }

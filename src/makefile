@@ -24,7 +24,7 @@ ifeq ($(shell command -v i686-elf-g++.exe 2>/dev/null),)
     LD      := g++
     OBJCOPY := objcopy
     HOSTCC  := 1
-    LIBGCC32_DIR ?= $(HOME)/tools/root/usr/lib/gcc/x86_64-linux-gnu/14/32
+    LIBGCC32_DIR ?= $(HOME)/tools/root/usr/lib/gcc/i686-linux-gnu/14
     LIBGCC_LDFLAGS := -L$(LIBGCC32_DIR) -no-pie
     PIE_CFLAGS     := -fno-pie
   else
@@ -154,14 +154,8 @@ OBJS    = $(ASM_OBJ) $(CPP_OBJ) $(C_OBJ) $(LWIP_C_OBJ) $(BEARSSL_OBJ)
 LINKER_SCRIPT = $(ROOT_DIR)/linker.ld
 
 # Compiler flags
-# v0.3 fix: -MMD -MP — header dependency tracking. Without it,
-# a struct edit in a header (e.g. the Task clip fields) recompiles ONLY
-# the .cpp files that were touched, leaving every other includer with
-# the OLD struct layout: mixed ABIs in one binary (found the hard way:
-# mrp_loader.o read Task::clip_h as Task::page_dir -> CR3=400 ->
-# triple fault). The .d files make header edits rebuild every user.
-COMMON_FLAGS   = -m32 -ffreestanding -fno-exceptions -fno-rtti -Wall -Wextra -O2 -g $(PIE_CFLAGS) -MMD -MP
-COMMON_FLAGS_C = -m32 -ffreestanding -Wall -Wextra -O2 -g $(PIE_CFLAGS) -MMD -MP
+COMMON_FLAGS   = -m32 -ffreestanding -fno-exceptions -fno-rtti -Wall -Wextra -O2 -g $(PIE_CFLAGS)
+COMMON_FLAGS_C = -m32 -ffreestanding -Wall -Wextra -O2 -g $(PIE_CFLAGS)
 INCLUDES     = -I$(KERNEL_DIR)/library/header -I$(KERNEL_DIR) -I$(KERNEL_DIR)/library
 
 # HOST MODE: 32-bit glibc multiarch headers (bits/wordsize.h etc.)
@@ -194,7 +188,7 @@ LDFLAGS = -m32 -ffreestanding -nostdlib -T $(LINKER_SCRIPT) $(LIBGCC_LDFLAGS)
 # v10.7: usermode.o (called from exception-handler context) + paging.o
 # v10.8: libc.o — atof() builds an IEEE-754 double via bit manipulation
 #        (returned via EAX:EDX soft-float), and must not emit x87 code.
-FPU_SENSITIVE = idt.o timer.o ps2_mouse.o panic.o syscall.o usermode.o paging.o libc.o net_lwip.o ne2000.o nic.o httpd.o tls_client.o task.o
+FPU_SENSITIVE = idt.o timer.o ps2_mouse.o panic.o syscall.o usermode.o paging.o libc.o net_lwip.o ne2000.o httpd.o tls_client.o
 
 # ============================================================
 #  Targets
@@ -278,22 +272,17 @@ MRP_TOOLS     = $(wildcard $(DIST_DIR)/equinox/tools/*.mrp)
 MRP_GAMES     = $(wildcard $(DIST_DIR)/equinox/games/*.mrp)
 C_FILES       = $(wildcard $(DIST_DIR)/*.c)
 WAD_FILES     = $(wildcard $(DIST_DIR)/*.wad)
-ELF_FILES     = $(wildcard $(DIST_DIR)/equinox/tools/*.elf)
-# v0.3: userland tool C SOURCES (self-hosting — the in-OS
-# `eqbuild` command compiles them; see the `tools` target).
-TOOLS_C_FILES = $(wildcard $(DIST_DIR)/equinox/tools/*.c)
-ALL_MODULES   = $(MRP_FILES) $(MRP_TOOLS) $(MRP_GAMES) $(C_FILES) $(WAD_FILES) $(ELF_FILES) $(TOOLS_C_FILES)
+ALL_MODULES   = $(MRP_FILES) $(MRP_TOOLS) $(MRP_GAMES) $(C_FILES) $(WAD_FILES)
 
-# Build ISO (v0.3: the userland tool SOURCES are staged first)
-$(DIST_DIR)/equinox.iso: $(DIST_DIR)/kernel.elf $(BOOT_DIR)/grub/grub.cfg tools elfdemo $(ALL_MODULES) | $(DIST_DIR)
+# Build ISO
+$(DIST_DIR)/equinox.iso: $(DIST_DIR)/kernel.elf $(BOOT_DIR)/grub/grub.cfg $(ALL_MODULES) | $(DIST_DIR)
 	mkdir -p $(ISO_DIR)/boot/grub
 	cp $(DIST_DIR)/kernel.elf $(ISO_DIR)/boot/
 	# Generate grub.cfg from the template + one module line per file.
-	# (PATH-BASED routing in mrp_bootloader: FLAT .c -> RAMFS /test
-	#  (mtcc samples); NESTED .c (equinox/tools/*.c) -> /equinox/tools
-	#  (eqbuild sources); .mrp/.elf/.wad land by the dist/
-	#  structure: root, /equinox/tools, /equinox/games. mtcc sample
-	#  paths are ready out of the box: mtcc /test/hello.c)
+	# (.c files become GRUB modules -> mrp_bootloader puts them into RAMFS
+	#  /test — .mrp files land according to the dist/ structure: root or
+	#  /equinox/tools, /equinox/games. mtcc sample paths are ready out of
+	#  the box: mtcc /test/hello.c)
 	# grub.cfg: `module` lines MUST live INSIDE the menuentry (after
 	# `multiboot`) — outside an entry GRUB loads no modules at all
 	# (silent: the boot log says "no boot modules"). gen_grubcfg.py replaces
@@ -302,11 +291,9 @@ $(DIST_DIR)/equinox.iso: $(DIST_DIR)/kernel.elf $(BOOT_DIR)/grub/grub.cfg tools 
 	# Copy every module onto the ISO, KEEPING the dist/ folder structure
 	# (so the module path in grub.cfg = the file path on the ISO).
 	-cp $(MRP_FILES) $(C_FILES) $(WAD_FILES) $(ISO_DIR)/boot/ 2>/dev/null || true
-	# tools dir: prebuilt .mrp (mtcc.mrp + parity demos) + the .c
-	# sources + ELF demos, all under boot/equinox/tools/.
-	@if [ -n "$(MRP_TOOLS)$(TOOLS_C_FILES)$(ELF_FILES)" ]; then \
+	@if [ -n "$(MRP_TOOLS)" ]; then \
                 mkdir -p $(ISO_DIR)/boot/equinox/tools; \
-                cp $(MRP_TOOLS) $(TOOLS_C_FILES) $(ELF_FILES) $(ISO_DIR)/boot/equinox/tools/; \
+                cp $(MRP_TOOLS) $(ISO_DIR)/boot/equinox/tools/; \
 	fi
 	@if [ -n "$(MRP_GAMES)" ]; then \
                 mkdir -p $(ISO_DIR)/boot/equinox/games; \
@@ -396,7 +383,7 @@ pack: $(DIST_DIR)
 	fi
 
 # FIX(mtcc.c): the compiler's canonical source now lives in the PROJECT ROOT
-# (mtcc.c; previously only mrp_user/mtcc.cpp existed).
+# (mtcc.c — user request; previously only mrp_user/mtcc.cpp existed).
 # This target packs from root/mtcc.c; the classic `make pack` still
 # packs mrp_user/*.cpp — both produced an identical mtcc.mrp (the two
 # files were kept in sync); output now lands in dist/equinox/tools/.
@@ -404,84 +391,6 @@ mtcc: $(DIST_DIR)
 	@mkdir -p $(DIST_DIR)/equinox/tools
 	python3 $(ROOT_DIR)/mrp_user/mrp_pack.py $(ROOT_DIR)/mtcc.c $(DIST_DIR)/equinox/tools/mtcc.mrp
 	@echo "[mtcc] root/mtcc.c -> $(DIST_DIR)/equinox/tools/mtcc.mrp"
-
-# ---------------------------------------------------------------
-# v0.3 (self-hosting): the userland file tools
-# (ls/cat/cp/rm/mkdir/rmdir/touch/stat/mv + fstest + pipedemo) ship
-# as C SOURCES in dist/equinox/tools -> RAMFS /equinox/tools. They
-# are compiled INSIDE the OS by the `eqbuild` shell command (the
-# in-OS mtcc, one log line per file, the .c source removed after a
-# successful build) — the OS builds its own userland. The shell
-# prefers the eqbuild products over its kernel builtins
-# (shell_try_user_tool).
-# ---------------------------------------------------------------
-# (elfdemo.c is EXCLUDED: it is a host-built static ELF32 program,
-#  not an mtcc .mrp — see the `elfdemo` target below.)
-TOOLS_SRC  = $(filter-out %/elfdemo.c,$(wildcard $(ROOT_DIR)/tools_user/*.c))
-TOOLS_HOST = $(ROOT_DIR)/scripts/tcc_host_test/mtcc_host
-
-# Rebuild the host mtcc binary from the canonical mtcc.c source.
-# (Still used by `make test` — the host test harness — but NOT by
-#  the ISO build anymore: tools ship as source now.)
-tools-host:
-	g++ -std=gnu++17 -O2 -w -I $(ROOT_DIR)/mrp_user -o $(TOOLS_HOST) \
-          $(ROOT_DIR)/scripts/tcc_host_test/host_main.cpp \
-          $(ROOT_DIR)/scripts/tcc_host_test/interp32.cpp
-
-# v0.3: ship SOURCES, not binaries. The ISO carries the .c
-# files; mrp_bootloader puts them into RAMFS /equinox/tools; the
-# in-OS `eqbuild` command builds + installs them. Stale prebuilt
-# .mrp files of the same tools are removed so nothing prebuilt
-# sneaks onto the self-hosting ISO.
-tools: $(DIST_DIR)
-	@mkdir -p $(DIST_DIR)/equinox/tools
-	@for src in $(TOOLS_SRC); do \
-                base=$$(basename $$src .c); \
-                echo "[tools] $$base.c -> dist/equinox/tools/$$base.c (eqbuild source)"; \
-                cp $$src $(DIST_DIR)/equinox/tools/$$base.c; \
-                rm -f $(DIST_DIR)/equinox/tools/$$base.mrp; \
-	done
-	@echo "[tools] sources staged — run `eqbuild` in-OS to build them"
-
-# Remove stale PREBUILT tool .mrp from dist/. The ISO prerequisites
-# wildcard-snapshot dist/ at make STARTUP: if tool .mrp files exist
-# when make begins and a recipe deletes them mid-run, the ISO target
-# dies with "No rule to make target". Run `make clean-tools` ONCE
-# after switching from the prebuild block below back to sources.
-clean-tools:
-	@for src in $(TOOLS_SRC); do \
-                base=$$(basename $$src .c); \
-                rm -f $(DIST_DIR)/equinox/tools/$$base.mrp; \
-	done
-	@echo "[clean-tools] stale prebuilt tool .mrp removed"
-
-# HOST-SIDE PREBUILD (v0.3 design — DISABLED by the self-hosting flow). Uncomment this block to ship prebuilt .mrp
-# tools again, e.g. for a host/mtcc parity regression ISO:
-#tools: tools-host $(DIST_DIR)
-#       @mkdir -p $(DIST_DIR)/equinox/tools $(BUILD_DIR)/tools
-#       @for src in $(TOOLS_SRC); do \
-#               base=$$(basename $$src .c); \
-#               echo "[tools] $$base.c -> dist/equinox/tools/$$base.mrp"; \
-#               (cd $(BUILD_DIR)/tools && $(TOOLS_HOST) c $$src) > /dev/null 2>&1; \
-#               test -f $(BUILD_DIR)/tools/$$base.mrp || { echo "[tools] FAILED: $$base"; exit 1; }; \
-#               cp $(BUILD_DIR)/tools/$$base.mrp $(DIST_DIR)/equinox/tools/$$base.mrp; \
-#       done
-#       @echo "[tools] -> $(DIST_DIR)/equinox/tools/"
-
-# ---------------------------------------------------------------
-# v0.3 (FR-07): STATIC ELF32 USER PROGRAM. Built by the HOST
-# toolchain (gcc -m32 -nostdlib + mrp_user/elf_link.ld, base
-# 0x01000000) — the same compiler family that builds the kernel,
-# exercising the kernel ELF loader end-to-end. Ships in
-# dist/equinox/tools -> RAMFS /equinox/tools (run elfdemo.elf).
-# ---------------------------------------------------------------
-elfdemo: $(DIST_DIR)
-	@mkdir -p $(DIST_DIR)/equinox/tools
-	gcc -m32 -ffreestanding -fno-pie -static -no-pie -nostdlib -O2 -Wall \
-                -T $(ROOT_DIR)/mrp_user/elf_link.ld \
-                $(ROOT_DIR)/tools_user/elfdemo.c \
-                -o $(DIST_DIR)/equinox/tools/elfdemo.elf
-	@echo "[elf] tools_user/elfdemo.c -> dist/equinox/tools/elfdemo.elf"
 
 # Host-side mtcc test harness (interpreter x86-32, no qemu needed)
 test:
@@ -492,7 +401,4 @@ clean:
 	rm -rf $(BUILD_DIR) $(DIST_DIR) $(ISO_DIR)
 
 # Phony targets
-.PHONY: all clean run run-disk diskimg pack iso test test-fat32 test-doom-disk mtcc doom tools tools-host elfdemo
-
-# v0.3: auto-generated header dependencies (-MMD -MP)
--include $(OBJS:.o=.d)
+.PHONY: all clean run run-disk diskimg pack iso test test-fat32 test-doom-disk mtcc doom

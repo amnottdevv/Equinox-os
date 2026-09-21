@@ -17,7 +17,7 @@ import subprocess
 import sys
 import time
 
-ROOT = "/home/z/my-project/equinox_os/extracted/equinox_os_v0.2_beta"
+ROOT = os.path.expanduser("~/morphos")
 ISO = os.path.join(ROOT, "dist", "morphos.iso")
 FONT_H = os.path.join(ROOT, "kernel", "library", "header", "font8x16.h")
 QEMU = os.path.expanduser("~/tools/root/usr/bin/qemu-system-i386")

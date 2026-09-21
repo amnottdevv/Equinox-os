@@ -98,33 +98,6 @@ extern "C" {
 #define MORPH_SYS_MOUSEDELTA 33
 #define MORPH_SYS_NETINFO    34
 #define MORPH_SYS_NETPING    35
-/* Phase B: multitasking */
-#define MORPH_SYS_SPAWN      36
-#define MORPH_SYS_YIELD      37
-/* Phase C: process management */
-#define MORPH_SYS_TASKINFO   38
-#define MORPH_SYS_KILL       39
-/* v0.3 FR-01: full file syscalls */
-#define MORPH_SYS_OPEN2      40
-#define MORPH_SYS_UNLINK     41
-#define MORPH_SYS_MKDIR      42
-#define MORPH_SYS_RMDIR      43
-#define MORPH_SYS_RENAME     44
-#define MORPH_SYS_STAT       45
-#define MORPH_SYS_READDIR    46
-#define MORPH_SYS_FSTAT      47
-/* v0.3 FR-03: free() */
-#define MORPH_SYS_FREE       48
-/* v0.3 (FR-02/05): wait / pipe / meminfo / spawn2 */
-#define MORPH_SYS_WAIT       49
-#define MORPH_SYS_PIPE       50
-#define MORPH_SYS_MEMINFO    51
-#define MORPH_SYS_SPAWN2     52
-/* v0.3 (FR-02/05): wait / pipe / meminfo / spawn2 */
-#define MORPH_SYS_WAIT       49
-#define MORPH_SYS_PIPE       50
-#define MORPH_SYS_MEMINFO    51
-#define MORPH_SYS_SPAWN2     52
 
 /* ---- blit flags (syscall #30) ---- */
 #define MORPH_BLIT_STRETCH   0x0u   /* full stretch to screen (default)  */
@@ -134,16 +107,6 @@ extern "C" {
 #define MORPH_SEEK_SET 0
 #define MORPH_SEEK_CUR 1
 #define MORPH_SEEK_END 2
-
-/* ---- open flags for f_open (syscall #40, v0.3 FR-01) ---- */
-#define MORPH_O_RDONLY 0x000u   /* read-only (open() #6 equivalent)   */
-#define MORPH_O_WRONLY 0x001u   /* write-only                         */
-#define MORPH_O_RDWR   0x002u   /* read + write                       */
-#define MORPH_O_CREAT  0x100u   /* create when missing                */
-#define MORPH_O_TRUNC  0x200u   /* truncate to 0 on open              */
-#define MORPH_O_APPEND 0x400u   /* every write lands at EOF           */
-#define MORPH_O_EXCL   0x800u   /* with O_CREAT: fail if it exists    */
-#define MORPH_O_DIR    0x1000u  /* open a directory for f_readdir     */
 
 /* ---- Error codes (negative returns, stable numbering) ---- */
 #define MORPH_ENOSYS  (-1)   /* unknown syscall                   */
@@ -156,8 +119,6 @@ extern "C" {
 #define MORPH_EMFILE  (-8)   /* fd table full                     */
 #define MORPH_EBUSY   (-9)   /* nested exec rejected              */
 #define MORPH_EFAULT  (-10)  /* v10.7 ring 3: pointer outside user regions */
-#define MORPH_EIO     (-11)  /* v0.2: disk I/O error                       */
-#define MORPH_EEXIST  (-12)  /* v0.3 FR-01: O_EXCL / mkdir / rename target */
 
 /* ---- Standard file descriptors ---- */
 #define MORPH_STDIN    0
@@ -179,21 +140,6 @@ typedef struct {
     int32_t  y;       /* absolute Y                              */
     uint32_t buttons; /* bit0=left bit1=right bit2=middle        */
 } morph_mouse_t;
-
-/* v0.3 FR-01: stat (f_stat/f_fstat) — 16 bytes, mirrors syscall.h */
-typedef struct {
-    uint32_t size;      /* file size in bytes                        */
-    uint32_t is_dir;    /* 1 = directory                             */
-    uint32_t backing;   /* 0 = RAMFS, 1 = FAT32-backed               */
-    uint32_t mode;      /* capability bits (reserved = 0)            */
-} morph_stat_t;
-
-/* v0.3 FR-01: dirent (f_readdir) — 72 bytes, mirrors syscall.h */
-typedef struct {
-    char     name[64];  /* NUL-terminated entry name                 */
-    uint32_t is_dir;    /* 1 = directory                             */
-    uint32_t size;      /* file size (0 for dirs)                    */
-} morph_dirent_t;
 
 /* ---- Special key codes (getkey / pollkey) ---- */
 #define MORPH_KEY_UP    (-1)
@@ -936,138 +882,6 @@ static inline int fclose_(int h) {
     f->used = 0; f->fd = 0; f->len = 0; f->cap = 0; f->buf = 0;
     f->path[0] = '\0';
     return r;
-}
-
-/* ================= Phase B: multitasking =================
- * A .mrp program can create OTHER .mrp tasks (non-blocking) and
- * yield. A spawned program shares the spawner's console - its
- * output appears on the same console.
- * =============================================== */
-
-/* Run another .mrp in a NEW task. Returns pid > 0 on success /
- * negative = errno (ENOMEM = memory pool or slot full). */
-static inline int task_spawn(const char* path) {
-    return morph_syscall2(MORPH_SYS_SPAWN, (uint32_t)(uintptr_t)path, 0);
-}
-
-/* Spawn with an arena hint (heap slack bytes). */
-static inline int task_spawn_hint(const char* path, uint32_t arena_hint) {
-    return morph_syscall2(MORPH_SYS_SPAWN, (uint32_t)(uintptr_t)path, arena_hint);
-}
-
-/* Give the CPU to the next task (round-robin). */
-static inline void task_yield(void) {
-    (void)morph_syscall0(MORPH_SYS_YIELD);
-}
-
-/* ================= Phase C: process management ================= */
-
-/* Kill another task by pid. 0 = success (the task is reaped
- * asynchronously by the scheduler), negative = errno. */
-static inline int task_kill(int pid) {
-    return morph_syscall2(MORPH_SYS_KILL, (uint32_t)pid, 0);
-}
-
-/* Snapshot the task list into a buffer (see <multitasking.h> / ps).
- * out[0] = count N; then N entries {pid, state, kind, console}.
- * Buffer of at least (1 + 4*8) u32 = 132 bytes. Returns N. */
-static inline int task_list(uint32_t* out) {
-    return morph_syscall2(MORPH_SYS_TASKINFO, (uint32_t)(uintptr_t)out, 0);
-}
-
-/* ================= v0.3: wait + pipes (FR-02) =================
- * POSIX-like process plumbing for .mrp programs: a parent spawns a
- * child (which inherits the parent's PIPE fds), the child writes
- * into the pipe, the parent reads until EOF, then wait() collects
- * the child's exit status.
- * =============================================== */
-
-/* Blocking waitpid. pid > 0 = that child, pid <= 0 = any child.
- * On success returns the child's pid and (if status != NULL) writes
- * its 32-bit exit status there. Negative = errno (ECHILD = -13:
- * no matching child). */
-static inline int task_wait(int pid, uint32_t* status) {
-    return morph_syscall2(MORPH_SYS_WAIT, (uint32_t)pid,
-                          (uint32_t)(uintptr_t)status);
-}
-
-/* Create an anonymous pipe. fds[0] = read end, fds[1] = write end
- * (fd numbers 3+). 0 = success, negative = errno. */
-static inline int pipe_create(int fds[2]) {
-    return morph_syscall2(MORPH_SYS_PIPE, (uint32_t)(uintptr_t)fds, 0);
-}
-
-/* Spawn a NEW task with an explicit args string (the child reads it
- * via getargs()). Returns pid > 0 / negative errno. */
-static inline int task_spawn_args(const char* path, uint32_t arena_hint,
-                                  const char* args) {
-    return morph_syscall3(MORPH_SYS_SPAWN2, (uint32_t)(uintptr_t)path,
-                          arena_hint, (uint32_t)(uintptr_t)args);
-}
-
-/* Demand-paging / pool statistics (SYS_MEMINFO). w[0]=pool total KB,
- * w[1]=pool free KB, w[2]=faulted-in user KB, w[3]=live tasks,
- * w[4]=zombies, w[5]=0. Returns 0 / errno. */
-static inline int mem_info(uint32_t w[6]) {
-    return morph_syscall2(MORPH_SYS_MEMINFO, (uint32_t)(uintptr_t)w, 0);
-}
-
-/* ================= v0.3 FR-01: full file API =================
- * open with flags, partial write() through an fd, unlink/mkdir/
- * rmdir/rename, stat/readdir/fstat. Names mirror the mtcc
- * <fileio.h> prelude so one mental model covers both toolchains.
- * =============================================== */
-
-/* Open with flags (MORPH_O_*) -> fd (3+) / negative errno. */
-static inline int f_open(const char* path, uint32_t flags) {
-    return morph_syscall2(MORPH_SYS_OPEN2, (uint32_t)(uintptr_t)path, flags);
-}
-
-/* Remove a FILE -> 0 / errno (directories: f_rmdir). */
-static inline int f_unlink(const char* path) {
-    return morph_syscall1(MORPH_SYS_UNLINK, (uint32_t)(uintptr_t)path);
-}
-
-/* Create a directory -> 0 / errno. */
-static inline int f_mkdir(const char* path) {
-    return morph_syscall1(MORPH_SYS_MKDIR, (uint32_t)(uintptr_t)path);
-}
-
-/* Remove an EMPTY directory -> 0 / errno. */
-static inline int f_rmdir(const char* path) {
-    return morph_syscall1(MORPH_SYS_RMDIR, (uint32_t)(uintptr_t)path);
-}
-
-/* Rename/move a file -> 0 / errno (POSIX replace semantics). */
-static inline int f_rename(const char* oldpath, const char* newpath) {
-    return morph_syscall2(MORPH_SYS_RENAME, (uint32_t)(uintptr_t)oldpath,
-                          (uint32_t)(uintptr_t)newpath);
-}
-
-/* stat: fills {size, is_dir, backing, mode} -> 0 / errno. */
-static inline int f_stat(const char* path, morph_stat_t* st) {
-    return morph_syscall2(MORPH_SYS_STAT, (uint32_t)(uintptr_t)path,
-                          (uint32_t)(uintptr_t)st);
-}
-
-/* readdir: ONE entry per call into `de` (fd from f_open with
- * MORPH_O_DIR). Returns 1 = entry, 0 = end, negative = errno. */
-static inline int f_readdir(int fd, morph_dirent_t* de) {
-    return morph_syscall2(MORPH_SYS_READDIR, (uint32_t)fd,
-                          (uint32_t)(uintptr_t)de);
-}
-
-/* fstat by descriptor (same layout as f_stat). */
-static inline int f_fstat(int fd, morph_stat_t* st) {
-    return morph_syscall2(MORPH_SYS_FSTAT, (uint32_t)fd,
-                          (uint32_t)(uintptr_t)st);
-}
-
-/* v0.3 FR-03: free a malloc() block back to the MRP arena —
- * malloc/free loops no longer exhaust the program heap.
- * Returns 0 / -1 (not an arena pointer). */
-static inline int f_free(void* p) {
-    return morph_syscall1(MORPH_SYS_FREE, (uint32_t)(uintptr_t)p);
 }
 
 #ifdef __cplusplus
