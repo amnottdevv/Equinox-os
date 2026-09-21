@@ -106,23 +106,7 @@ jobs:
 
           cp -r "$SRC_ROOT"/. src/
 
-      - name: Debug src/ state
-        if: steps.find_asset.outputs.found == 'true'
-        run: |
-          set -euo pipefail
-          echo "== isi src/ (top level) =="
-          ls -la src/ | head -30
-
-          echo "== jumlah file di src/ =="
-          find src -type f | wc -l
-
-          echo "== cek gitignore untuk src/ =="
-          git check-ignore -v src/ || echo "src/ TIDAK di-ignore"
-
-          echo "== git status src/ (termasuk ignored) =="
-          git status --porcelain --ignored -- src/ | head -50
-
-      - name: Commit and push in 30 batches
+      - name: Sync src/ (debug + stage + commit + push in 30 batches)
         if: steps.find_asset.outputs.found == 'true'
         env:
           BRANCH: ${{ github.event.repository.default_branch }}
@@ -135,18 +119,35 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git config advice.detachedHead false
-          # Naikkan buffer HTTP biar push dataset besar tidak kena RPC/HTTP error
           git config http.postBuffer 524288000
 
-          # 1) Stage semua perubahan src/ (force, agar tetap ikut walau di-.gitignore)
+          echo "=============== DEBUG ==============="
+          echo "== jumlah file di src/ =="
+          find src -type f | wc -l
+
+          echo "== git check-ignore src/ =="
+          git check-ignore -v src/ || echo "src/ TIDAK di-ignore"
+
+          echo "== git status src/ (ringkas) =="
+          git status --porcelain -- src/ | head -20
+          echo "...(dipotong kalau kepanjangan)..."
+
+          echo "== staged diff SEBELUM add =="
+          git diff --cached --stat -- src/ | tail -3
+
+          echo "=========== STAGE SEMUA ============="
           git add -A -f -- src/
 
-          if git diff --cached --quiet; then
+          echo "== staged diff SESUDAH add =="
+          git diff --cached --stat -- src/ | tail -5
+          echo "== jumlah staged file =="
+          git diff --cached --name-only -- src/ | wc -l
+
+          if git diff --cached --quiet -- src/; then
             echo "No changes in src/ — nothing to commit."
             exit 0
           fi
 
-          # 2) Simpan daftar path yang berubah (termasuk delete)
           mapfile -t ALL_PATHS < <(git diff --cached --name-only -- src/ | sort -u)
           TOTAL="${#ALL_PATHS[@]}"
           echo "Total changed paths: $TOTAL"
@@ -156,14 +157,12 @@ jobs:
             exit 0
           fi
 
-          # 3) Bersihkan index supaya bisa staging per batch
           git reset -q HEAD -- src/ || true
 
           PER_BATCH=$(( (TOTAL + BATCHES - 1) / BATCHES ))
           [ "$PER_BATCH" -lt 1 ] && PER_BATCH=1
           echo "Files per batch: $PER_BATCH (max $BATCHES batches)"
 
-          # 4) Commit + push batch demi batch
           for ((i = 0; i < BATCHES; i++)); do
             start=$(( i * PER_BATCH ))
             [ "$start" -ge "$TOTAL" ] && break
@@ -180,7 +179,6 @@ jobs:
 
             git commit -m "chore: sync src/ from release ${TAG} (${ASSET}) [batch $((i+1))/${BATCHES}]"
 
-            # Push dengan retry + rebase kalau ada update di remote
             pushed=false
             for attempt in 1 2 3 4 5; do
               if git push origin "HEAD:${BRANCH}"; then
