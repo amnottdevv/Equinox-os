@@ -10,14 +10,17 @@
 //    * The BearSSL engine (handshake, crypto, records) is
 //      driven from the calling shell task under net_lock().
 //
-//  Verification policy (tls_connect_auto):
+//  Verification policy (v0.3 FR-23 — FAIL-CLOSED):
 //    1. strict attempt — chain checked against the 9 root CAs
 //       embedded in third_party/bearssl/anchors/equinox_anchors.c
-//    2. if that fails with a certificate error (unknown root /
-//       unsupported key), retry in parse-only mode: the leaf's
-//       public key is still extracted and every record is
-//       authenticated + encrypted, but the chain is NOT
-//       validated — the caller must show a warning.
+//    2. a certificate failure (unknown root / unsupported key /
+//       expired) REFUSES the connection by default.
+//    3. the parse-only retry ("encrypted but NOT verified") happens
+//       ONLY when the user explicitly opted in with
+//       tls_set_insecure(1) — e.g. `mget -k`. The leaf public key
+//       is still extracted and every record authenticated +
+//       encrypted, but the chain is not validated; a clear warning
+//       is printed and tls_session_verified() reports 0.
 // ============================================================
 #ifndef EQUINOX_TLS_CLIENT_H
 #define EQUINOX_TLS_CLIENT_H
@@ -43,6 +46,12 @@ extern "C" {
 // already printed). Strict-then-fallback happens inside.
 struct tls_sess* tls_connect_auto(const char* host,
                                   const void* dst, int port);
+
+// v0.3 FR-23: opt-in for the "encrypted but not verified" retry.
+// 0 (DEFAULT) = verification failure refuses the connection.
+// 1 = allow the warned parse-only fallback (user asked for -k).
+// Returns the previous value. Reset to 0 after each connection.
+int  tls_set_insecure(int allow);
 
 // True when the session's chain was verified against the
 // embedded root CAs (0 in fallback mode).

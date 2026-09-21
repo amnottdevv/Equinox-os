@@ -38,18 +38,16 @@ int paging_is_active(void) {
     return paging_active;
 }
 
-/* Is the 4 KB PAGE containing this address entirely user-owned?
- * (4 KB granularity: a page sticking out of the region = supervisor.) */
-static int page_is_user(uint32_t addr) {
-    uint32_t pstart = addr & ~0xFFFu;
-    uint32_t pend   = pstart + 0xFFFu;
-
-    if (pstart >= USER_ARENA_START && pend < USER_GUARD_START)
-        return 1;                       /* arena + trampoline */
-    if (pstart >= USER_STACK_START && pend < USER_STACK_END)
-        return 1;                       /* stack user */
-    return 0;                           /* termasuk halaman guard */
+/* Phase A: the kernel page-directory template — used by shell tasks.
+ * User tasks get their own directory (task.cpp) with a U/S window. */
+uint32_t* paging_kernel_dir(void) {
+    return page_dir;
 }
+
+/* Phase A: the template is now ALL supervisor — the user arena is
+ * mapped U/S through the PER-TASK page directories (own physical
+ * chunk window, see task.cpp). The template no longer uses
+ * page_is_user. */
 
 void paging_init(void) {
     if (paging_active) return;
@@ -61,16 +59,15 @@ void paging_init(void) {
     for (int i = 0; i < 4; i++)
         for (int j = 0; j < 1024; j++) fb_pts[i][j] = 0;
 
-    /* ---- 2. Low 64 MB: 16 page directory entry + 16 tabel ---- */
+    /* ---- 2. Low 64 MB: 16 page directory entries + 16 tables ----
+     * Phase A: everything supervisor (U/S=0). Each task's user
+     * window is built by task.cpp in its own task_pts. */
     for (int i = 0; i < 16; i++) {
         page_dir[i] = ((uint32_t)(uintptr_t)low_pts[i])
-                      | PTE_PRESENT | PTE_RW | PTE_USER;
-        /* The PDE gets U/S=1 so user access is only limited by the PTE
-         * (hardware rule: user mode needs U/S=1 at BOTH levels). */
+                      | PTE_PRESENT | PTE_RW;
         for (int j = 0; j < 1024; j++) {
             uint32_t addr = ((uint32_t)i << 22) | ((uint32_t)j << 12);
-            low_pts[i][j] = addr | PTE_PRESENT | PTE_RW
-                            | (page_is_user(addr) ? PTE_USER : 0);
+            low_pts[i][j] = addr | PTE_PRESENT | PTE_RW;
         }
     }
 

@@ -19,13 +19,17 @@
 #include "header/usermode.h"
 #include "header/stdio.h"       /* printf for the kill report */
 #include "header/libstring.h"   /* snprintf (bounded) */
-#include "header/paging.h"      /* paging_is_active() utk memmap */
+#include "header/paging.h"      /* paging_is_active() for memmap */
+#include "header/serial.h"     /* Phase B: serial debug */
+#include "header/task.h"        /* Phase A: per-task u3 save + per-task TSS */
 #include <stdint.h>
 #include <stddef.h>
 
 /* Defined in the top-level asm block below - extern "C" so the
  * C++ call is not mangled. */
 extern "C" void kern_longjmp(uint32_t esp, uint32_t eip);
+extern "C" uint32_t user3_launch4(uint32_t entry, uint32_t user_esp,
+                                  uint32_t arg, void* save_area);
 
 // ============================================================
 //  1. TSS + USER INTERRUPT STACK
@@ -109,8 +113,20 @@ void tss_init(void) {
     asm volatile("ltr %w0" : : "rm"((uint16_t)0x28));
 }
 
+/* Phase A: the scheduler calls this on every context switch — TSS.ESP0
+ * points at the CURRENT task's kernel stack, so a CPL3→CPL0 transition
+ * (syscall/exception/IRQ) always lands on the correct task's stack. */
+extern "C" void tss_set_esp0(uint32_t esp0) {
+    tss.esp0 = esp0;
+}
+
+/* Phase A: top of the user interrupt stack (used by boot task 0). */
+extern "C" uint32_t usermode_int_stack_top(void) {
+    return (uint32_t)(uintptr_t)&user_int_stack[sizeof(user_int_stack)];
+}
+
 // ============================================================
-//  2. TRAMPOLINE EXIT (halaman user 0x2600000 — v10.9)
+//  2. EXIT TRAMPOLINE (user page 0x2600000 — v10.9)
 // ------------------------------------------------------------
 //  An .mrp entry is a plain C function: void _start(void*). If the
 //  program just does `return;`, the CPU rets to the address we
@@ -139,49 +155,37 @@ void user_trampoline_init(void) {
 }
 
 // ============================================================
-//  3. STATE LAUNCH/KILL + ASM CORE
+//  3. LAUNCH/KILL STATE + ASM CORE (Phase A: PER-TASK)
 // ------------------------------------------------------------
-//  user3_saved_esp/eip = the return point on the mrp_run() kernel stack.
-//  Written by user3_launch BEFORE the iret; read by kern_longjmp on the
-//  kill path. user3_exit_normal/status = the final result for mrp_run().
-//
-//  These FOUR variables are deliberately NON-static + extern "C": the
-//  top-level asm block below refers to them by name - GCC cannot see
-//  those references, so the symbols must be exact and must never be
-//  renamed/merged by the optimizer (static could be).
+//  Each task's resume point lives in Task->u3 ({esp,eip}),
+//  written by the user3_launch4 asm through the save_area pointer. The exit
+//  status/normal flags are Task fields (read by mrp_run after the launch
+//  returns). The g_user3_exit_status scratch holds the landing pad for
+//  the EAX return value (written by user3_terminate before longjmp).
 // ============================================================
 
 extern "C" {
-uint32_t user3_saved_esp      = 0;
-uint32_t user3_saved_eip      = 0;
-uint32_t user3_exit_status_val   = 0;
-uint32_t user3_exit_normal_val   = 0;
+uint32_t g_user3_exit_status = 0;   /* EAX scratch for user3_killed */
 }
 
 int user3_exit_normal(void) {
-    return user3_exit_normal_val ? 1 : 0;
+    struct Task* t = task_current();
+    return (t && t->u3_normal) ? 1 : 0;
 }
 
 /*
- *  ALL instruction-level asm lives in ONE top-level block:
+ *  ASM CORE (Phase A — per-task):
  *
- *  kern_longjmp(esp, eip) - a freestanding mini longjmp: set ESP to the
- *  saved value, jmp to the resume label. Never touches EBP
- *  (landing pad memulihkannya dari slot stack). `cld` menjaga
- *  string direction (kernel ABI convention).
+ *  kern_longjmp(esp, eip) - freestanding mini longjmp (unchanged).
  *
- *  user3_launch(entry, user_esp, arg) -> uint32_t (exit status)
- *
- *  The prologue saves ebx/esi/edi/ebp (callee-saved cdecl ABI) so the
- *  caller's C frame (mrp_run_inner) stays intact when execution
- *  "comes back" through the landing pad - not via a normal ret.
- *
- *  The user3_killed landing pad is reached ONLY via kern_longjmp, with
- *  ESP == the ebp value at launch. Slots: [esp]=caller's ebp,
- *  [esp-4]=edi, [esp-8]=esi, [esp-12]=ebx, [esp+4]=the return address.
+ *  user3_launch4(entry, user_esp, arg, save_area) -> uint32_t
+ *    [ebp+8]=entry, [ebp+12]=user_esp, [ebp+16]=arg, [ebp+20]=save
+ *    save_area = &Task->u3 {esp,eip}: written ONCE here —
+ *    the caller task's resume point (its mrp_run frame).
+ *    The g_user3_exit_status scratch is read by the landing pad as the return.
  */
 asm(
-    ".global user3_launch\n"
+    ".global user3_launch4\n"
     ".global kern_longjmp\n"
     ".text\n"
     "kern_longjmp:\n"
@@ -189,64 +193,44 @@ asm(
     "    movl 4(%esp), %esp\n"       /* new esp                  */
     "    cld\n"
     "    jmp *%eax\n"
-    "user3_launch:\n"
-    /* STANDARD PROLOGUE: push ebp FIRST so the cdecl arguments sit at
-     * at [ebp+8/12/16] (first-prologue bug fix: ebx/esi/edi used to be
-     * pushed BEFORE ebp, shifting the arguments to [ebp+20+] -
-     * the iret EIP was read from the caller's ESI (=0) and the user
-     * from EBX (=the entry address) -> the program jumped to 0x0 + the .mrp code
-     * overwritten by the stub at entry-8. Thanks, QEMU frame dump.) */
+    "user3_launch4:\n"
+    /* STANDARD PROLOGUE: push ebp FIRST — argumen cdecl di
+     * [ebp+8/12/16/20] (the first-prologue bug was fixed — see history). */
     "    pushl %ebp\n"
     "    movl %esp, %ebp\n"
     "    pushl %ebx\n"
     "    pushl %esi\n"
     "    pushl %edi\n"
-    /* kernel resume point - the longjmp lands here (esp == ebp) */
-    "    movl %ebp, user3_saved_esp\n"
+    /* kernel resume point — the longjmp lands here (esp == ebp) */
+    "    movl 20(%ebp), %ecx\n"      /* ecx = save_area (Task->u3) */
+    "    movl %ebp, 0(%ecx)\n"       /* save->esp = frame ini     */
     "    movl $user3_killed, %eax\n"
-    "    movl %eax, user3_saved_eip\n"
-    /* cdecl arguments: [ebp+8]=entry, [ebp+12]=user_esp, [ebp+16]=arg */
-    "    movl 8(%ebp), %eax\n"          /* eax = entry EIP        */
-    "    movl 16(%ebp), %ecx\n"         /* ecx = arg (_start api) */
-    "    movl 12(%ebp), %edx\n"         /* edx = user stack top   */
-    /* v10.9: 20 bytes of headroom (not 8) so ESP at _start entry
-     * == 12 (mod 16) - exactly like a function called with `call`
-     * from a 16-aligned stack (i386 System V ABI). Hosted g++ -O2
-     * code may use movaps/SSE and assumes this alignment.
-     * Layout: [esp]=trampoline ret, [esp+4]=arg, [esp+8..+19]=pad. */
+    "    movl %eax, 4(%ecx)\n"       /* save->eip = landing pad   */
+    "    movl 8(%ebp), %eax\n"       /* eax = entry EIP        */
+    "    movl 16(%ebp), %ecx\n"      /* ecx = arg (_start api) */
+    "    movl 12(%ebp), %edx\n"      /* edx = user stack top   */
+    /* v10.9: 20 bytes of headroom — ESP di entry _start == 12 (mod 16)
+     * (i386 System V ABI, hosted g++ -O2 may emit movaps). */
     "    subl $20, %edx\n"
-    "    movl $0x2600000, %ebx\n"       /* USER_TRAMPOLINE (v10.9)*/
-    "    movl %ebx, (%edx)\n"           /* [esp+0] = ret addr stub*/
-    "    movl %ecx, 4(%edx)\n"          /* [esp+4] = arg          */
-    /* build the iret frame (push order is the reverse of iret's pops).
-     * NOTE: these pushes descend BELOW the freshly pushed ebx/esi/edi
-     * slots - those stay intact for the landing pad. */
-    "    pushl $0x23\n"                 /* SS  user data | 3      */
-    "    pushl %edx\n"                  /* ESP user               */
-    "    pushl $0x202\n"                /* EFLAGS: bit1 + IF=1    */
-    "    pushl $0x1B\n"                 /* CS  user code | 3      */
-    "    pushl %eax\n"                  /* EIP entry              */
-    /* the data segment registers must be user BEFORE the iret */
+    "    movl $0x2600000, %ebx\n"    /* USER_TRAMPOLINE          */
+    "    movl %ebx, (%edx)\n"        /* [esp+0] = ret addr stub */
+    "    movl %ecx, 4(%edx)\n"       /* [esp+4] = arg           */
+    /* build the iret frame (push order is the reverse of iret's pops) */
+    "    pushl $0x23\n"               /* SS  user data | 3      */
+    "    pushl %edx\n"                /* ESP user               */
+    "    pushl $0x202\n"              /* EFLAGS: bit1 + IF=1    */
+    "    pushl $0x1B\n"               /* CS  user code | 3      */
+    "    pushl %eax\n"                /* EIP entry              */
     "    movw $0x23, %ax\n"
     "    mov %ax, %ds\n"
     "    mov %ax, %es\n"
     "    mov %ax, %fs\n"
     "    mov %ax, %gs\n"
-    "    iretl\n"                       /* === enter CPL 3 === */
+    "    iretl\n"                     /* === enter CPL 3 === */
     "user3_killed:\n"
-    /* the longjmp lands here: ESP == launch ebp; IF was already set
-     * by the terminate path. Slots relative to esp(=ebp) MATCH the
-     * prologue above: [esp-4]=ebx, [esp-8]=esi, [esp-12]=edi,
-     * [esp]=old ebp, [esp+4]=return address. (FIX: the old version
-     * read edi/esi/ebx from the old prologue offsets - EBX and EDI
-     * were swapped, corrupting the caller's registers after a kill:
-     * the program-name printf turned to garbage.)
-     *
-     * FIX(v0.1): the "movw $0x10, %ax" load was lost in the v10.14
-     * English rewrite -> every user-program exit landed here with
-     * EAX = the kern_longjmp target address (0x112dcf) and the bare
-     * "mov %ax, %ds" loaded garbage into DS = instant #GP kernel
-     * panic. Restored: load the kernel data selector FIRST. */
+    /* longjmp lands here: ESP == launch ebp (this task's mrp_run frame).
+     * Slot prologue: [esp-4]=ebx, [esp-8]=esi, [esp-12]=edi,
+     * [esp]=old ebp, [esp+4]=return address. */
     "    movw $0x10, %ax\n"
     "    mov %ax, %ds\n"
     "    mov %ax, %es\n"
@@ -255,11 +239,22 @@ asm(
     "    movl -4(%esp), %ebx\n"
     "    movl -8(%esp), %esi\n"
     "    movl -12(%esp), %edi\n"
-    "    movl user3_exit_status_val, %eax\n"
+    "    movl g_user3_exit_status, %eax\n"
     "    movl (%esp), %ebp\n"
-    "    addl $4, %esp\n"               /* drop the ebp slot -> ret */
-    "    ret\n"                         /* esp = arg1; caller cleans */
+    "    addl $4, %esp\n"             /* drop the ebp slot -> ret */
+    "    ret\n"                       /* esp = arg1; caller cleans */
 );
+
+/* Legacy 3-arg wrapper: the save area is the current task's own. */
+extern "C" uint32_t user3_launch(uint32_t entry, uint32_t user_esp, uint32_t arg) {
+    struct Task* t = task_current();
+    if (!t) {
+        /* no task (should never happen) — static fallback */
+        static struct u3_save sv;
+        return user3_launch4(entry, user_esp, arg, &sv);
+    }
+    return user3_launch4(entry, user_esp, arg, &t->u3);
+}
 
 // ============================================================
 //  4. THE KILL PATH
@@ -273,8 +268,12 @@ asm(
 
 __attribute__((noreturn))
 void user3_terminate(int normal, uint32_t status, const char* msg) {
-    user3_exit_normal_val = normal ? 1u : 0u;
-    user3_exit_status_val = status;
+    struct Task* t = task_current();
+    if (t) {
+        t->u3_normal = normal ? 1u : 0u;
+        t->u3_status = status;
+    }
+    g_user3_exit_status = status;
 
     if (msg) {
         printf("%s", msg);
@@ -284,9 +283,15 @@ void user3_terminate(int normal, uint32_t status, const char* msg) {
      * re-enable it explicitly before the jump. */
     asm volatile("sti");
 
-    /* Abandon user_int_stack (TSS.ESP0 is constant - the next
-     * transition starts from the top again) and land in user3_killed. */
-    kern_longjmp(user3_saved_esp, user3_saved_eip);
+    if (!t) {
+        /* no task: no resume point — halt the machine. */
+        asm volatile("cli");
+        for (;;) asm volatile("hlt");
+    }
+
+    /* Abandon user_int_stack (TSS.ESP0 di-set ulang scheduler) and
+     * land in user3_killed — frame mrp_run task INI. */
+    kern_longjmp(t->u3.esp, t->u3.eip);
     __builtin_unreachable();
 }
 
