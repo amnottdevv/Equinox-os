@@ -59,11 +59,11 @@ jobs:
                 | select(.name | test("source"; "i"))
                 | select(.name | test("\\.zip$"; "i"))
                 | .name' \
-              | head -n1
+              | head -n1 || true
           )"
 
           if [ -z "$ASSET_NAME" ]; then
-            echo "No zip asset with 'source' in its name found in this release. Skipping."
+            echo "No zip asset with 'source' in its name found. Skipping."
             echo "found=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -96,7 +96,7 @@ jobs:
           unzip -q downloaded_source.zip -d "$TMP_DIR"
 
           ENTRY_COUNT="$(find "$TMP_DIR" -mindepth 1 -maxdepth 1 | wc -l)"
-          FIRST_ENTRY="$(find "$TMP_DIR" -mindepth 1 -maxdepth 1 | head -n1)"
+          FIRST_ENTRY="$(find "$TMP_DIR" -mindepth 1 -maxdepth 1 | head -n1 || true)"
 
           if [ "$ENTRY_COUNT" -eq 1 ] && [ -d "$FIRST_ENTRY" ]; then
             SRC_ROOT="$FIRST_ENTRY"
@@ -106,7 +106,7 @@ jobs:
 
           cp -r "$SRC_ROOT"/. src/
 
-      - name: Sync src/ (debug + stage + commit + push in 30 batches)
+      - name: Sync src/ (stage, commit, push in 30 batches)
         if: steps.find_asset.outputs.found == 'true'
         env:
           BRANCH: ${{ github.event.repository.default_branch }}
@@ -121,41 +121,28 @@ jobs:
           git config advice.detachedHead false
           git config http.postBuffer 524288000
 
-          echo "=============== DEBUG ==============="
-          echo "== jumlah file di src/ =="
-          find src -type f | wc -l
-
-          echo "== git check-ignore src/ =="
+          echo "=============== DEBUG (sebelum add) ==============="
+          echo "File di src/: $(find src -type f | wc -l)"
           git check-ignore -v src/ || echo "src/ TIDAK di-ignore"
+          echo "Baris git status: $(git status --porcelain -- src/ | wc -l)"
 
-          echo "== git status src/ (ringkas) =="
-          git status --porcelain -- src/ | head -20
-          echo "...(dipotong kalau kepanjangan)..."
-
-          echo "== staged diff SEBELUM add =="
-          git diff --cached --stat -- src/ | tail -3
-
-          echo "=========== STAGE SEMUA ============="
+          echo "=============== STAGE SEMUA ==============="
           git add -A -f -- src/
 
-          echo "== staged diff SESUDAH add =="
-          git diff --cached --stat -- src/ | tail -5
-          echo "== jumlah staged file =="
-          git diff --cached --name-only -- src/ | wc -l
+          STAGED_COUNT="$(git diff --cached --name-only -- src/ | wc -l)"
+          echo "Staged files: $STAGED_COUNT"
 
-          if git diff --cached --quiet -- src/; then
+          if [ "$STAGED_COUNT" -eq 0 ]; then
             echo "No changes in src/ — nothing to commit."
             exit 0
           fi
 
+          echo "== contoh 10 staged =="
+          git diff --cached --name-only -- src/ | sed -n '1,10p'
+
           mapfile -t ALL_PATHS < <(git diff --cached --name-only -- src/ | sort -u)
           TOTAL="${#ALL_PATHS[@]}"
           echo "Total changed paths: $TOTAL"
-
-          if [ "$TOTAL" -eq 0 ]; then
-            echo "Nothing to commit."
-            exit 0
-          fi
 
           git reset -q HEAD -- src/ || true
 
@@ -186,7 +173,7 @@ jobs:
                 break
               fi
 
-              echo "Push gagal (percobaan $attempt). Fetch & rebase origin/${BRANCH}..."
+              echo "Push gagal (percobaan $attempt). Fetch & rebase..."
               git fetch origin "${BRANCH}" || true
               git rebase "origin/${BRANCH}" || {
                 git rebase --abort || true
