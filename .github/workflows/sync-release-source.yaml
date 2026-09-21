@@ -16,7 +16,6 @@ on:
 permissions:
   contents: write
 
-# Hindari 2 run barengan yang bisa bikin push bentrok
 concurrency:
   group: sync-src-${{ github.repository }}
   cancel-in-progress: false
@@ -107,6 +106,22 @@ jobs:
 
           cp -r "$SRC_ROOT"/. src/
 
+      - name: Debug src/ state
+        if: steps.find_asset.outputs.found == 'true'
+        run: |
+          set -euo pipefail
+          echo "== isi src/ (top level) =="
+          ls -la src/ | head -30
+
+          echo "== jumlah file di src/ =="
+          find src -type f | wc -l
+
+          echo "== cek gitignore untuk src/ =="
+          git check-ignore -v src/ || echo "src/ TIDAK di-ignore"
+
+          echo "== git status src/ (termasuk ignored) =="
+          git status --porcelain --ignored -- src/ | head -50
+
       - name: Commit and push in 30 batches
         if: steps.find_asset.outputs.found == 'true'
         env:
@@ -120,9 +135,11 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git config advice.detachedHead false
+          # Naikkan buffer HTTP biar push dataset besar tidak kena RPC/HTTP error
+          git config http.postBuffer 524288000
 
-          # 1) Stage semua perubahan src/ untuk tahu total file yang harus di-commit
-          git add -A -- src/
+          # 1) Stage semua perubahan src/ (force, agar tetap ikut walau di-.gitignore)
+          git add -A -f -- src/
 
           if git diff --cached --quiet; then
             echo "No changes in src/ — nothing to commit."
@@ -154,7 +171,7 @@ jobs:
             batch=( "${ALL_PATHS[@]:start:PER_BATCH}" )
             [ "${#batch[@]}" -eq 0 ] && break
 
-            git add -A -- "${batch[@]}"
+            git add -A -f -- "${batch[@]}"
 
             if git diff --cached --quiet; then
               echo "Batch $((i+1))/$BATCHES: no staged changes, skipping."
