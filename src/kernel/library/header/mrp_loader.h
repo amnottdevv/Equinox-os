@@ -66,26 +66,6 @@ enum mrp_run_result {
 // MRP_RUN_ERR_IS_DIR / MRP_RUN_ERR_NOT_FOUND depending on the case.
 int mrp_run(struct fs_node* parent, const char* name);
 
-/* Phase A (multitasking): variant with an explicit arena size hint —
- * different programs need different heap slack (mtcc ~8 MB, doom
- * ~24 MB, small programs are fine with 2 MB). The hint is rounded
- * up to 4 KB pages. */
-int mrp_run_hint(struct fs_node* parent, const char* name, uint32_t arena_heap_hint);
-
-/* Phase A.1 (DOOM regression fix): pick the arena hint from the
- * program NAME. Pre-multitasking, the .mrp arena was one static 33 MB
- * region, so DOOM silently had ~24+ MB of heap; the per-task loader
- * cut that to a flat 2 MB, which cannot even hold the shareware WAD
- * (4.2 MB) — `doom` failed with an arena allocation error. Every run
- * path (shell `run` / `./` / `doom` / `spawn` / SYS_EXEC) now routes
- * through this helper so the policy lives in ONE place. */
-uint32_t mrp_arena_hint_for(const char* name);
-
-/* Default hint (heap bytes in addition to the code image). */
-#define MRP_ARENA_DEFAULT  (2u * 1024u * 1024u)
-#define MRP_ARENA_MTCC     (8u * 1024u * 1024u)
-#define MRP_ARENA_DOOM     (24u * 1024u * 1024u)
-
 // Quiet mode: suppresses loader info messages ("mrp: running ..."/"finished").
 // Used by the global tool dispatch in the shell (`mtcc main.c` from any
 // directory) so tool output stays clean -- only the program's output.

@@ -5,7 +5,7 @@
 extern "C" {
 #endif
 
-// Open the system settings page
+// Buka halaman pengaturan sistem
 void settings_open(void);
 
 #ifdef __cplusplus
