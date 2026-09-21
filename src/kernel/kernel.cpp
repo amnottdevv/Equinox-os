@@ -1,4 +1,3 @@
-// kernel do you love donut's ? 
 #include "library/header/stdio.h"
 #include "library/header/color.h"
 #include "library/header/libstring.h"
