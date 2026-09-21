@@ -72,16 +72,6 @@ static inline uint32_t rol32(uint32_t x, unsigned r) {
  * tls_connect_auto to decide on the fallback retry) */
 static int tls_last_err = 0;
 
-/* v0.3 FR-23: fail-closed by default — the parse-only retry needs
- * an explicit opt-in (mget -k / tls_set_insecure(1)). */
-static int tls_insecure_ok = 0;
-
-int tls_set_insecure(int allow) {
-    int prev = tls_insecure_ok;
-    tls_insecure_ok = allow ? 1 : 0;
-    return prev;
-}
-
 // ============================================================
 //  Session
 // ============================================================
@@ -614,27 +604,16 @@ struct tls_sess* tls_connect_auto(const char* host,
         return s;
     }
 
-    /* v0.3 FR-23 (fail-closed): a certificate problem REFUSES the
-     * connection unless the user explicitly opted into the warned
-     * parse-only retry (mget -k / tls_set_insecure(1)). A name
-     * mismatch is a real attack signal - never falls back. */
+    /* Retry without verification only for certificate problems
+     * (unknown root, unsupported curve, expired...). A name
+     * mismatch is a real attack signal - do NOT fall back. */
     int e = tls_last_err;
     if (e >= BR_ERR_X509_INVALID_VALUE &&
         e <= BR_ERR_X509_NOT_TRUSTED &&
         e != BR_ERR_X509_BAD_SERVER_NAME) {
-        if (!tls_insecure_ok) {
-            printf("TLS: FAILED: %s (code %d)\n",
-                   tls_x509_reason(e), e);
-            printf("TLS: connection REFUSED - certificate not trusted "
-                   "(fail-closed)\n");
-            printf("TLS: use 'mget -k <url>' to allow an ENCRYPTED but "
-                   "unverified connection\n");
-            return NULL;
-        }
         printf("TLS: warning: %s (code %d)\n",
                tls_x509_reason(e), e);
-        printf("TLS: retrying WITHOUT certificate verification "
-                   "(user opted in)\n");
+        printf("TLS: retrying WITHOUT certificate verification\n");
         s = tls_attempt(host, (const ip_addr_t*)dst, port, 0);
         if (s) {
             printf("TLS: connection established - %s, "
@@ -642,7 +621,6 @@ struct tls_sess* tls_connect_auto(const char* host,
                    br_ssl_engine_get_version(&s->cc.eng));
         }
     }
-    tls_set_insecure(0);              /* one-shot: reset after use */
     return s;
 }
 

@@ -67,10 +67,6 @@ void panic_screen(uint32_t addr, const char* reason, const char* detail) {
     // Stop interrupts while drawing (IRQs could interleave output).
     asm volatile("cli");
 
-    /* Phase A: a panic renders on the ACTIVE console (not the running
-     * task's console — that may be a background console). */
-    term_force_active_output();
-
     clear_screen();
     set_cursor_position(0, 0);
 

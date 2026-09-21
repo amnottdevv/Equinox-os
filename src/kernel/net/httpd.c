@@ -81,11 +81,11 @@ static err_t httpd_send(struct tcp_pcb* pcb, struct http_state* hs) {
     }
     while (hs->offset < hs->total) {
         u16_t snd = tcp_sndbuf(pcb);
-        if (snd == 0) break;                       /* wait for sent_cb */
+        if (snd == 0) break;                       /* tunggu sent_cb */
         uint32_t chunk = hs->total - hs->offset;
         if (chunk > (uint32_t)snd) chunk = snd;
         if (chunk > 0xFFFFu)       chunk = 0xFFFFu;
-        /* ZERO-COPY: the RAMFS content is stable while the connection lives */
+        /* ZERO-COPY: content RAMFS stabil selama koneksi aktif */
         err_t e = tcp_write(pcb, hs->data + hs->offset, (u16_t)chunk, 0);
         if (e != ERR_OK) break;
         hs->offset   += chunk;
@@ -111,7 +111,7 @@ static void httpd_404(struct http_state* hs) {
         "Content-Length: %u\r\n\r\n", (unsigned)hs->total);
 }
 
-// ---- directory listing for the index page ----
+// ---- listing direktori utk halaman index ----
 static int emit_dir(struct fs_node* dir, const char* label,
                     const char* prefix, char* b, int n) {
     if (!dir) return n;
@@ -137,7 +137,7 @@ static void httpd_route(struct http_state* hs, const char* path) {
 
     if (path[0] == 0 || strcmp(path, "/") == 0 ||
         strcmp(path, "/index.html") == 0) {
-        /* ---- the status page is generated ---- */
+        /* ---- halaman status dibangkitkan ---- */
         uint32_t w[10];
         net_get_info(w);
 

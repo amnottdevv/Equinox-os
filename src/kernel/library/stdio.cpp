@@ -1,26 +1,10 @@
 #include "header/stdio.h"
 #include "header/itoa_atoi.h"
-#include "header/libstring.h"   /* memcpy — canvas snapshot/restore (Phase A.1) */
 #include "header/vesa.h"
 #include "header/font8x16.h"
 #include "header/color.h"
-#include "header/serial.h"
-#include "header/task.h"        /* Phase A.1: per-console canvas lives in the
-                                       user physical pool (task_user_phys_alloc) */
-#include "header/paging.h"      /* v0.3: kernel dir for the canvas copy */
 #include <stdint.h>
 #include <stdarg.h>
-
-/* v0.3: IRQ save/restore for the canvas copy critical section
- * (CR3 is switched — IRQ0 must not preempt in between). */
-static inline uint32_t con_irq_save(void) {
-    uint32_t flags;
-    asm volatile("pushfl\n\tpopl %0\n\tcli" : "=r"(flags) :: "memory");
-    return flags;
-}
-static inline void con_irq_restore(uint32_t flags) {
-    asm volatile("pushl %0\n\tpopfl" :: "r"(flags) : "memory");
-}
 
 // ============================================================
 //  DISPLAY BACKEND SELECTION
@@ -34,102 +18,10 @@ static int use_vesa  = 0;   // 0 = VGA text mode, 1 = VESA framebuffer
 static int term_cols = 80;
 static int term_rows = 25;
 
-/* ============================================================
- *  MULTI-CONSOLE (Phase A — multitasking)
- *  ------------------------------------------------------------
- *  All console state that used to be module-static is now a field
- *  of a PER-CONSOLE struct TermCon. The old identifiers below are
- *  macros pointing into g_out, so the legacy backend code
- *  (put_char_vesa etc.) compiles unchanged.
- *
- *    g_out : OUTPUT console — owned by the running task (a
- *            background task's printf updates its own cells).
- *    g_act : ACTIVE console — the only one rendered to the screen
- *            + receiving keyboard focus. F2 = console_activate.
- *
- *  Render rule: the cell mirror is ALWAYS updated (per-console text
- *  mirror); pixel/VGA writes happen only when g_out == g_act.
- *
- *  Phase A.1 (graphics isolation): each console additionally owns a
- *  PIXEL canvas snapshot. When focus leaves a console on which a
- *  user program drew pixels (fillrect / putpixel / blit), the
- *  framebuffer is saved into that console's canvas; when focus
- *  returns, it is restored. Together with the scheduler's draw gate
- *  (task_console_draw_gate) this keeps a frozen game on its own
- *  terminal instead of painting over the shell the user is typing
- *  into (the "snake on terminal 2" bug).
- * ============================================================ */
-#define N_CONSOLES    8
-#define TERM_MAX_COLS 160
-#define TERM_MAX_ROWS 64
-#define TERM_MAX_CELLS (TERM_MAX_COLS * TERM_MAX_ROWS)
-
-struct TermCell {
-    uint8_t ch;
-    uint8_t attr;    /* VGA 16-color fg|bg<<4 (approximation for re-render) */
-};
-
-struct TermCon {
-    int      used;
-    int      row, col;
-    uint8_t  attr;            /* current_color */
-    uint32_t fg_rgb, bg_rgb;
-    int      scroll_enabled;
-    int      curvis;
-    int      prev_row, prev_col;
-    int      onscreen;
-    uint32_t cell_fg, cell_bg;
-    struct TermCell cells[TERM_MAX_CELLS];
-    /* --- Phase A.1: pixel canvas snapshot (VESA only) --- */
-    int      has_canvas;      /* pixels were drawn while active */
-    uint8_t* canvas;          /* framebuffer copy (user phys pool, VMA == phys) */
-};
-
-static struct TermCon tcons[N_CONSOLES];
-static struct TermCon* g_out = &tcons[0];
-static struct TermCon* g_act = &tcons[0];
-
-/* Legacy identifiers -> g_out fields (the old backend code compiles unchanged). */
-#define cursor_row          (g_out->row)
-#define cursor_col          (g_out->col)
-#define current_color       (g_out->attr)
-#define term_fg_rgb         (g_out->fg_rgb)
-#define term_bg_rgb         (g_out->bg_rgb)
-#define term_scroll_enabled (g_out->scroll_enabled)
-#define cursor_visible      (g_out->curvis)
-#define prev_cursor_row     (g_out->prev_row)
-#define prev_cursor_col     (g_out->prev_col)
-#define cursor_onscreen     (g_out->onscreen)
-#define cursor_cell_fg      (g_out->cell_fg)
-#define cursor_cell_bg      (g_out->cell_bg)
-
-/* Store one cell into the console mirror (always; rendering is separate). */
-static void con_cell_put(struct TermCon* c, int row, int col, uint8_t ch) {
-    if (row < 0 || row >= term_rows || row >= TERM_MAX_ROWS) return;
-    if (col < 0 || col >= term_cols || col >= TERM_MAX_COLS) return;
-    c->cells[row * TERM_MAX_COLS + col].ch   = ch;
-    c->cells[row * TERM_MAX_COLS + col].attr = current_color;
-}
-
-/* Default state of a fresh console (used by create + init_display). */
-static void con_defaults(struct TermCon* c) {
-    c->used = 1;
-    c->row = 0; c->col = 0;
-    c->attr = 0x0F;
-    c->fg_rgb = 0xFFFFFF;
-    c->bg_rgb = 0x000000;
-    c->scroll_enabled = 1;
-    c->curvis = 1;
-    c->prev_row = -1; c->prev_col = -1;
-    c->onscreen = 0;
-    c->cell_fg = 0xFFFFFF; c->cell_bg = 0x000000;
-    c->has_canvas = 0;
-    c->canvas = NULL;
-    for (int i = 0; i < TERM_MAX_CELLS; i++) {
-        c->cells[i].ch = ' ';
-        c->cells[i].attr = 0x0F;
-    }
-}
+// Shared cursor state (used by both backends)
+static int cursor_row   = 0;
+static int cursor_col   = 0;
+static uint8_t current_color = 0x0F;  // VGA attribute byte (fg|bg<<4)
 
 /* ============================================================
  *  FIX(R1) — TUI SCROLL LOCK
@@ -150,6 +42,7 @@ static void con_defaults(struct TermCon* c) {
  *  it does NOT shift the screen contents. Full-screen apps must use
  *  this; the shell keeps the default (scrolling active).
  * ============================================================ */
+static int term_scroll_enabled = 1;
 
 /* ============================================================
  *  FIX(R2) — QUIET CURSOR + ERASE WITH THE CORRECT COLOR
@@ -172,6 +65,10 @@ static void con_defaults(struct TermCon* c) {
  *     (including from the blink ISR) during bulk renders; the app
  *     turns it back on ONCE at the final position.
  * ============================================================ */
+static int      cursor_visible   = 1;       // 0 = suppress (bulk render)
+static int      cursor_onscreen  = 0;       // VESA: is the underline currently drawn?
+static uint32_t cursor_cell_fg   = 0xFFFFFF; // fg color at draw time
+static uint32_t cursor_cell_bg   = 0x000000; // cell bg color at draw time
 
 // ============================================================
 //  VGA 16-color → RGB palette (matching real VGA colors)
@@ -195,37 +92,22 @@ static const uint32_t vga_palette[16] = {
     0xFFFFFF, // 15 white
 };
 
-// fg/bg 32-bit RGB is now per-console (TermCon fields).
+// Current fg/bg as 32-bit RGB (updated by set_color)
+static uint32_t term_fg_rgb = 0xFFFFFF;
+static uint32_t term_bg_rgb = 0x000000;
 
 // ============================================================
-//  VGA TEXT MODE BACKEND
-//  (the cell mirror is ALWAYS updated; vga_buffer belongs to the active console only)
+//  VGA TEXT MODE BACKEND  (original code, unchanged)
 // ============================================================
 static volatile uint16_t* vga_buffer = (uint16_t*)0xB8000;
 
-/* Shift the cell mirror up by one row (any console). */
-static void scroll_cells(struct TermCon* c) {
-    for (int y = 0; y + 1 < term_rows && y + 1 < TERM_MAX_ROWS; y++) {
-        for (int x = 0; x < term_cols && x < TERM_MAX_COLS; x++) {
-            c->cells[y * TERM_MAX_COLS + x] = c->cells[(y + 1) * TERM_MAX_COLS + x];
-        }
-    }
-    for (int x = 0; x < term_cols && x < TERM_MAX_COLS; x++) {
-        c->cells[(term_rows - 1) * TERM_MAX_COLS + x].ch   = ' ';
-        c->cells[(term_rows - 1) * TERM_MAX_COLS + x].attr = current_color;
-    }
-}
-
 static void scroll_screen_vga(void) {
     if (cursor_row >= 25) {
-        scroll_cells(g_out);
-        if (g_out == g_act) {
-            for (int y = 0; y < 24; y++)
-                for (int x = 0; x < 80; x++)
-                    vga_buffer[y * 80 + x] = vga_buffer[(y + 1) * 80 + x];
+        for (int y = 0; y < 24; y++)
             for (int x = 0; x < 80; x++)
-                vga_buffer[24 * 80 + x] = (current_color << 8) | ' ';
-        }
+                vga_buffer[y * 80 + x] = vga_buffer[(y + 1) * 80 + x];
+        for (int x = 0; x < 80; x++)
+            vga_buffer[24 * 80 + x] = (current_color << 8) | ' ';
         cursor_row = 24;
     }
 }
@@ -249,7 +131,6 @@ static void vga_show_crtc_cursor(void) {
 
 static void update_cursor_vga(void) {
     if (!cursor_visible) return;          // hidden: do not touch the CRTC
-    if (g_out != g_act) return;           // only the visible console sets the CRTC
     uint16_t pos = cursor_row * 80 + cursor_col;
     outb(0x3D4, 0x0F);
     outb(0x3D5, (uint8_t)(pos & 0xFF));
@@ -258,16 +139,9 @@ static void update_cursor_vga(void) {
 }
 
 static void clear_screen_vga(void) {
-    /* the cell mirror is always cleared (console g_out) */
-    for (int i = 0; i < TERM_MAX_CELLS; i++) {
-        g_out->cells[i].ch = ' ';
-        g_out->cells[i].attr = current_color;
-    }
-    if (g_out == g_act) {
-        for (int y = 0; y < 25; y++)
-            for (int x = 0; x < 80; x++)
-                vga_buffer[y * 80 + x] = (current_color << 8) | ' ';
-    }
+    for (int y = 0; y < 25; y++)
+        for (int x = 0; x < 80; x++)
+            vga_buffer[y * 80 + x] = (current_color << 8) | ' ';
     cursor_row = 0;
     cursor_col = 0;
     update_cursor_vga();
@@ -310,16 +184,12 @@ static void put_char_vga(char c) {
     if (c == '\b') {
         if (cursor_col > 0) {
             cursor_col--;
-            con_cell_put(g_out, cursor_row, cursor_col, ' ');
-            if (g_out == g_act)
-                vga_buffer[cursor_row * 80 + cursor_col] = (current_color << 8) | ' ';
+            vga_buffer[cursor_row * 80 + cursor_col] = (current_color << 8) | ' ';
             if (cursor_visible) update_cursor_vga();
         }
         return;
     }
-    con_cell_put(g_out, cursor_row, cursor_col, (uint8_t)c);
-    if (g_out == g_act)
-        vga_buffer[cursor_row * 80 + cursor_col] = (current_color << 8) | c;
+    vga_buffer[cursor_row * 80 + cursor_col] = (current_color << 8) | c;
     cursor_col++;
     if (cursor_col >= 80) {
         vga_wrap_after_char();
@@ -334,7 +204,9 @@ static void put_char_vga(char c) {
 //  For 1024x768 that's 128x48 — much more room than VGA 80x25.
 // ============================================================
 
-// The previous cursor position is now per-console (TermCon fields).
+// Previous cursor position (to erase old cursor before drawing new)
+static int prev_cursor_row = -1;
+static int prev_cursor_col = -1;
 
 /*
  * Render one glyph at (row, col) using the 8x16 font.
@@ -406,8 +278,6 @@ static void hide_cursor_vesa(void) {
  * and use the remembered cell colors, not the current global colors. */
 void term_cursor_tick(void) {
     if (!use_vesa || !cursor_visible || !cursor_onscreen) return;
-    if (g_out != g_act) return;           /* blink only the visible console */
-    if (g_act->has_canvas) return;        /* v0.3: no cursor on canvas */
     if (++cursor_blink_acc < CURSOR_BLINK_TICKS) return;
     cursor_blink_acc = 0;
     cursor_blink_on ^= 1;
@@ -417,11 +287,6 @@ void term_cursor_tick(void) {
 
 static void update_cursor_vesa(void) {
     if (!cursor_visible) return;          // quiet mode: draw nothing
-    if (g_out != g_act) return;           // only the visible console
-    if (g_out->has_canvas) return;        // v0.3: canvas mode — the
-                                          // graphics program owns the
-                                          // screen; the cursor underline
-                                          // must not cut into its pixels
 
     // --- Erase old cursor (bg color at draw time — FIX R2) ---
     if (cursor_onscreen && prev_cursor_row >= 0 && prev_cursor_col >= 0) {
@@ -444,18 +309,15 @@ static void update_cursor_vesa(void) {
 }
 
 static void clear_screen_vesa(void) {
-    /* the cell mirror is always cleared */
-    for (int i = 0; i < TERM_MAX_CELLS; i++) {
-        g_out->cells[i].ch = ' ';
-        g_out->cells[i].attr = current_color;
-    }
-    if (g_out == g_act) {
-        uint16_t width  = vesa_get_width();
-        uint16_t height = vesa_get_height();
-        for (uint16_t y = 0; y < height; y++)
-            for (uint16_t x = 0; x < width; x++)
-                vesa_draw_pixel(x, y, term_bg_rgb);
-    }
+    /* FIX(S3): clear per-pixel via vesa_draw_pixel() (bpp-aware 16/24/32).
+     * Before: a dword fill with a 32-bit RGB value -> wrong colors in
+     * 16bpp and 24bpp (only accidentally right for pure black 0x00000000). */
+    uint16_t width  = vesa_get_width();
+    uint16_t height = vesa_get_height();
+    for (uint16_t y = 0; y < height; y++)
+        for (uint16_t x = 0; x < width; x++)
+            vesa_draw_pixel(x, y, term_bg_rgb);
+
     cursor_row = 0;
     cursor_col = 0;
     prev_cursor_row = -1;
@@ -465,27 +327,27 @@ static void clear_screen_vesa(void) {
 
 static void scroll_screen_vesa(void) {
     if (cursor_row >= term_rows) {
-        scroll_cells(g_out);              /* the cell mirror always shifts */
-        if (g_out == g_act && !g_out->has_canvas) {
-            /* v0.3: in canvas mode the pixel shift is SKIPPED —
-             * the mirror-only scroll keeps the program's pixels. */
-            uint32_t fb_addr = vesa_get_framebuffer();
-            uint16_t pitch   = vesa_get_pitch();
-            uint16_t fb_h    = vesa_get_height();
+        uint32_t fb_addr = vesa_get_framebuffer();
+        uint16_t pitch   = vesa_get_pitch();
+        uint16_t fb_h    = vesa_get_height();
 
-            int scroll_px = 16;  // one text row in pixels
+        int scroll_px = 16;  // one text row in pixels
 
-            // Move framebuffer up by 16 pixel rows (dword-at-a-time)
-            uint32_t* dst = (uint32_t*)fb_addr;
-            uint32_t* src = (uint32_t*)((uint8_t*)fb_addr + (uint32_t)scroll_px * pitch);
-            uint32_t total_dwords = ((uint32_t)(fb_h - scroll_px) * pitch) / 4;
-            for (uint32_t i = 0; i < total_dwords; i++)
-                dst[i] = src[i];
+        // Move framebuffer up by 16 pixel rows (dword-at-a-time)
+        uint32_t* dst = (uint32_t*)fb_addr;
+        uint32_t* src = (uint32_t*)((uint8_t*)fb_addr + (uint32_t)scroll_px * pitch);
+        uint32_t total_dwords = ((uint32_t)(fb_h - scroll_px) * pitch) / 4;
+        for (uint32_t i = 0; i < total_dwords; i++)
+            dst[i] = src[i];
 
-            for (uint16_t y = (uint16_t)(fb_h - scroll_px); y < fb_h; y++)
-                for (uint16_t x = 0; x < vesa_get_width(); x++)
-                    vesa_draw_pixel(x, y, term_bg_rgb);
-        }
+        // FIX(S4): clear the last 16 rows per-pixel (bpp-aware).
+        // The dword copy above is still used because it is byte-exact
+        // (safe for every bpp). The old dword clear wrote a raw
+        // RGB32 color -> garbled in 16/24bpp.
+        for (uint16_t y = (uint16_t)(fb_h - scroll_px); y < fb_h; y++)
+            for (uint16_t x = 0; x < vesa_get_width(); x++)
+                vesa_draw_pixel(x, y, term_bg_rgb);
+
         cursor_row = term_rows - 1;
     }
 }
@@ -507,15 +369,6 @@ static void vesa_wrap_after_char(void) {
 }
 
 static void put_char_vesa(char c) {
-    /* Phase A.1 consistency rule: a text write on an UNFOCUSED console
-     * would update the cell mirror only — the console's pixel canvas
-     * snapshot (if any) would go stale. Drop the canvas so the next
-     * activation does a clean full text re-render instead of showing
-     * an outdated picture. (Frozen games never hit this: the draw gate
-     * suspends them before they can print.) */
-    if (g_out != g_act && g_out->has_canvas) {
-        console_canvas_invalidate((int)(g_out - tcons));
-    }
     if (c == '\n') {
         cursor_row++;
         cursor_col = 0;
@@ -541,266 +394,18 @@ static void put_char_vesa(char c) {
         if (cursor_col > 0) {
             cursor_col--;
             // Overwrite with space (clears the cell)
-            con_cell_put(g_out, cursor_row, cursor_col, ' ');
-            if (g_out == g_act && !g_out->has_canvas)
-                draw_glyph(cursor_row, cursor_col, ' ');
+            draw_glyph(cursor_row, cursor_col, ' ');
             if (cursor_visible) update_cursor_vesa();
         }
         return;
     }
 
-    con_cell_put(g_out, cursor_row, cursor_col, (uint8_t)c);
-    if (g_out == g_act && !g_out->has_canvas)   /* v0.3: mirror-only */
-        draw_glyph(cursor_row, cursor_col, (uint8_t)c);  /* while canvas  */
+    draw_glyph(cursor_row, cursor_col, (uint8_t)c);
     cursor_col++;
     if (cursor_col >= term_cols) {
         vesa_wrap_after_char();
     }
     if (cursor_visible) update_cursor_vesa();
-}
-
-/* ============================================================
- *  RGB -> nearest VGA 16-color (for the cell attr mirror, so the
- *  re-render after a console switch keeps a similar color).
- * ============================================================ */
-static uint8_t rgb_nearest16(uint32_t rgb) {
-    uint8_t r = (rgb >> 16) & 0xFF, g = (rgb >> 8) & 0xFF, b = rgb & 0xFF;
-    uint32_t best = 0, bestd = 0xFFFFFFFF;
-    for (uint32_t i = 0; i < 16; i++) {
-        uint32_t pr = vga_palette[i] >> 16, pg = (vga_palette[i] >> 8) & 0xFF,
-                 pb = vga_palette[i] & 0xFF;
-        uint32_t dr = pr > r ? pr - r : r - pr;
-        uint32_t dg = pg > g ? pg - g : g - pg;
-        uint32_t db = pb > b ? pb - b : b - pb;
-        uint32_t d = dr * dr + dg * dg + db * db;
-        if (d < bestd) { bestd = d; best = i; }
-    }
-    return (uint8_t)best;
-}
-
-/* ============================================================
- *  CONSOLE API (Phase A — used by task.cpp / idt.cpp)
- * ============================================================ */
-int console_create(void) {
-    for (int i = 0; i < N_CONSOLES; i++) {
-        if (!tcons[i].used) {
-            con_defaults(&tcons[i]);
-            return i;
-        }
-    }
-    return -1;
-}
-
-void console_free(int id) {
-    if (id < 0 || id >= N_CONSOLES) return;
-    if (&tcons[id] == g_act) return;      /* the active console is never freed */
-    console_canvas_invalidate(id);
-    tcons[id].used = 0;
-}
-
-int console_active_id(void) {
-    return (int)(g_act - tcons);
-}
-
-/* Phase C: number of consoles in use (bounds-check for `switch n`). */
-int console_count(void) {
-    int n = 0;
-    for (int i = 0; i < N_CONSOLES; i++)
-        if (tcons[i].used) n++;
-    return n;
-}
-
-int console_next_used(int from, int dir) {
-    if (from < 0) from = 0;
-    if (from >= N_CONSOLES) from = N_CONSOLES - 1;
-    for (int k = 1; k <= N_CONSOLES; k++) {
-        int idx = (from + dir * k + N_CONSOLES * 8) % N_CONSOLES;
-        if (tcons[idx].used) return idx;
-    }
-    return -1;
-}
-
-/* ---------- Phase A.1: per-console pixel canvas ---------- */
-
-static uint32_t con_canvas_bytes(void) {
-    return (uint32_t)vesa_get_pitch() * (uint32_t)vesa_get_height();
-}
-
-static void con_render_full(struct TermCon* c);   /* v0.3 */
-
-/* Mark the ACTIVE console as having pixels on screen (called by the
- * graphics syscalls after the focus gate passes).
- * v0.3 (FR-17/18): the FIRST draw takes a SNAPSHOT of the text
- * screen (restored/re-rendered when the program exits) and CLEARS the
- * framebuffer — graphics programs start on a clean black canvas
- * instead of painting over the boot log. Text output while the
- * canvas is live updates the cell MIRROR only (serial still mirrors):
- * glyphs and the cursor must not trash the program's pixels. */
-void console_canvas_mark(void) {
-    if (!use_vesa || !g_act) return;
-    struct TermCon* c = g_act;
-    if (c->has_canvas) return;              /* already in canvas mode */
-    if (!c->canvas)
-        c->canvas = (uint8_t*)(uintptr_t)
-                    task_user_phys_alloc(con_canvas_bytes());
-    if (c->canvas) {
-        /* snapshot + clear under the KERNEL directory (irq off, CR3
-         * saved/restored) — same discipline as the console-switch
-         * save path: the identity VMA is guaranteed there. */
-        uint32_t f = con_irq_save();
-        uint32_t saved_cr3 = task_read_cr3();
-        task_load_cr3(paging_kernel_dir());
-        memcpy(c->canvas,
-               (const void*)(uintptr_t)vesa_get_framebuffer(),
-               (size_t)con_canvas_bytes());
-        memset((void*)(uintptr_t)vesa_get_framebuffer(), 0,
-               (size_t)con_canvas_bytes());
-        task_load_cr3((uint32_t*)(uintptr_t)saved_cr3);
-        con_irq_restore(f);
-    }
-    /* even without a snapshot buffer: the program owns the screen —
-     * text goes mirror-only until the program exits. */
-    c->has_canvas = 1;
-    c->onscreen = 0;                        /* force re-render at exit */
-    cursor_onscreen = 0;                    /* stale underline is gone  */
-    prev_cursor_row = -1;
-    prev_cursor_col = -1;
-}
-
-/* Drop the canvas of a console (a graphics program exited / the
- * console is being freed) and return the buffer to the physical
- * pool — the memory-cleanup half of the isolation fix.
- * v0.3 (FR-17/18): when the ACTIVE console leaves canvas mode
- * (program exit), the text screen is RE-RENDERED from the cell mirror
- * — which the program's own printf output kept up to date — instead
- * of restoring a stale snapshot. */
-void console_canvas_invalidate(int console_id) {
-    if (console_id < 0 || console_id >= N_CONSOLES) return;
-    struct TermCon* c = &tcons[console_id];
-    int was_live = (c == g_act && c->has_canvas && use_vesa);
-    if (c->canvas) {
-        task_user_phys_free((uint32_t)(uintptr_t)c->canvas,
-                            con_canvas_bytes());
-        c->canvas = NULL;
-    }
-    c->has_canvas = 0;
-    if (was_live)
-        con_render_full(c);          /* text back on screen, clean */
-}
-
-/* Full re-render of a console onto the screen (called on activate).
- * Borrows g_out so the render helpers target the requested console. */
-static void con_render_full(struct TermCon* c) {
-    struct TermCon* save_out = g_out;
-    g_out = c;
-    if (use_vesa) {
-        /* v10.11 perf fix: one hardware-friendly fill_rect instead of
-         * ~1M single-pixel writes (a full-screen clear used to cost
-         * tens of milliseconds on every F1/F2 switch). */
-        vesa_fill_rect(0, 0, vesa_get_width(), vesa_get_height(), 0x000000);
-        uint32_t save_fg = term_fg_rgb;
-        for (int r = 0; r < term_rows && r < TERM_MAX_ROWS; r++) {
-            for (int q = 0; q < term_cols && q < TERM_MAX_COLS; q++) {
-                struct TermCell* cell = &c->cells[r * TERM_MAX_COLS + q];
-                if (cell->ch == ' ' || cell->ch == 0) continue;
-                term_fg_rgb = vga_palette[cell->attr & 0x0F];
-                draw_glyph(r, q, cell->ch);
-            }
-        }
-        term_fg_rgb = save_fg;
-        c->onscreen = 0;
-        c->prev_row = -1;
-        c->prev_col = -1;
-        if (c->curvis) update_cursor_vesa();
-    } else {
-        for (int y = 0; y < 25; y++)
-            for (int x = 0; x < 80; x++) {
-                struct TermCell* cell = &c->cells[y * TERM_MAX_COLS + x];
-                vga_buffer[y * 80 + x] = ((uint16_t)cell->attr << 8) | cell->ch;
-            }
-        update_cursor_vga();
-    }
-    g_out = save_out;
-}
-
-void console_activate(int id) {
-    if (id < 0 || id >= N_CONSOLES) return;
-    if (!tcons[id].used) return;
-    if (g_act == &tcons[id]) return;
-
-    struct TermCon* old = g_act;
-    g_act = &tcons[id];
-
-    /* Phase A.1 — graphics console isolation on switch-away:
-     * save the outgoing console's pixels (if it has a canvas) into
-     * its snapshot buffer so another terminal's text does not
-     * overwrite a frozen game's screen. Allocation from the user
-     * physical pool can fail under memory pressure — then the
-     * console degrades to plain text re-rendering.
-     * v0.3 FIX (demand paging): the canvas buffer is a RAW
-     * physical chunk accessed through its VMA==phys identity — but
-     * with demand-paged task windows that VMA may be remapped in the
-     * CURRENT task's directory (the switch can preempt any task).
-     * The copy now runs under the KERNEL directory (irq off, CR3
-     * saved/restored) so the identity mapping is guaranteed. */
-    if (old->has_canvas && use_vesa) {
-        if (!old->canvas)
-            old->canvas = (uint8_t*)(uintptr_t)
-                          task_user_phys_alloc(con_canvas_bytes());
-        if (old->canvas) {
-            uint32_t f = con_irq_save();
-            uint32_t saved_cr3 = task_read_cr3();
-            task_load_cr3(paging_kernel_dir());
-            memcpy(old->canvas,
-                   (const void*)(uintptr_t)vesa_get_framebuffer(),
-                   (size_t)con_canvas_bytes());
-            task_load_cr3((uint32_t*)(uintptr_t)saved_cr3);
-            con_irq_restore(f);
-        } else {
-            old->has_canvas = 0;   /* no memory for a snapshot: text fallback */
-        }
-    }
-
-    /* Phase A.1 — switch-in: restore the incoming console's frozen
-     * pixels, or do a full text re-render when it has none.
-     * v0.3: kernel-directory copy (see the save side above). */
-    if (tcons[id].has_canvas && tcons[id].canvas && use_vesa) {
-        uint32_t f = con_irq_save();
-        uint32_t saved_cr3 = task_read_cr3();
-        task_load_cr3(paging_kernel_dir());
-        memcpy((void*)(uintptr_t)vesa_get_framebuffer(),
-               (const void*)tcons[id].canvas,
-               (size_t)con_canvas_bytes());
-        task_load_cr3((uint32_t*)(uintptr_t)saved_cr3);
-        con_irq_restore(f);
-        /* cursor tracking restarts cleanly for the focused console */
-        struct TermCon* save_out = g_out;
-        g_out = &tcons[id];
-        tcons[id].onscreen = 0;
-        tcons[id].prev_row = -1;
-        tcons[id].prev_col = -1;
-        if (tcons[id].curvis) update_cursor_vesa();
-        g_out = save_out;
-    } else {
-        con_render_full(g_act);
-    }
-
-    /* SIGTTOU-style resume: wake programs parked on this console by
-     * the scheduler's graphics draw gate (they continue mid-syscall
-     * and finish the draw they were suspended on). */
-    task_wake_console(id);
-}
-
-void term_set_output(int id) {
-    if (id < 0 || id >= N_CONSOLES || !tcons[id].used) {
-        g_out = g_act;
-        return;
-    }
-    g_out = &tcons[id];
-}
-
-void term_force_active_output(void) {
-    g_out = g_act;
 }
 
 // ============================================================
@@ -815,8 +420,6 @@ void init_display(void) {
         // Clamp to sane minimums
         if (term_cols < 40) term_cols = 40;
         if (term_rows < 20) term_rows = 20;
-        if (term_cols > TERM_MAX_COLS) term_cols = TERM_MAX_COLS;
-        if (term_rows > TERM_MAX_ROWS) term_rows = TERM_MAX_ROWS;
         // Fill framebuffer with black
         vesa_fill_rect(0, 0, vesa_get_width(), vesa_get_height(), 0x000000);
     } else {
@@ -824,9 +427,6 @@ void init_display(void) {
         term_cols = 80;
         term_rows = 25;
     }
-    /* Console 0 = console boot. */
-    con_defaults(&tcons[0]);
-    g_out = g_act = &tcons[0];
 }
 
 // Active console size — used by panic.cpp to draw a correct
@@ -863,7 +463,6 @@ void term_set_cursor_visible(int visible) {
 }
 
 void put_char(char c) {
-    serial_putc(c);          /* debug mirror to COM1 (QEMU -serial) */
     if (use_vesa) put_char_vesa(c);
     else          put_char_vga(c);
 }
@@ -907,8 +506,6 @@ void set_color(uint8_t fg, uint8_t bg) {
 void set_fg_rgb(uint32_t rgb) {
     if (use_vesa) {
         term_fg_rgb = rgb & 0x00FFFFFFu;
-        /* snap the 16-color fg for the cell attr mirror (consistent re-render) */
-        current_color = (current_color & 0xF0) | rgb_nearest16(term_fg_rgb);
         return;
     }
     uint8_t r = (rgb >> 16) & 0xFF, g = (rgb >> 8) & 0xFF, b = rgb & 0xFF;
@@ -1120,17 +717,6 @@ uint16_t inw(uint16_t port) {
 
 void outw(uint16_t port, uint16_t val) {
     asm volatile ("outw %0, %1" : : "a"(val), "Nd"(port));
-}
-
-/* v0.3 (FR-12): 32-bit port I/O — PCI config cycles. */
-uint32_t inl(uint16_t port) {
-    uint32_t ret;
-    asm volatile ("inl %1, %0" : "=a"(ret) : "Nd"(port));
-    return ret;
-}
-
-void outl(uint16_t port, uint32_t val) {
-    asm volatile ("outl %0, %1" : : "a"(val), "Nd"(port));
 }
 
 // ======================== KEYBOARD I/O ======================

@@ -404,13 +404,13 @@ extern "C" void ne2000_dbg_probe(void) {
     uint8_t save_cr = ne_in(NE_CR);
     ne_out(NE_CR, CR_STA | 0x20);           /* page0 + nodma */
 
-    /* 1. the 16-byte PROM at address 0 */
+    /* 1. PROM 16 byte dari address 0 */
     ne_read_mem(buf, 0x0000, 16);
     printf("PROM[0..15]:");
     for (int i = 0; i < 16; i++) printf(" %02x", buf[i]);
     printf("\n");
 
-    /* 2. round-trip: write a pattern to 0x5000, read it back */
+    /* 2. round-trip: tulis pattern ke 0x5000, baca balik */
     uint8_t pat[8] = {0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77};
     uint8_t bak[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     ne_write_mem(pat, 0x5000, 8);
@@ -421,7 +421,7 @@ extern "C" void ne2000_dbg_probe(void) {
     for (int i = 0; i < 8; i++) printf(" %02x", bak[i]);
     printf("\n");
 
-    /* 3. read from an odd offset */
+    /* 3. baca dari offset ganjil */
     ne_read_mem(bak, 0x0001, 6);
     printf("PROM[1..6]  :");
     for (int i = 0; i < 6; i++) printf(" %02x", bak[i]);
@@ -446,12 +446,9 @@ extern "C" void ne2000_dbg_probe(void) {
 }
 
 // ---------------- ISR (IRQ9, vector 41) --------------------
-// Registered by idt_set_gate(41, ...) in idt.cpp. v0.3 FR-09: the ISR
-// acks the card, records the overflow flag and COPIES the frames into
-// the net RX ring (net_rxr_drain_isr — memcpy only, no lwIP). The
-// actual stack processing (pbuf, callbacks, httpd, timers) happens in
-// the "net" kernel task via net_service(). Heavy traffic can no
-// longer hold IRQ9 (or IRQ0) hostage -> no keyboard/mouse/timer lag.
+// Didaftar idt_set_gate(41, ...) di idt.cpp. Hanya: ack IRQ di
+// card, catat flag overflow, poll (net_poll punya cli-guard
+// sendiri), EOI ke PIC.
 extern "C" __attribute__((interrupt)) void ne2000_isr(void* frame) {
     (void)frame;
     ne_irqs++;
@@ -460,7 +457,7 @@ extern "C" __attribute__((interrupt)) void ne2000_isr(void* frame) {
     if (isr & ISR_OVW) ne_ovw = 1;
     ne_out(NE_ISR, isr);            /* write-back = ack          */
 
-    net_rxr_drain_isr();            /* frames -> RX ring only    */
+    net_poll();                     /* drain as soon as possible */
 
     outb(0xA0, 0x20);               /* EOI slave + master        */
     outb(0x20, 0x20);

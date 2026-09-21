@@ -3,12 +3,10 @@
 // ------------------------------------------------------------
 //  Stack: lwIP 2.1.3 (BSD-3, third_party/lwip-2.1.3) NO_SYS=1
 //  NIC  : NE2000 ISA (QEMU -device ne2k_isa) @ 0x300, IRQ9
-//  Model (v0.3 FR-09): two-stage — the IRQ9 NIC ISR only copies
-//         frames into the RX ring (net_rxr_drain_isr); ALL lwIP
-//         processing happens in task context via net_service()
-//         (the dedicated "net" kernel task + boot/blocking waits).
+//  Model: cooperative polling — net_poll() is called from the
+//         timer IRQ0 (net_timer_tick) and the IRQ9 NIC ISR.
 //         Every lwIP access is guarded by cli/sti (net_lock /
-//         net_unlock), so it is safe from every context at once.
+//         net_unlock), so it is safe from both contexts at once.
 //
 //  Used by: kernel.cpp (init + shell commands ifconfig / ping),
 //  timer.cpp (net_timer_tick), idt.cpp (ne2000_isr).
@@ -29,28 +27,13 @@ extern "C" {
 //         (network commands become a polite no-op).
 int  net_init(void);
 
-// v0.3 FR-09: drain the RX RING -> pbuf -> lwIP, then
-// sys_check_timeouts(). TASK CONTEXT ONLY (the "net" kernel task,
-// the boot DHCP wait, blocking mget/ping waits). Re-entrancy safe
-// (internal cli-guard). Returns the number of frames accepted.
-int  net_service(void);
-
-// IRQ9 ISR context: copy NIC frames into the RX ring (no lwIP!).
-int  net_rxr_drain_isr(void);
-
-// Legacy alias of net_service() — task context only since v0.3.
+// Drain NIC RX -> pbuf -> lwIP, then sys_check_timeouts().
+// Re-entrancy safe (internal cli-guard). May be called from any
+// context: a task (shell), the IRQ0 timer, or IRQ9 (NIC).
 void net_poll(void);
 
-// Legacy no-op since v0.3 (IRQ0 no longer runs the stack).
+// Called from timer_handler (IRQ0) — only polls when up.
 void net_timer_tick(void);
-
-// Create the console-less "net" kernel task (after task_init0).
-// Returns 1 on success / when no NIC (nothing to service), 0 on
-// task-table exhaustion.
-int  net_start_task(void);
-
-// v0.3 debug: dump the RX ring cursors + nettask state (`netdbg`).
-void net_dbg_dump(void);
 
 // Shell: print MAC/IP/counters.
 void net_print_info(void);
@@ -93,13 +76,6 @@ void net_get_info(uint32_t* w);
 // Non-verbose ping (syscall #35): return reply count 0..count.
 int  net_ping_raw(const char* ipstr, int count);
 
-// ---- TLS policy (kernel/net/tls_client.c, v0.3 FR-23) ----
-// 1 = allow the WARNED "encrypted but not verified" retry for the
-// NEXT https connection (mget -k). 0 (default) = a certificate
-// verification failure REFUSES the connection (fail-closed).
-// Returns the previous value; auto-resets after each connection.
-int tls_set_insecure(int allow);
-
 // ---- httpd :80 (kernel/net/httpd.c) ----
 // start = idempotent; return 1 success/already, 0 failed (no pcb).
 int      net_httpd_start(void);
@@ -115,10 +91,9 @@ uint32_t net_httpd_bytes(void);
 //   -port overrides the port from the URL; defaults are 80
 //   (http) and 443 (https).
 // HTTPS rides on BearSSL 0.6 (third_party/bearssl, TLS 1.2):
-// strict chain validation against 9 embedded Mozilla roots.
-// v0.3 FR-23: verification failure REFUSES the connection by
-// default (fail-closed); `mget -k <url>` opts into the warned
-// parse-only "encrypted but unverified" retry.
+// strict chain validation against 9 embedded Mozilla roots,
+// with an automatic parse-only retry (clearly warned) when the
+// server's chain cannot be verified (unknown root / P-384).
 // The response body is saved via fs_write_binary into save_dir
 // (the shell cwd) under the URL's basename — the file format
 // (.json, .png, ...) is preserved byte-exact.
