@@ -330,7 +330,7 @@ static void rename_selected_action(void) {
     char new_name[80];
     make_unique_name(base_name, ext, new_name, sizeof(new_name));
 
-    // Buat node baru, salin konten jika file
+    // Create the new node; copy the content if it is a file
     const char* content = node->is_dir ? nullptr : node->content;
     int ret = node->is_dir
         ? fs_create_dir(s_cwd, new_name)
@@ -525,7 +525,7 @@ static void win_key_cb(lv_event_t* e) {
         return;
     }
 
-    // Blokir input keyboard jika ada dialog terbuka
+    // Block keyboard input while a dialog is open
     if (s_mbox) return;
     if (!s_file_list) return;
 
