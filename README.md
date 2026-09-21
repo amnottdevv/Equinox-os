@@ -74,8 +74,6 @@ root::users / $ doom -iwad /mnt/doom1.wad    # DOOM straight off the disk
 | **Games** | Snake, Breakout, Pong (Libgame framework) and **DOOM** loaded from the FAT32 disk. |
 | **Tooling** | 110 shell commands, 29 self-built userland tools, 24 C sample programs, and QEMU regression suites. |
 
-Scale: about 38,000 lines of first-party C / C++ / assembly (excluding LVGL,
-lwIP and BearSSL) plus about 10,000 lines of Python build and test tooling.
 
 ### What is new in v0.3
 
