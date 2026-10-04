@@ -9,18 +9,7 @@ theme:
   name: material
   language: en
   palette:
-    - scheme: default
-      primary: indigo
-      accent: blue
-      toggle:
-        icon: material/brightness-7
-        name: Switch to dark mode
-    - scheme: slate
-      primary: indigo
-      accent: blue
-      toggle:
-        icon: material/brightness-4
-        name: Switch to light mode
+    scheme: slate
   features:
     - navigation.instant
     - navigation.tracking
@@ -44,12 +33,10 @@ markdown_extensions:
   - pymdownx.tabbed:
       alternate_style: true
   - pymdownx.details
-  - pymdownx.emoji:
-      emoji_index: !!python/name:materialx.emoji.twemoji
-      emoji_generator: !!python/name:materialx.emoji.to_svg
   - toc:
       permalink: true
   - md_in_html
+  - tables
 
 nav:
   - Home: index.md
