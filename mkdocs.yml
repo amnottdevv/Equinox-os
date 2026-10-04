@@ -39,7 +39,7 @@ markdown_extensions:
   - tables
 
 nav:
-  - Home: index.md
+  - Home: README.md
   - Getting Started: GETTING_STARTED.md
   - Installation: INSTALL.md
   - Architecture: ARCHITECTURE.md
