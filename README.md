@@ -561,7 +561,7 @@ Negative results are errnos (`SYS_ENOENT`, `SYS_EBADF`, `SYS_EFAULT`, `SYS_EBUSY
 ## Networking
 
 ```text
-ne2k_isa (0x300 / IRQ 9) -> RX ring (drained outside the IRQ) -> lwIP 2.1.3 (NO_SYS) -> DHCP / DNS / ICMP / TCP
+ne2k_isa / e1000 (0x300 / IRQ 9) -> RX ring (drained outside the IRQ) -> lwIP 2.1.3 (NO_SYS) -> DHCP / DNS / ICMP / TCP
                                                         |
                           mget (HTTP + HTTPS client)   +   httpd (server on :80)
                           eggkg in-process fetch       +   BearSSL TLS 1.2, 9 root CAs
