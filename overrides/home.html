@@ -1,0 +1,66 @@
+{% extends "main.html" %}
+{% block tabs %}
+  {{ super() }}
+  <style>
+    .md-header { position: initial }
+    .md-main > .md-main__inner { margin: 0 }
+    .md-content { display: none }
+    @media screen and (min-width:60em) { .md-sidebar--secondary { display: none } }
+    @media screen and (min-width:76.25em) { .md-sidebar--primary { display: none } }
+    .splash-hero {
+      background: linear-gradient(135deg, #4a1d6b 0%, #31135e 45%, #160726 100%);
+      color: #fff;
+      padding: 4rem 1.2rem 4.5rem;
+    }
+    .splash-hero__inner {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 2.5rem;
+      flex-wrap: wrap;
+    }
+    .splash-hero__text { max-width: 34rem; }
+    .splash-hero__text h1 {
+      font-size: 2.6rem;
+      font-weight: 700;
+      color: #fff;
+      margin: 0 0 1rem;
+    }
+    .splash-hero__text p {
+      font-size: 1.15rem;
+      opacity: .85;
+      line-height: 1.6;
+      margin: 0 0 1.75rem;
+    }
+    .splash-hero__text .md-button { margin: .25rem .5rem .25rem 0; }
+    .splash-hero__image img {
+      max-width: 460px;
+      width: 100%;
+      border-radius: .5rem;
+      box-shadow: 0 16px 40px rgba(0,0,0,.45);
+    }
+  </style>
+  <section class="splash-hero">
+    <div class="md-grid md-typeset">
+      <div class="splash-hero__inner">
+        <div class="splash-hero__text">
+          <h1>Equinox OS</h1>
+          <p>{{ config.site_description }} — a 32-bit x86 hobby operating system that compiles its own userland, inside the OS.</p>
+          <a href="{{ 'GETTING_STARTED/' | url }}" class="md-button md-button--primary" title="Getting Started">
+            Get started
+          </a>
+          <a href="{{ 'OVERVIEW/' | url }}" class="md-button" title="Documentation Overview">
+            Overview
+          </a>
+          <a href="{{ 'RELEASE_NOTES/' | url }}" class="md-button" title="Release Notes">
+            Release notes
+          </a>
+        </div>
+        <div class="splash-hero__image">
+          <img src="{{ 'image/equinox_intro_art.png' | url }}" alt="Equinox OS intro art" width="1659" height="1200" loading="lazy">
+        </div>
+      </div>
+    </div>
+  </section>
+{% endblock %}
+{% block content %}{% endblock %}

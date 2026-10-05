@@ -28,6 +28,7 @@ theme:
   font:
     text: Roboto
     code: JetBrains Mono
+  custom_dir: overrides
   features:
     - navigation.instant
     - navigation.instant.progress
@@ -38,8 +39,11 @@ theme:
     - navigation.expand
     - navigation.path
     - navigation.top
+    - navigation.footer
+    - navigation.indexes
     - toc.follow
-    - toc.integrate
+    - content.action.edit
+    - content.action.view
     - content.code.copy
     - content.code.select
     - content.tabs.link
@@ -76,37 +80,39 @@ extra:
       link: https://github.com/amnottdevv/Equinox-os
   generator: false
 
+copyright: Copyright &copy; 2026 amnottdevv — Equinox OS
+
 nav:
   - Home: index.md
   - Overview:
-    - Doc Map: OVERVIEW.md
-    - Getting Started: GETTING_STARTED.md
-    - Installation: INSTALL.md
-    - Architecture: ARCHITECTURE.md
-    - Release Notes: RELEASE_NOTES.md
+    - OVERVIEW.md
+    - GETTING_STARTED.md
+    - INSTALL.md
+    - ARCHITECTURE.md
+    - RELEASE_NOTES.md
     - Historical Release: Release/0.1_beta.md
     - All Doc Links: nav.md
-    - FAQ: FAQ.md
+    - FAQ.md
   - Configuration:
-    - Configuration: CONFIGURATION.md
-    - Set Builtin: SET.md
-    - system.ecf: SYSTEM_ECF.md
-    - .ecf Format: ECF.md
-    - eqshell Scripts: EQSHELL.md
-    - Commands: COMMANDS.md
+    - CONFIGURATION.md
+    - SET.md
+    - SYSTEM_ECF.md
+    - ECF.md
+    - EQSHELL.md
+    - COMMANDS.md
   - Storage & Boot:
-    - Booting: BOOTING.md
-    - QFS: QFS.md
-    - FAT32 Filesystem: FAT32.md
-    - Drivers: DRIVERS.md
+    - BOOTING.md
+    - QFS.md
+    - FAT32.md
+    - DRIVERS.md
   - Networking:
-    - Networking: NETWORKING.md
+    - NETWORKING.md
   - Kernel Internals:
-    - Memory: MEMORY.md
-    - Multitasking: MULTITASKING.md
-    - System Calls: SYSCALLS.md
-    - Graphics & Desktop: GUI.md
+    - MEMORY.md
+    - MULTITASKING.md
+    - SYSCALLS.md
+    - GUI.md
   - Self-Hosting:
-    - Self Hosting: SELF_HOSTING.md
-    - MRP1 Format: MRP.md
-    - Packages: PACKAGES.md
+    - SELF_HOSTING.md
+    - MRP.md
+    - PACKAGES.md

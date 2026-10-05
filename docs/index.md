@@ -1,3 +1,11 @@
+---
+template: home.html
+title: Equinox OS
+hide:
+  - navigation
+  - toc
+---
+
 <p align="center">
   <img src="image/Equinox.png" alt="Equinox OS" width="640">
 </p>
