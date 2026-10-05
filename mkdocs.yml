@@ -8,8 +8,8 @@ edit_uri: edit/main/docs/
 theme:
   name: material
   language: en
-  logo: image/equinox_info.png
-  favicon: image/equinox_info.png
+  logo: image/Equinox.png
+  favicon: image/Equinox.png
   palette:
     - media: "(prefers-color-scheme: dark)"
       scheme: slate
@@ -85,6 +85,8 @@ nav:
     - Architecture: ARCHITECTURE.md
     - Release Notes: RELEASE_NOTES.md
     - Historical Release: Release/0.1_beta.md
+    - All Doc Links: nav.md
+    - FAQ: FAQ.md
   - Configuration:
     - Configuration: CONFIGURATION.md
     - Set Builtin: SET.md

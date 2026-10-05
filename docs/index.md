@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="image/equinox_intro_art.png" alt="Equinox OS" width="640">
+  <img src="image/Equinox.png" alt="Equinox OS" width="640">
 </p>
 
 # Equinox OS
@@ -108,4 +108,4 @@ wizard or the `eggkg` package manager.
 | Network | lwIP 2.1.3, BearSSL TLS 1.2, NE2000 + Intel E1000 |
 | Desktop | LVGL 9 apps, EquiX desktop (ThorVG vector renderer) |
 
-Historical: [Release/0.1_beta.md](Release/0.1_beta.md).
+Historical: [Release/0.1_beta.md](Release/0.1_beta.md). Quick answers: [FAQ](FAQ.md) · full doc map: [nav.md](nav.md).
