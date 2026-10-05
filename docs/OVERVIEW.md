@@ -36,6 +36,7 @@ dedicated suites for the installer, AHCI, E1000 and `.ecf`).
 | [DRIVERS.md](DRIVERS.md) | Storage stack (block layer, **ATA PIO**, **AHCI SATA**) and network drivers (**NE2000**, **E1000**); PCI matching; how to add a new driver |
 | [NETWORKING.md](NETWORKING.md) | lwIP 2.1.3 stack, DHCP/DNS, `mget` (HTTP/HTTPS + TLS), `httpd`, QEMU user-mode networking, NE2000 vs E1000 |
 | [SELF_HOSTING.md](SELF_HOSTING.md) | `mtcc` (the in-OS C compiler), MRP1 executables, ruf v3 build recipes, `equinoxinstall -compile/-build`, the build pipeline |
+| [MTCC_API.md](MTCC_API.md) | The mtcc prelude headers: `morph.h`, `fileio.h`, `multitasking.h` (+ the hosted `Morph.h` SDK) |
 | [SYSCALLS.md](SYSCALLS.md) | The full `int 0x80` interface: syscalls #1–#54, calling convention, errno values |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Technical overview: boot flow, memory map, multitasking, filesystems, networking, graphics, executable formats, build & test harnesses |
 | [COMMANDS.md](COMMANDS.md) | Complete shell reference: builtins (incl. `eggkg`, `Qfs`, `set`, `equinoxinstall`), userland tools, pipes/glob/redirect, example session |
