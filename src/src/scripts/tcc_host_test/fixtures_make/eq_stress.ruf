@@ -1,0 +1,5 @@
+# stress: semua tools userland asli, satu proses
+echo "stress build 29 tools"
+src ../../tools_user
+exclude elfdemo.c
+exclude fstest.c

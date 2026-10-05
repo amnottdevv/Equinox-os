@@ -1,0 +1,5 @@
+# fixture mtcc -make — bentuk key:=value ala sketch
+echo "memulai compiling"
+src:=fixtures_make/tools
+src:=fixtures_make/libc
+exclude:=games

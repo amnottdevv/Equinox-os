@@ -1,0 +1,3 @@
+echo "uji out dir"
+src fixtures_make/tools
+out fixtures_make/bin
