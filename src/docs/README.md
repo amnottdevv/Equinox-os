@@ -1,56 +1,74 @@
-# Dokumentasi Equinox OS — v0.3 Beta
+# Equinox OS Documentation — 0.4 Beta
 
-Equinox OS adalah sistem operasi hobby 32-bit x86 dengan kernel monolitik
-yang ditulis dalam C++17, di-boot oleh GRUB (multiboot), menggambar ke
-framebuffer VESA 1360x768, punya stack TCP/IP nyata yang bisa mengunduh
-file dari internet lewat HTTP**S**, subsistem disk (ATA + FAT32
-baca/tulis) yang persisten antar reboot — dan sejak v0.3, **OS ini
-meng-compile userland-nya sendiri dari dalam OS** (`eqbuild`, 29 tools).
+Equinox OS is a 32-bit x86 hobby operating system: a monolithic C++17/C
+kernel booted by GRUB into a VESA 1360×768 framebuffer, real ring-3
+processes with demand paging, a TCP/IP stack that can fetch files over
+HTTPS, persistent FAT32 storage on both PATA (ATA PIO) and SATA (AHCI)
+disks — and, the part that defines the project, **the OS compiles its own
+userland from C source inside the OS** with its built-in compiler
+(`mtcc`), driven either by the `equinoxinstall` wizard or by `eggkg`, the
+package manager.
 
-Status rilis: **v0.3 Beta** — regresi QEMU **101/101 PASS**.
+Status: **0.4 Beta** — regression-tested in QEMU (101 core checks plus
+dedicated suites for the installer, AHCI, E1000 and `.ecf`).
 
-## Isi folder ini
+---
 
-| File | Isi |
+## Documentation map
+
+| Document | Contents |
 | --- | --- |
-| [GETTING_STARTED.md](GETTING_STARTED.md) | Prasyarat, cara build, dan **semua command menjalankan QEMU** (ISO saja, dengan disk FAT32, jaringan, serial debug) |
-| [RELEASE_NOTES.md](RELEASE_NOTES.md) | Catatan rilis v0.3 Beta: **fitur unggulan**, **fitur tambahan**, perbaikan bug penting, batasan yang diketahui, roadmap v0.4 |
-| [COMMANDS.md](COMMANDS.md) | Referensi lengkap: command shell bawaan + **29 tools userland** yang di-compile in-OS, dengan contoh pemakaian |
-| [ARCHITECTURE.md](ARCHITECTURE.md) | Gambaran teknis: alur boot, memory map, scheduler, syscall #0–#54, filesystem, jaringan, grafis, format MRP & pipeline self-hosting |
+| [GETTING_STARTED.md](GETTING_STARTED.md) | Prerequisites, building the ISO, **every QEMU run variant** (plain, disk, install image, E1000, AHCI/SATA), first boot, troubleshooting |
+| [INSTALL.md](INSTALL.md) | Installing Equinox onto a disk — **path A: the `equinoxinstall` wizard**, **path B: fully manual** (`Qfs`, `mount`, `copy`), installing the GRUB bootloader, what ships and what does not |
+| [PACKAGES.md](PACKAGES.md) | `eggkg` reference: `update / install / remove / list / search / info / sync`, the package repository format (package.list v0 + index.idx v1), the **bash package** (not bundled — installed via eggkg), writing your own package |
+| [QFS.md](QFS.md) | `Qfs` disk tool: `-list-disk`, `-format fat32`, `-install-boot`; disk naming (hda–hdh) and slot mapping |
+| [CONFIGURATION.md](CONFIGURATION.md) | The `.ecf` configuration system, the `set` builtin (all flags), `system.ecf` schema, eqshell scripts (`.es`) and `/eqshell.log` |
+| [DRIVERS.md](DRIVERS.md) | Storage stack (block layer, **ATA PIO**, **AHCI SATA**) and network drivers (**NE2000**, **E1000**); PCI matching; how to add a new driver |
+| [NETWORKING.md](NETWORKING.md) | lwIP 2.1.3 stack, DHCP/DNS, `mget` (HTTP/HTTPS + TLS), `httpd`, QEMU user-mode networking, NE2000 vs E1000 |
+| [SELF_HOSTING.md](SELF_HOSTING.md) | `mtcc` (the in-OS C compiler), MRP1 executables, ruf v3 build recipes, `equinoxinstall -compile/-build`, the build pipeline |
+| [SYSCALLS.md](SYSCALLS.md) | The full `int 0x80` interface: syscalls #1–#54, calling convention, errno values |
+| [ARCHITECTURE.md](ARCHITECTURE.md) | Technical overview: boot flow, memory map, multitasking, filesystems, networking, graphics, executable formats, build & test harnesses |
+| [COMMANDS.md](COMMANDS.md) | Complete shell reference: builtins (incl. `eggkg`, `Qfs`, `set`, `equinoxinstall`), userland tools, pipes/glob/redirect, example session |
+| [RELEASE_NOTES.md](RELEASE_NOTES.md) | What is new in 0.4 Beta, known limitations, roadmap |
 
-Dokumen teknis bahasa Inggris yang lebih rinci tetap ada di root repo:
-`README.md` (feature list + shell reference), `RELEASE_v0.3.md`
-(changelog teknis), `mrp_user/TCC.md` (compiler), `mrp_user/TARGETS.md`
-(roadmap FR), `mrp_user/workflow_mrp.md` (alur kerja MRP).
+Historical: [Release/0.1_beta.md](Release/0.1_beta.md).
 
-## Quick start (3 langkah)
+---
+
+## Quick start (3 steps)
 
 ```sh
-# 1. Build kernel + ISO
+# 1. Build the kernel + ISO (host Linux)
 make
 
-# 2. Boot di QEMU (dengan jaringan user-mode + httpd di localhost:8080)
+# 2. Boot it in QEMU (256 MB guest RAM, NE2000 NIC, httpd forwarded to :8080)
 make run
 
-# 3. Di dalam OS: build userland-nya sendiri
-eqbuild
+# 3. Inside the OS: install the userland, then add the coreutils package
+equinoxinstall
+eggkg update && eggkg install bash -y
 ```
 
-Setelah `eqbuild` selesai, seluruh 29 tools (`ls`, `cat`, `grep`, `tail`,
-`sort`, `wc`, …) langsung bisa dipakai di shell. Prompt shell:
-`root::users / $`.
+After `equinoxinstall` the shell has the text toolset (`grep`, `wc`,
+`sort`, …). The classic coreutils (`ls`, `cat`, `cp`, `mv`, `rm`,
+`mkdir`, …) arrive with the **bash** package via `eggkg` — the base ISO
+deliberately ships without them to stay slim; the shell provides
+builtins and aliases meanwhile, so basic navigation works out of the box.
 
-## Spesifikasi singkat
+## System snapshot
 
 | | |
 | --- | --- |
-| Arsitektur | 32-bit x86 (i386), kernel monolitik C++17 |
-| Boot | GRUB / multiboot, ISO hybrid |
-| Mode grafis | VESA 1360x768 @ 32 bpp (fallback teks VGA otomatis) |
-| Privilege | ring 0 / ring 3 nyata (TSS), syscall `int 0x80` #0–#54 |
-| Multitasking | round-robin preemptive, 2 console virtual (F1/F2), demand paging |
-| Filesystem | RAMFS + FAT32 read-write (LFN, write-through, auto-mount `/mnt`) |
-| Jaringan | lwIP 2.1.3 + NE2000: DHCP, DNS, ICMP, TCP, HTTP(S) client & server |
-| Compiler | `mtcc` — compiler C in-OS + libc subset, pipeline self-hosting `eqbuild` |
-| Ukuran ISO | ± 13.5 MB (termasuk source 29 tools + DOOM) |
-| Emulator uji | QEMU (`qemu-system-i386`, RAM 64 MB) |
+| Architecture | 32-bit x86 (i686), monolithic kernel, C++17 / C / NASM |
+| Boot | GRUB Multiboot (`kernel.elf` + boot modules), ISO hybrid |
+| Memory | **256 MB recommended** (`-m 256`); 64 MB minimum |
+| Display | VESA 1360×768×32 linear framebuffer, VGA text fallback |
+| Privilege | Real ring 0 / ring 3 (TSS), syscalls via `int 0x80` (#1–#54) |
+| Multitasking | Preemptive round-robin @ 100 Hz, up to 8 tasks, 2 virtual consoles (F1/F2), demand paging |
+| Storage | **ATA PIO (PATA)** + **AHCI (SATA)** behind a block layer; FAT32 read/write, RAMFS |
+| Networking | lwIP 2.1.3, DHCP/DNS/ICMP/TCP, HTTP(S) client + server; **NE2000 ISA** and **Intel E1000 PCI** |
+| Packages | `eggkg` → compiles and installs packages from the [Eggkg-l](https://github.com/amnottdevv/Eggkg-l) repository |
+| Compiler | `mtcc` — in-OS single-pass C compiler, MRP1 ring-3 executables |
+| Desktop | LVGL 9 apps + ThorVG-powered EquiX vector desktop |
+
+![System info](image/equinox_info.png)

@@ -1,0 +1,193 @@
+name: Sync release source zip to src/
+
+on:
+  release:
+    types:
+      - published
+      - edited
+      - prereleased
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag to synchronize"
+        required: false
+        default: "v0.2-Beta"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-src-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  sync-source:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+          token: ${{ github.token }}
+
+      - name: Set release tag
+        id: rel
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ github.event.inputs.release_tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${{ github.event.release.tag_name }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Find zip asset with "source" in its name
+        id: find_asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          RELEASE_TAG="${{ steps.rel.outputs.tag }}"
+          echo "Release: $RELEASE_TAG"
+
+          ASSET_NAME="$(
+            gh release view "$RELEASE_TAG" \
+              --repo "${{ github.repository }}" \
+              --json assets \
+              --jq '.assets[]
+                | select(.name | test("source"; "i"))
+                | select(.name | test("\\.zip$"; "i"))
+                | .name' \
+              | head -n1 || true
+          )"
+
+          if [ -z "$ASSET_NAME" ]; then
+            echo "No zip asset with 'source' in its name found. Skipping."
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Found asset: $ASSET_NAME"
+          echo "found=true" >> "$GITHUB_OUTPUT"
+          echo "asset_name=$ASSET_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Download the asset
+        if: steps.find_asset.outputs.found == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release download "${{ steps.rel.outputs.tag }}" \
+            --repo "${{ github.repository }}" \
+            --pattern "${{ steps.find_asset.outputs.asset_name }}" \
+            --output downloaded_source.zip
+
+      - name: Extract into src/
+        if: steps.find_asset.outputs.found == 'true'
+        run: |
+          set -euo pipefail
+          rm -rf src
+          mkdir -p src
+
+          TMP_DIR="$(mktemp -d)"
+          trap 'rm -rf "$TMP_DIR" downloaded_source.zip' EXIT
+
+          unzip -q downloaded_source.zip -d "$TMP_DIR"
+
+          ENTRY_COUNT="$(find "$TMP_DIR" -mindepth 1 -maxdepth 1 | wc -l)"
+          FIRST_ENTRY="$(find "$TMP_DIR" -mindepth 1 -maxdepth 1 | head -n1 || true)"
+
+          if [ "$ENTRY_COUNT" -eq 1 ] && [ -d "$FIRST_ENTRY" ]; then
+            SRC_ROOT="$FIRST_ENTRY"
+          else
+            SRC_ROOT="$TMP_DIR"
+          fi
+
+          cp -r "$SRC_ROOT"/. src/
+
+      - name: Sync src/ (stage, commit, push in 30 batches)
+        if: steps.find_asset.outputs.found == 'true'
+        env:
+          BRANCH: ${{ github.event.repository.default_branch }}
+          TAG: ${{ steps.rel.outputs.tag }}
+          ASSET: ${{ steps.find_asset.outputs.asset_name }}
+          BATCHES: "30"
+        run: |
+          set -euo pipefail
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config advice.detachedHead false
+          git config http.postBuffer 524288000
+
+          echo "=============== DEBUG (sebelum add) ==============="
+          echo "File di src/: $(find src -type f | wc -l)"
+          git check-ignore -v src/ || echo "src/ TIDAK di-ignore"
+          echo "Baris git status: $(git status --porcelain -- src/ | wc -l)"
+
+          echo "=============== STAGE SEMUA ==============="
+          git add -A -f -- src/
+
+          STAGED_COUNT="$(git diff --cached --name-only -- src/ | wc -l)"
+          echo "Staged files: $STAGED_COUNT"
+
+          if [ "$STAGED_COUNT" -eq 0 ]; then
+            echo "No changes in src/ — nothing to commit."
+            exit 0
+          fi
+
+          echo "== contoh 10 staged =="
+          git diff --cached --name-only -- src/ | sed -n '1,10p'
+
+          mapfile -t ALL_PATHS < <(git diff --cached --name-only -- src/ | sort -u)
+          TOTAL="${#ALL_PATHS[@]}"
+          echo "Total changed paths: $TOTAL"
+
+          git reset -q HEAD -- src/ || true
+
+          PER_BATCH=$(( (TOTAL + BATCHES - 1) / BATCHES ))
+          [ "$PER_BATCH" -lt 1 ] && PER_BATCH=1
+          echo "Files per batch: $PER_BATCH (max $BATCHES batches)"
+
+          for ((i = 0; i < BATCHES; i++)); do
+            start=$(( i * PER_BATCH ))
+            [ "$start" -ge "$TOTAL" ] && break
+
+            batch=( "${ALL_PATHS[@]:start:PER_BATCH}" )
+            [ "${#batch[@]}" -eq 0 ] && break
+
+            git add -A -f -- "${batch[@]}"
+
+            if git diff --cached --quiet; then
+              echo "Batch $((i+1))/$BATCHES: no staged changes, skipping."
+              continue
+            fi
+
+            git commit -m "chore: sync src/ from release ${TAG} (${ASSET}) [batch $((i+1))/${BATCHES}]"
+
+            pushed=false
+            for attempt in 1 2 3 4 5; do
+              if git push origin "HEAD:${BRANCH}"; then
+                pushed=true
+                break
+              fi
+
+              echo "Push gagal (percobaan $attempt). Fetch & rebase..."
+              git fetch origin "${BRANCH}" || true
+              git rebase "origin/${BRANCH}" || {
+                git rebase --abort || true
+                echo "Rebase gagal, coba lagi..."
+              }
+              sleep $(( attempt * 3 ))
+            done
+
+            if [ "$pushed" != "true" ]; then
+              echo "Gagal push batch $((i+1)) setelah beberapa percobaan." >&2
+              exit 1
+            fi
+
+            echo "Batch $((i+1))/$BATCHES pushed."
+          done
+
+          echo "Selesai. Semua batch sudah di-push."

@@ -1,157 +1,121 @@
-# Catatan Rilis — v0.3 Beta
+# Release notes — 0.4 Beta
 
-v0.3 mengubah fondasi 0.2 Beta menjadi model proses & memori yang nyata,
-lalu membuat OS membangun userland-nya sendiri: dari **11 tools menjadi
-29 tools yang seluruhnya di-compile di dalam OS** oleh `eqbuild`
-(builtin `help` dihapus — daftar command pindah ke dokumentasi/README).
-Semua perubahan dikawal regresi QEMU penuh: **101/101 PASS**.
+**0.4 Beta** turns Equinox from "a kernel that can compile its tools"
+into a **self-installing, package-driven operating system**: a real
+installer wizard, a package manager with a Git-hosted repository, a
+validated configuration store, a disk tool, and a storage/network
+driver expansion (AHCI SATA + block layer, Intel E1000).
 
----
+Regression status: 101 core QEMU checks PASS, plus dedicated 0.4
+suites — installer wizard (15), AHCI (17), E1000, `.ecf` (25), manual
+install (23), base image (15), `/mnt` build (7), eggkg bash build.
 
-## Fitur unggulan (headline v0.3)
+## Highlights
 
-### 1. Self-hosting — OS membangun userland-nya sendiri (`eqbuild`)
-ISO mengirim **source C** (bukan binari) dari 29 tools userland ke
-`/equinox/tools`. Perintah `eqbuild` meng-compile semuanya dengan
-compiler in-OS `mtcc` — satu log per file, sumber dihapus setelah
-berhasil — lalu barulah shell memakainya. Buktinya konsisten:
-output compiler in-OS **byte-identical** dengan compiler host (ceksum
-`head.mrp`/`wc.mrp` sama persis), jadi toolchain parity terjaga.
+### 1. `equinoxinstall` — the in-OS installer wizard
+Four phases from the running OS: pick a target disk (or *build in
+place*) → format/copy the EQUINOXBASE layout → pick the network driver
+(written into `system.ecf`) → compile the userland onto the target with
+live status; optional `[5/5]` installs the GRUB bootloader so the disk
+boots without the CD. Shortcuts: `-compile <dir>`, `-build
+<file.ruf|name|*.ruf>`. *(The v0.3 `eqbuild` loop lives on inside it as
+the compile phase.)*
 
-### 2. Multitasking + demand paging
-Scheduler round-robin preemptive (quantum per tick, FPU state
-`fxsave/fxrstor` per task), 2 console virtual (**F1/F2**), `ps` / `kill`
-/ `switch`, `wait` + pipe POSIX-style, zombie & orphan handling.
-Per-task VMA di-*reserve* dengan penanda `PTE_DEMAND`; page fault
-mengalokasikan satu halaman zero-fill per sentuhan pertama — arena 24 MB
-DOOM hanya "membayar" halaman yang benar-benar dipakai, jadi DOOM dan
-program lain hidup berdampingan.
+### 2. `eggkg` + the Eggkg-l repository
+Gentoo-style package manager built into the shell: `update / install /
+remove / list / search / info / sync`. Packages are C sources + a ruf
+v3 recipe, fetched over HTTPS from
+[Eggkg-l](https://github.com/amnottdevv/Eggkg-l) (local/offline paths
+work too), verified with in-kernel SHA-256, compiled with `mtcc -make`
+and installed into `/bin` with `installed.db` + boot-time `.local`
+sync. `dependencies.bash=true` auto-activates the coreutils at boot.
 
-### 3. Jaringan nyata sampai HTTPS
-lwIP 2.1.3 di atas NE2000 ISA: DHCP, DNS, ICMP, TCP. Client `mget`
-mengunduh `http://` dan `https://` (TLS 1.2 via BearSSL, validasi rantai
-ketat terhadap 9 root CA Mozilla; fallback parse-only diberi peringatan
-jelas). Server `httpd` menyajikan status + file RAMFS di port 80
-(dari host: `http://localhost:8080/`).
+### 3. The bash package replaces bundled coreutils
+**The base ISO no longer bundles the bash-class tools** (`ls cat cp mv
+mkdir rmdir rm touch stat` and friends). The canonical copies live in
+Eggkg-l as the `bash` package; the shell keeps eqbash builtins
+(`lf`, `showf`, `cdir`, `cfile`, `ccfile`, `save`, `delfile`, `deldir`,
+`pren`, `copy`, `move`, `del`) and **bash-name aliases** so the thin
+base stays fully usable, and `eggkg install bash` swaps in the full
+package. Text filters (`grep`, `wc`, `sort`, …) remain in the base.
 
-### 4. FAT32 baca-tulis yang persisten
-Driver ATA PIO (LBA28/48, MBR) + FAT32 read-write: LFN dengan 8.3
-mangling benar, FSInfo terjaga, direktori tumbuh on-demand,
-write-through per close, rollback bila I/O gagal, mini-fsck
-host-verified sampai 100% utilisasi. Disk auto-mount di `/mnt`; file
-hasil `mget` ke `/mnt` **tetap ada setelah reboot**. DOOM jalan
-full-speed langsung dari disk (`doom -iwad /mnt/doom1.wad`).
+### 4. Storage: block layer + AHCI (SATA)
+New generic block layer (`blk.cpp`, 8 fixed slots: PATA 0–3, SATA 4+,
+`hda`–`hdh` naming, bus-neutral MBR parsing) with a full **AHCI 1.x
+SATA driver** (`ahci.cpp`): ABAR/BAR5, GHC.AE, engine stop/start with
+CR/FR wait, DET/ATAPI checks, command list + FIS receive + PRDT DMA,
+READ/WRITE DMA (EXT) + FLUSH CACHE, self-healing port restart.
+PATA keeps the classic **ATA PIO** driver. FAT32 gains an in-kernel
+**formatter** (`fat32_mkfs`: MBR + type-0x0C whole-disk partition @
+LBA 2048, label EQUINOXBASE).
 
-### 5. Compiler C + libc di dalam OS
-`mtcc` meng-compile & menjalankan source C live di ring 3 (prelude
-`<morph.h>`/`<multitasking.h>`/`<fileio.h>`). libc subset di-render
-**lokal** di program (bukan round-trip ABI): printf/sprintf/snprintf
-hingga 5 argumen konversi (`%u` unsigned sejati), sscanf, ctype, string
-extras, qsort, rand — 54 tahap self-test lolos in-OS. Fungsi
-dideklarasikan-tak-terdefinisi kini gagal di "link" dengan nomor baris
-call-site pertama.
+### 5. Networking: Intel E1000
+New PCI NIC driver (`e1000.c`, `8086:100E/100F`): EEPROM MAC, RX ring
+32×2048 B, TX ring 8×16 B descriptors, read-to-clear ICR — behind the
+same `nic.c` registry as the NE2000 (adding a NIC = one struct + one
+registration). Boot-time driver selection via `system.ecf`
+(`[net] driver = ne2000|e1000|none`), wizard step [3/4] writes it;
+`make run-e1000` / `scripts/e1000_test.py`.
 
-### 6. Grafis per-task
-VESA 1360x768@32bpp. Setiap task punya *draw window* sendiri
-(`set_clip` #53) — putpixel/fillrect/line ter-clip; `draw_line` (#54)
-Bresenham focus-gated. Semantik canvas jujur: gambar pertama mensnapshot
-layar teks lalu membersihkan hitam; teks tetap termirror ke serial +
-cell mirror; console di-render ulang saat program exit.
+### 6. `Qfs` — the disk tool
+`Qfs -list-disk` (hda–hdh with size/label/state), `Qfs -t hdX -format
+fat32`, `Qfs -install-boot hdX` (GRUB `boot.img`+`core.img` staged in
+RAMFS `/equinox/bootimg/`). Paired with the `mount/umount` builtins and
+the recursive `copy`/`del` commands this is the manual install path.
 
-### 7. PCI + driver registry
-Enumerasi bus PCI (0xCF8/0xCFC, BAR, IRQ routing, rekursi bridge) saat
-boot — `lspci` menampilkan tabelnya. NIC diabstraksi registry
-(`kernel/net/nic.c`); NIC PCI yang dikenali tapi belum berdriver
-(e1000/pcnet32/eepro100) dilaporkan jujur, bukan didiamkan.
+### 7. Configuration: `.ecf` + `set` + eqshell scripts
+INI-lite config store (`ecf.c`) with the `set` builtin:
+`set`, `set <key> <val>`, `set list`, `-a` apply, `-w` write,
+`-d` register system config, `-b` base pivot, `-x` run `.es` script.
+`system.ecf` lives in `/equinox/conf/` (legacy `boot/` fallback,
+`active.conf` overlay). eqshell scripts start with `[Eqshell]`,
+journal to `/eqshell.log`. Schema keys: `net.driver`,
+`dependencies.bash`, `eggkg.server/mirror/local`.
 
----
+### 8. Build system: ruf v3 + `mtcc -make`
+Recipes gain real variables (`name := "bash"`), jobs and
+`copy/move ? to` install steps; `equinoxinstall -build` and `eggkg`
+share the same engine. mtcc itself: line-numbered undefined-reference
+errors, `%u` true unsigned, host/OS byte-identical output.
 
-## Fitur tambahan (tools release — 18 tools baru)
+### 9. Shell & desktop
+Shell: **pipes, glob, redirection, history**; eqbash builtins;
+`xxd`; `->` copy syntax; multi-line `save`. Desktop: **EquiX** vector
+desktop (ThorVG) with dynamic GUI arena (`guiarena.cpp`), LVGL apps,
+`desktop`/`tvgdemo`/`tvgbench` commands.
 
-Semua di-compile in-OS oleh `eqbuild`, dipanggil lewat dispatcher global
-yang sama dengan mtcc/snake:
+### 10. Memory
+Dynamic RAM top from the GRUB memory map (`paging_set_ram_top`,
+tables clamped 16–128 MB), demand-paged per-task arenas, **256 MB
+recommended** (`-m 256`, 64 MB minimum), region above `ram_top`
+deliberately unmapped.
 
-| Tool | Sorotan |
-| --- | --- |
-| `grep` | `-i -n -c -v`, multi-file (prefix `nama:`), mini-regex: `.` `X*` `^` `$` |
-| `head` / `tail` | N baris pertama/terakhir (`-n N`; tail ring 64×256) |
-| `wc` | `-l -w -c` (default ketiganya + nama file), binary-safe |
-| `sort` / `uniq` | bubble + early-exit di store 32 KB; `sort -r`; `uniq -c` grup bersebelahan |
-| `cut` | `-d DELIM -f LIST` (N, N-M, N-, daftar koma, escape `\t \n \0`) |
-| `tr` | map SET1→SET2 + `-d`, range (`a-z`), repeat-char-terakhir |
-| `rev` / `nl` | balik tiap baris / nomori baris `%6d` |
-| `more` | pager 23 baris per halaman, sembarang tombol lanjut, `q` keluar |
-| `find` | rekursif (depth 8), filter `-name SUBSTR` |
-| `which` | cari NAME/NAME.mrp di path sistem (urutan shell sendiri) |
-| `diff` | bandingkan baris per baris streaming, 20 diff pertama gaya `</>` |
-| `strings` / `cksum` | deret printable (minlen) / checksum 32-bit + ukuran, multi-file |
-| `basename` / `dirname` | pecah komponen path (pojok-pojok POSIX) |
+## Compatibility notes
 
-Ditambah 11 tools yang sudah ada: `ls cat cp mv rm mkdir rmdir touch
-stat fstest pipedemo`. Total **29**. Builtin `help` dihapus — command
-tidak dikenal dilaporkan apa adanya; daftar command ada di
-`docs/COMMANDS.md` dan README.
+- **Bash tools**: if you scripted against `ls/cat/cp` you will see the
+  builtins/aliases until `eggkg install bash` — behavior-compatible,
+  richer once installed.
+- **eqbuild (0.3)**: superseded by `equinoxinstall`; `-compile` /
+  `-build` cover the old flows.
+- **`boot/system.ecf`** → moved to `/equinox/conf/system.ecf` (legacy
+  path still read).
+- **Syscall table unchanged** (#0–#54, append-only) — userland from
+  0.3 rebuilds as-is.
 
-Fitur platform pendamping: syscall #49–#54 (`wait pipe meminfo spawn2
-setclip drawline`), `SYS_ECHILD`/`SYS_EPERM`, loader ELF32 statis
-(`elfdemo.elf`, exit status 42 via `spawn`+`wait`), `lspci`, `meminfo`,
-`wait [pid]`.
+## Known limitations
 
----
+- ATAPI (CD over AHCI) is detected and skipped, not mounted.
+- mtcc remains a C subset (no struct-by-value, no float, no switch).
+- ICMP `ping` does not traverse QEMU slirp; use `tcpping`.
+- `MAX_TASKS` = 8; fd table 16/task; single user (`root`).
+- The GUI arena assumes ≤128 MB mapped RAM (tables clamp); DMA
+  buffers are identity-mapped BSS — RAM-hungry additions need bounce
+  buffers.
 
-## Perbaikan bug akar (yang layak diceritakan)
+## Roadmap (post-0.4)
 
-1. **Scheduler "instant sleep"** — `schedule()` kembali ke task yang
-   baru mem-block dirinya sendiri saat tak ada task READY lain, lalu
-   fix-up BLOCKED→RUNNING membatalkan sleep. Kini: jalur idle
-   `hlt`-dengan-interrupt-on sampai interrupt mengubah keadaan;
-   `sleep(3000)` terukur tepat 300 tick / 3.0 s wall; nettask tak lagi
-   busy-spin 100% CPU.
-2. **ABI drift karena stale object** — makefile tanpa dependency header:
-   edit struct `Task` meninggalkan 38/46 object dengan layout lama
-   (scheduler membaca `clip_h` sebagai `page_dir` → triple fault).
-   Perbaikan: `-MMD -MP` + include `.d` + rebuild bersih.
-3. **Urutan canvas** — snapshot+clear dijalankan *setelah* draw pertama
-   sehingga menghapus draw itu sendiri. Kini mark sebelum piksel
-   pertama.
-4. **Heap kernel habis di tool ke-13** — 29 tools × ±34 KB `.mrp` +
-   modul boot memenuhi heap 2 MB dan terfragmentasi. Heap kini 2-region
-   (±3.1 MB) dengan guard adjacency antar-region di coalesce/realloc.
-5. **stdio slot vs raw fd** — prelude `fgetc/fread` bekerja di slot
-   tabel `fopen()`, bukan fd mentah `f_open()`; tool generasi pertama
-   senyap membaca EOF. Seluruh tools line-oriented kini konsisten pakai
-   `fopen/fgetc/fclose`.
-
-## Kualitas rilis
-
-- Regresi QEMU: **101/101 PASS** (4 suite: `regression_task3` 29,
-  `regression_task2` 12, `regression_v03` 31, `regression_multitask` 29)
-  — termasuk eqbuild 29/29, bukti piksel clip (159.677 px merah di
-  dalam jendela 400×400), libc 54/54 in-OS, soak 60 detik.
-- Parity compiler in-OS == host (byte-identical, ceksum cocok).
-- Smoke tools 22/22 + host pre-validation 29/29.
-
-## Batasan yang diketahui (jujur)
-
-- Stack user 1 MB tidak auto-grow (guard page mematikan task) — by design.
-- `MAX_TASKS` = 8; zombie memegang slot (zombie tertua "dicuri" saat
-  tabel penuh).
-- printf-family mtcc maksimal 5 argumen konversi per panggilan; sscanf
-  5 output pointer.
-- Pipe write yang memenuhi buffer lalu dibaca task yang sama =
-  self-deadlock (terdokumentasi di `pipedemo.c`).
-- Segmen ELF harus di `[0x800000, 0x2000000)`; heap task ELF fix 2 MB.
-- Clip window tidak diwariskan lintas spawn dan di-reset saat program
-  exit; piksel program grafis tidak dipertahankan setelah exit (console
-  teks di-render ulang).
-- `eqbuild` serial di task shell; tools hanya ada setelah dijalankan
-  (boot baru membawa source — sengaja, itu inti self-hosting).
-- Satu volume FAT32 mount pada satu waktu (`/mnt`), partisi primary MBR
-  saja.
-
-## Arah v0.4
-
-Fitur berat yang sengaja ditunda: preemption/SMP penuh, VFS generik,
-driver NIC PCI nyata (e1000), dan *mtcc meng-compile dirinya sendiri*
-(self-host compiler penuh). Daftar lengkap ada di
-`mrp_user/TARGETS.md` (FR tersisa Stage 4–5).
+- ATAPI/CDROM over AHCI; NCQ command scheduling.
+- Real multi-user + permissions; more packages (games data, toolchain).
+- Network: second NIC concurrent, UDP tools, larger TLS suite.
+- mtcc: structs by value, float, larger preprocessor.
+- Installer: partition-level (non-whole-disk) installs.

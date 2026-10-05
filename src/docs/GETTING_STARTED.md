@@ -1,160 +1,225 @@
-# Getting Started — Build & Menjalankan Equinox OS di QEMU
+# Getting Started — Building and Running Equinox OS
 
-Dokumen ini menjawab pertanyaan paling sering: *"command run QEMU-nya
-gimana?"* — lengkap dari nol (build) sampai semua variasi menjalankan OS,
-plus catatan troubleshooting.
+This document answers the most common question — *"how do I build and
+run it?"* — from zero: host prerequisites, every `make` target, every
+QEMU invocation variant, and what to do on the first boot. For
+installing the OS onto a persistent disk, see
+[INSTALL.md](INSTALL.md); for the package manager, see
+[PACKAGES.md](PACKAGES.md).
 
-## 1. Prasyarat (host Linux)
+## 1. Prerequisites (Linux host)
 
-| Kebutuhan | Keterangan |
+| Requirement | Notes |
 | --- | --- |
-| `g++` / `gcc` dengan `-m32` | atau cross toolchain `i686-elf-` |
-| `nasm` | assembler boot (`boot/start.asm`) |
-| `grub-mkrescue` + modul `i386-pc` | pembuat ISO bootable (butuh `xorriso`) |
-| `mtools` | pembuat `dist/disk.img` FAT32 |
-| Python 3 | script build & harness tes |
-| `libgcc.a` 32-bit | dari `gcc-multilib`, atau arahkan `LIBGCC32_DIR` |
+| `g++`/`gcc` with `-m32` | or a cross toolchain `i686-elf-` |
+| `nasm` | assembles `boot/start.asm` |
+| `grub-mkrescue` + `i386-pc` modules | builds the bootable ISO (needs `xorriso`) |
+| `mtools` | builds the FAT32 test images (`dist/disk.img`, `dist/equinox.img`) |
+| Python 3 | build helpers + QEMU regression harnesses |
+| 32-bit `libgcc.a` | from `gcc-multilib`, or point `LIBGCC32_DIR` at it |
+| `qemu-system-i386` | runs the OS |
 
-Debian/Ubuntu: `sudo apt install build-essential gcc-multilib nasm
-grub-pc-bin xorriso mtools python3`.
+Debian/Ubuntu one-liner:
 
-> Jika toolchain ada di lokasi kustom (di-extract tanpa root), point
-> `LIBGCC32_DIR` ke folder libgcc 32-bit dan `PATH` ke binari
-> `grub-mkrescue` — makefile otomatis memakai `/usr/lib/grub/i386-pc`
-> atau `~/tools/root/usr/lib/grub/i386-pc`.
+```sh
+sudo apt install build-essential gcc-multilib nasm grub-pc-bin xorriso \
+                 mtools python3 qemu-system-x86
+```
+
+> Custom toolchain location: point `LIBGCC32_DIR` at the folder holding
+> the 32-bit `libgcc.a` and add its `bin/` to `PATH`. The makefile
+> auto-detects `/usr/lib/grub/i386-pc` and `~/tools/root/usr/lib/grub/i386-pc`
+> for `grub-mkrescue`, and falls back to `grub-mkimage` from `PATH`.
 
 ## 2. Build
 
 ```sh
-make            # kernel.elf + dist/equinox.iso  (hasil utama)
-make mtcc       # pack compiler in-OS  -> dist/equinox/tools/mtcc.mrp
-make tools      # stage 29 source .c tools -> dist/equinox/tools/ (eqbuild source)
-make pack       # pack program mrp_user/*.cpp + games/*.cpp
-make doom       # build doomgeneric      -> dist/equinox/games/doom.mrp
-make diskimg    # disk uji FAT32 64 MB   -> dist/disk.img
-make test       # harness mtcc di host (tanpa QEMU)
+make            # kernel.elf + dist/equinox.iso   (the main artifact)
+make mtcc       # pack the in-OS compiler          -> dist/equinox/tools/mtcc.mrp
+make tools      # stage tool .c sources            -> dist/equinox/tools/
+make libc       # stage libc sources + headers     -> dist/equinox/libc/
+make pack       # pack mrp_user/*.cpp programs     -> .mrp
+make bootimg    # grub-mkimage boot.img + core.img -> RAMFS /equinox/bootimg
+make diskimg    # 64 MB FAT32 test disk            -> dist/disk.img
+make img        # EQUINOXBASE install image        -> dist/equinox.img
+make test       # host-side mtcc test harness (no QEMU)
 ```
 
-`make` saja sudah cukup untuk ISO lengkap: kernel + modul RAMFS +
-source tools + compiler. `dist/` mencerminkan layout RAMFS di dalam OS.
+`make` alone produces a complete ISO: kernel + RAMFS modules (tool and
+libc **sources**, mtcc.mrp, boot images). `dist/` mirrors the RAMFS
+layout inside the OS. Note that the ISO ships **sources, not binaries**
+— the userland is compiled *inside the OS* on first boot (see
+[SELF_HOSTING.md](SELF_HOSTING.md)).
 
-## 3. Menjalankan di QEMU
+## 3. Running in QEMU
 
-### 3a. Cara paling cepat — make
+### 3a. Fastest way — make targets
 
 ```sh
-make run        # ISO + jaringan user-mode (httpd terekspos di localhost:8080)
-make run-disk   # + disk FAT32 64 MB ter-attach (auto-mount di /mnt)
+make run         # ISO + user-mode networking (httpd reachable at localhost:8080)
+make run-disk    # + 64 MB FAT32 disk as primary master (auto-mounted at /mnt)
+make run-img     # + dist/equinox.img (EQUINOXBASE label -> promoted to /)
+make run-e1000   # install image + Intel E1000 PCI NIC instead of the NE2000
+make run-ahci    # disk hangs off an ich9-AHCI controller (SATA) instead of PIIX IDE
 ```
 
-### 3b. Command QEMU manual — ISO saja
+### 3b. Manual QEMU — ISO only
 
 ```sh
-qemu-system-i386 -m 64 -cdrom dist/equinox.iso \
+qemu-system-i386 -m 256 -cdrom dist/equinox.iso \
     -netdev user,id=net0,hostfwd=tcp::8080-:80 \
     -device ne2k_isa,netdev=net0,iobase=0x300,irq=9
 ```
 
-### 3c. Command QEMU manual — ISO + disk FAT32 (rekomendasi)
+### 3c. Manual QEMU — ISO + FAT32 disk (recommended)
 
 ```sh
-qemu-system-i386 -m 64 -boot order=d -cdrom dist/equinox.iso \
+qemu-system-i386 -m 256 -boot order=d -cdrom dist/equinox.iso \
     -drive file=dist/disk.img,format=raw,if=ide,index=0,media=disk \
     -netdev user,id=net0,hostfwd=tcp::8080-:80 \
     -device ne2k_isa,netdev=net0,iobase=0x300,irq=9
 ```
 
-### Penjelasan opsi
-
-| Opsi | Fungsi |
-| --- | --- |
-| `-m 64` | RAM 64 MB untuk guest — cukup (kernel heap ±3 MB, pool user terpisah, staging modul 12 MB) |
-| `-cdrom dist/equinox.iso` | boot dari ISO Equinox |
-| `-boot order=d` | boot dari CD-ROM dulu (varian disk) |
-| `-drive file=dist/disk.img,…,if=ide,index=0` | disk IDE primary master; partisi FAT32 pertama auto-mount di `/mnt` |
-| `-netdev user,id=net0` | jaringan user-mode slirp: guest `10.0.2.15`, gateway/host `10.0.2.2`, DNS `10.0.2.3` (DHCP otomatis saat boot) |
-| `hostfwd=tcp::8080-:80` | web server `httpd` di guest bisa dibuka dari browser host: `http://localhost:8080/` |
-| `-device ne2k_isa,netdev=net0,iobase=0x300,irq=9` | NIC NE2000 ISA (driver bawaan) |
-
-### 3d. Variasi lain yang berguna
+### 3d. Manual QEMU — SATA via AHCI and the E1000 NIC
 
 ```sh
-# Log serial (mirror debug console COM1) ke file — cara utama men-debug:
-qemu-system-i386 -m 64 -cdrom dist/equinox.iso -serial file:serial.log \
-    -netdev user,id=net0 -device ne2k_isa,netdev=net0,iobase=0x300,irq=9
+# SATA disk on an AHCI controller (QEMU ich9-ahci, 8086:2922):
+# the disk lands on ahci.0 port 0 -> block slot 4 -> Qfs name "hde"
+qemu-system-i386 -m 256 -boot order=d -cdrom dist/equinox.iso \
+    -device ahci,id=ahci \
+    -drive file=dist/disk.img,format=raw,if=none,id=hd0 \
+    -device ide-hd,drive=hd0,bus=ahci.0 \
+    -netdev user,id=net0,hostfwd=tcp::8080-:80 \
+    -device ne2k_isa,netdev=net0,iobase=0x300,irq=9
 
-# Kumpulkan log QEMU monitor sendiri (opsional):
-#   tambahkan: -monitor stdio   lalu ketik "info registers", "xp /8wx addr", dll.
-
-# Boot cepat tanpa jaringan (uji murni filesystem/multitasking):
-qemu-system-i386 -m 64 -cdrom dist/equinox.iso
+# Intel PRO/1000 PCI NIC (8086:100E) instead of the NE2000:
+qemu-system-i386 -m 256 -cdrom dist/equinox.iso \
+    -netdev user,id=net0 -device e1000,netdev=net0
 ```
 
-Catatan: ICMP `ping` tidak diteruskan oleh user-net QEMU — pakai
-`tcpping <host> [port]` dari dalam OS.
+### Option reference
 
-## 4. Hal pertama yang dilakukan setelah boot
+| Option | Purpose |
+| --- | --- |
+| `-m 256` | Guest RAM — **256 MB recommended** (kernel heap + module staging + GUI arena; 64 MB works but is tight) |
+| `-cdrom dist/equinox.iso` | Boot the Equinox ISO |
+| `-boot order=d` | Boot from CD-ROM first (disk variants) |
+| `-drive …,if=ide,index=0` | IDE primary master; the first FAT32 partition auto-mounts at `/mnt` |
+| `-device ahci,id=ahci` + `-device ide-hd,bus=ahci.0` | Attach the disk to the AHCI (SATA) controller instead — handled by the AHCI driver + block layer |
+| `-netdev user,id=net0` | slirp user-mode networking: guest `10.0.2.15`, gateway/host `10.0.2.2`, DNS `10.0.2.3` (DHCP runs at boot) |
+| `hostfwd=tcp::8080-:80` | The guest `httpd` is reachable from the host browser: `http://localhost:8080/` |
+| `-device ne2k_isa,…,iobase=0x300,irq=9` | NE2000 ISA NIC (default driver) |
+| `-device e1000,netdev=net0` | Intel PRO/1000 PCI NIC (E1000 driver, `8086:100E`) |
 
-Boot log gaya Linux `[ OK ]` akan lewat, lalu muncul prompt:
+### 3e. Useful variations
+
+```sh
+# Mirror the debug console (COM1) to a file — the primary debugging aid:
+qemu-system-i386 -m 256 -cdrom dist/equinox.iso -serial file:serial.log \
+    -netdev user,id=net0 -device ne2k_isa,netdev=net0,iobase=0x300,irq=9
+
+# QEMU monitor (optional): add -monitor stdio, then "info registers",
+# "xp /8wx addr", etc.
+
+# Pure filesystem/multitasking test, no networking:
+qemu-system-i386 -m 256 -cdrom dist/equinox.iso
+```
+
+Note: QEMU user-mode networking does not forward ICMP — use
+`tcpping <host> [port]` from inside the OS instead of `ping`.
+
+## 4. First steps after boot
+
+The Linux-style `[ OK ]` boot log scrolls by (mirrored to COM1), then
+the shell prompt appears:
 
 ```
 root::users / $
 ```
 
-Langkah penting #1 — **build userland-nya sendiri**:
+**Step 1 — build the userland** (the ISO carries sources, not binaries):
 
 ```
-root::users / $ eqbuild
-[eqbuild] 1/29  cat.c
-mtcc: wrote cat.mrp (35210 bytes)
-[eqbuild] 1/29  OK  cat.mrp built, source removed
-... (29 file)
-[eqbuild] 29 built, 0 failed
+root::users / $ equinoxinstall
 ```
 
-Setelah itu semua tools siap dipakai. Beberapa hal untuk dicoba:
+The 4-phase wizard builds every shipped tool with the in-OS compiler —
+pick `0)` *build in place* to skip the disk dance and just compile into
+RAMFS. Progress looks like (33 jobs: 20 tool sources + 13 libc modules,
+two parallel mtcc tasks):
+
+```
+[4/4] build userland from /equinox
+[info] : kompilator in-OS siap: mtcc.mrp (352104 bytes)
+[info] : libc  — 13 modul  di /equinox/libc (check-compile)
+[info] : tools — 20 sumber di /equinox/tools
+[info] : parallel pool: 2 compiler thread(s), 33 job(s) total
+[info] : [ 1/33] T1 libc/convert.c   -> convert.mrp    4120 B  module verified
+[info] : [14/33] T2 tools/cat.c      -> cat.mrp       35210 B  installed
+       ...
+summary — libc 13/13 verified, tools 20/20, 0 failed
+parallel build: 33 job(s) on 2 thread(s), wall 11.8 s
+```
+
+**Step 2 — install the bash package** (the classic coreutils are *not*
+bundled with the ISO; they arrive as a package, see
+[PACKAGES.md](PACKAGES.md)):
+
+```
+root::users / $ eggkg update && eggkg install bash -y
+```
+
+**Step 3 — explore:**
 
 ```sh
-ls                    # isi RAMFS root
-eqbuild               # (sudah) — 29 tools di-compile in-OS
-grep printf /test/hello.c
-mtcc /test/hello.c    # compile & run C langsung di dalam OS
-lspci                 # tabel PCI hasil enumerasi boot
-ps                    # daftar task; switch console: F1/F2
+ls /mnt                      # with a disk attached (run-disk / run-ahci)
+grep -n printf /test/hello.c | tr a-z A-Z    # pipes work out of the box
+mtcc /test/hello.c           # compile + run C, live, in the OS
+lspci                        # PCI table: PIIX/AHCI/E1000 as applicable
+ps                           # task table; F1/F2 switch consoles
 mget https://raw.githubusercontent.com/torvalds/linux/master/README
-doom -iwad /mnt/doom1.wad    # DOOM langsung dari disk FAT32
+doom -iwad /mnt/doom1.wad    # DOOM straight off the FAT32 disk
 ```
 
-Dengan disk ter-attach (`run-disk`): `ls /mnt`, `cat /mnt/README.TXT`,
-`cd /mnt && mget http://10.0.2.2:8022/file` (unduh langsung ke disk,
-persisten antar reboot), `doom -iwad /mnt/doom1.wad`.
+## 5. Controls
 
-## 5. Kontrol & interaksi
-
-| Tombol | Fungsi |
+| Key | Function |
 | --- | --- |
-| `F1` / `F2` | pindah console virtual (tiap console punya task/shell sendiri) |
-| Keyboard PS/2 | input shell, editor, game (WASD + mouse untuk DOOM) |
-| `Ctrl+Alt+G` (QEMU) | lepas/masang mouse ke guest |
+| `F1` / `F2` | Switch virtual console (each has its own task/shell) |
+| PS/2 keyboard | Shell, editor, games |
+| Mouse (PS/2) | LVGL desktop + DOOM |
+| `Ctrl+Alt+G` (QEMU) | Grab/release mouse into the guest |
 
 ## 6. Troubleshooting
 
-| Gejala | Sebab & solusi |
+| Symptom | Cause & fix |
 | --- | --- |
-| `boot failed: could not read from CDROM` | `grub-mkrescue` memakai platform salah / modul `i386-pc` tidak ketemu — pastikan paket grub-pc-bin terpasang; makefile otomatis memakai `-d` ke folder `i386-pc` bila ada |
-| Link error `-lgcc` | `libgcc.a` 32-bit tidak ketemu — install `gcc-multilib` atau set `LIBGCC32_DIR=.../32` |
-| `error: unknown keyword` di make | pastikan `make` (GNU make) dan tab recipe tidak rusak — edit makefile via editor yang menjaga TAB |
-| Boot hang / layar hitam | cek `serial.log` (boot melaporkan semua tahap ke COM1); coba `-vga std` |
-| Tidak ada jaringan | pastikan opsi `-netdev`/`-device` satu baris utuh; cek banner DHCP saat boot |
-| Tools "Unknown command" | tools baru tersedia setelah `eqbuild` dijalankan (boot baru membawa source, bukan binari — itu desain self-hosting) |
+| `boot failed: could not read from CDROM` | `grub-mkrescue` used the wrong platform — make sure `grub-pc-bin` is installed (`i386-pc` modules); the makefile passes `-d` automatically when the folder exists |
+| Link error on `-lgcc` | 32-bit `libgcc.a` missing — install `gcc-multilib` or set `LIBGCC32_DIR=.../32` |
+| `missing separator` from make | A text editor converted recipe TABs to spaces — restore real TABs (recipes must start with TAB) |
+| Boot hang / black screen | Check `serial.log` (every boot stage reports to COM1); try `-vga std` |
+| No network | Keep `-netdev`/`-device` on one line; check the DHCP banner at boot; for E1000 use `make run-e1000` or `-device e1000`; verify `[net] driver` in `system.ecf` (see [CONFIGURATION.md](CONFIGURATION.md)) |
+| Tools print "Unknown command" | Run `equinoxinstall` first — a fresh boot carries sources, not binaries (that is the self-hosting design) |
+| `ls`/`cat`/`cp` behave like the simple builtins | The full coreutils arrive with `eggkg install bash`; until then the shell builtins/aliases cover the basics |
+| Disk not visible | Plain IDE: `/mnt` after `run-disk`. AHCI/SATA: `make run-ahci`, disk appears as `hde` — check with `Qfs -list-disk` |
 
-## 7. Harness tes otomatis (opsional)
+## 7. Automated test suites (optional)
 
 ```sh
-python3 scripts/regression_task3.py      # suite utama v0.3 (2 part otomatis)
-python3 scripts/regression_task2.py      # proses/memori/ELF/pipe
-python3 scripts/regression_v03.py        # core syscall + tools
-python3 scripts/regression_multitask.py  # canvas/game/F1-F2/DOOM
+make test            # host-side mtcc harness (no QEMU)
+make test-e1000      # E1000 bring-up: lspci 8086:100E, DHCP, mget over PCI NIC
+make test-ahci       # SATA via AHCI: detect, mount, byte-exact I/O, reboot persistence
+make test-wizard     # interactive equinoxinstall on a blank disk -> boots as /
+make test-ecf        # set builtin, eqgui editor, system.ecf steers net driver
+make test-install    # manual install path (Qfs, mount, copy, set -x scripts)
+make test-img        # EQUINOXBASE base volume promoted to /, survives reboot
+make test-mnt        # equinoxinstall onto a plain FAT32 volume mounted at /mnt
+
+python3 scripts/regression_task3.py      # v0.3 core suite (boot, tools, gfx, libc, soak)
+python3 scripts/regression_task2.py      # processes/memory/ELF/pipe
+python3 scripts/regression_v03.py        # syscalls + tools
+python3 scripts/regression_multitask.py  # canvas/games/F1-F2/DOOM
 ```
 
-Total 101 pemeriksaan; semua harus PASS pada ISO rilis.
+All suites must PASS on a release ISO — 101 core checks plus the
+dedicated driver/installer suites.

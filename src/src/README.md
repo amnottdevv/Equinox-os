@@ -1,22 +1,5 @@
 # Equinox OS
 
-<p align="center">
-  <img src="https://img.shields.io/badge/architecture-i686%20%2F%2032--bit-6f42c1?style=for-the-badge" alt="i686 32-bit" />
-  <img src="https://img.shields.io/badge/kernel-monolithic-8A4FFF?style=for-the-badge" alt="Monolithic kernel" />
-  <img src="https://img.shields.io/badge/boot-GRUB%20Multiboot-2D2D2D?style=for-the-badge" alt="GRUB Multiboot" />
-  <img src="https://img.shields.io/badge/language-C%2FC%2B%2B%2FASM-00599C?style=for-the-badge" alt="C C++ Assembly" />
-</p>
-
-<p align="center">
-  <img src="https://img.shields.io/github/license/equinoxosproject/Equinox-os?style=flat-square" alt="License" />
-  <img src="https://img.shields.io/github/repo-size/equinoxosproject/Equinox-os?style=flat-square" alt="Repository size" />
-  <img src="https://img.shields.io/github/commit-activity/y/equinoxosproject/Equinox-os?style=flat-square" alt="Commit activity" />
-  <img src="https://img.shields.io/github/last-commit/equinoxosproject/Equinox-os?style=flat-square" alt="Last commit" />
-  <a href="https://github.com/equinoxosproject/Equinox-os/actions/workflows/sync-release-source.yaml"><img src="https://github.com/equinoxosproject/Equinox-os/actions/workflows/sync-release-source.yaml/badge.svg" alt="Release source sync" /></a>
-</p>
-
-# Equinox OS
-
 Equinox OS is a 32-bit x86 hobby operating system with a monolithic kernel written in C++, C and NASM. It boots through GRUB Multiboot into a VESA 1360x768 linear framebuffer, runs ring-3 processes with demand paging, and — the part that defines the project — **compiles its own userland from C source inside the OS** with its built-in compiler, `mtcc`.
 
 Beyond the kernel, the system ships with a working set of everyday OS facilities: a shell with pipes, globbing, redirection and scripting; a package manager (`eggkg`) that fetches, compiles and installs software from a Git-hosted package repository over HTTPS; a validated configuration system (`.ecf` files with a `set` builtin); a FAT32 disk tool (`Qfs`) that can format a disk and install a bootable GRUB; a TCP/IP stack with an HTTPS client and server; an LVGL desktop plus a ThorVG-powered vector desktop; and DOOM running from a demand-paged arena off the FAT32 disk.
@@ -169,7 +152,7 @@ kernel/shell.cpp     prompt "root::users / $"   (eqbash: builtins + global tool 
 
 The kernel is monolithic. Every subsystem mirrors its log to serial COM1, which makes the whole system scriptable from the host (the regression suites drive QEMU this way). The boot log lists each subsystem as `[ OK ]` together with every file loaded into the RAM filesystem.
 
-More detail lives in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), [`docs/GETTING_STARTED.md`](docs/GETTING_STARTED.md) and the rest of the English documentation suite in [`docs/`](docs/README.md) (installation, packages, Qfs, configuration, drivers, networking, self-hosting, syscalls, commands, release notes).
+More detail lives in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and [`docs/GETTING_STARTED.md`](docs/GETTING_STARTED.md) (Indonesian).
 
 ---
 
@@ -291,7 +274,7 @@ The libc lives in `/equinox/libc` as **13 modules** spliced together by the `<mo
 
 - The compiler emits a **closed instruction set**. A host-side x86-32 interpreter (`scripts/tcc_host_test/`, run with `make test`) executes exactly that set, so any codegen bug outside it is caught immediately.
 - **Parity:** the in-OS compiler produces byte-identical `.mrp` images to the host build of the same source.
-- Documentation: [`mrp_user/TCC.md`](mrp_user/TCC.md), [`mrp_user/workflow_mrp.md`](mrp_user/workflow_mrp.md), [`src/docs/EGGKG.md`](src/docs/EGGKG.md) (eggkg design notes), [`docs/PACKAGES.md`](docs/PACKAGES.md) (user-facing package guide).
+- Documentation: [`mrp_user/TCC.md`](mrp_user/TCC.md), [`mrp_user/workflow_mrp.md`](mrp_user/workflow_mrp.md), [`docs/EGGKG.md`](docs/EGGKG.md).
 
 ---
 
@@ -561,7 +544,7 @@ Negative results are errnos (`SYS_ENOENT`, `SYS_EBADF`, `SYS_EFAULT`, `SYS_EBUSY
 ## Networking
 
 ```text
-ne2k_isa / e1000 (0x300 / IRQ 9) -> RX ring (drained outside the IRQ) -> lwIP 2.1.3 (NO_SYS) -> DHCP / DNS / ICMP / TCP
+ne2k_isa (0x300 / IRQ 9) -> RX ring (drained outside the IRQ) -> lwIP 2.1.3 (NO_SYS) -> DHCP / DNS / ICMP / TCP
                                                         |
                           mget (HTTP + HTTPS client)   +   httpd (server on :80)
                           eggkg in-process fetch       +   BearSSL TLS 1.2, 9 root CAs
@@ -808,10 +791,8 @@ test/            C sample programs for mtcc
 mtcc.c           the in-OS C compiler (canonical source, incl. -make/ruf v3)
 scripts/         image builder, QEMU regression harnesses, bump_version.py, host mtcc tests
 third_party/     lwIP 2.1.3, BearSSL (with root-CA anchors)
-docs/            user documentation (English): getting started, install,
-                 packages, Qfs, configuration, drivers, networking,
-                 self-hosting, syscalls, commands, architecture, release notes
-src/docs/        in-tree design notes kept with the source (eggkg design)
+docs/            user documentation (Indonesian): getting started, commands,
+                 architecture, eggkg, release notes
 dist/            build output: equinox.iso, kernel.elf, disk.img, staged sources, repo/
 ```
 
@@ -829,3 +810,4 @@ dist/            build output: equinox.iso, kernel.elf, disk.img, staged sources
 | `doom1.wad` | shareware DOOM data | id Software shareware terms |
 
 Eggkg-l (the default package repository) is a separate repository: [github.com/amnottdevv/Eggkg-l](https://github.com/amnottdevv/Eggkg-l).
+

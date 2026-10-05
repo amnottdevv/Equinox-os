@@ -1,148 +1,165 @@
-# Referensi Command — Shell & Tools Userland
+# Command reference — the eqshell (0.4 Beta)
 
-Prompt shell: `root::users / $`. Command **userland** (tabel di bawah
-dengan tanda ✓) adalah program `.mrp` ring-3 yang di-compile **di dalam
-OS** oleh `eqbuild` — jalankan `eqbuild` dulu setelah boot, lalu semua
-tools siap dipakai. Command lain adalah builtin kernel.
+Prompt: `root::users / $`. Commands marked **✓ userland** are ring-3
+`.mrp` programs compiled **inside the OS** (by `equinoxinstall`, or by
+`eggkg install bash` for the coreutils). Everything else is a builtin
+in the kernel shell.
 
-Sintaks umum: `command [argumen...]`; path absolut (`/mnt/...`) maupun
-relatif (`./file`, `dir/file`) diterima; glob/pipes antar-command belum
-didukung (pipe ada di API syscall, lihat `pipedemo`).
-
-## 1. Filesystem — navigasi & manipulasi
-
-| Command | Jenis | Fungsi / contoh |
-| --- | --- | --- |
-| `ls [dir]`, `ls -l` | builtin | isi direktori (RAMFS dan `/mnt` sama saja) — `ls /mnt`, `ls -l` |
-| `cd <dir>` | builtin | pindah direktori — `cd /equinox/tools` |
-| `pwd` | builtin | direktori kerja sekarang |
-| `tree [dir]` | builtin | pohon direktori rekursif |
-| `cat <file>` | ✓ | tampilkan isi file — `cat /mnt/README.TXT` |
-| `cp <src> <dst>` | ✓ | copy file (RAMFS / disk) |
-| `mv <src> <dst>` | ✓ | pindah / rename |
-| `rm <file>` | builtin/✓ | hapus file (write-through di `/mnt`) |
-| `mkdir <dir>`, `rmdir <dir>` | builtin/✓ | buat / hapus direktori |
-| `touch <file>` | ✓ | buat file kosong / update waktu |
-| `stat <file>` | ✓ | metadata file (ukuran, tipe, waktu) |
-| `cfile <name>`, `ccfile <name> <text>` | builtin | buat file / buat dengan isi satu baris |
-| `save <name> << "text"` | builtin | buat/timpa file dengan teks multi-baris |
-| `cdir <name>` | builtin | buat direktori |
-| `edit <file>` | builtin | editor teks bawaan (arrow/PgUp/PgDn/Home/End/Tab; **Ctrl+S** simpan, **Ctrl+Q** keluar) |
-| `xxd <file> [n]` | builtin | hex dump n byte pertama (default 64) — `xxd /mnt/bin.dat 32` |
-| `mount` / `umount` | builtin | pasang / lepas volume FAT32 di `/mnt` |
-| `diskinfo` | builtin | drive ATA + detail volume (layout, free cluster, arena) |
-| `fm` | builtin | file manager GUI (LVGL + mouse) |
-
-## 2. Tools teks (18 tools baru + set file lama — semua ✓ eqbuild)
-
-| Command | Fungsi | Contoh |
-| --- | --- | --- |
-| `grep [-i] [-n] [-c] [-v] PATTERN FILE...` | cari baris; mini-regex `.` `X*` `^` `$`; multi-file (prefix `nama:`) | `grep -n printf /test/hello.c` |
-| `head [-n N] FILE` | N baris pertama (default 10) | `head -n 5 /test/libc.c` |
-| `tail [-n N] FILE` | N baris terakhir (default 10, maks 64) | `tail -n 3 serial.log` |
-| `wc [-l -w -c] FILE` | hitung baris/kata/byte | `wc -l /test/hello.c` |
-| `sort [-r] FILE` | urutkan baris (asc/desc) | `sort -r names.txt` |
-| `uniq [-c] FILE` | hapus duplikat bersebelahan (+ hitung) | `sort x.txt` lalu `uniq -c x.txt` |
-| `cut -d DELIM -f LIST FILE` | ambil kolom — LIST: `N`, `N-M`, `N-`, koma | `cut -d : -f 1 users.txt` |
-| `tr SET1 SET2 FILE` / `tr -d SET FILE` | translasi / hapus karakter, range `a-z` didukung, escape `\n \t \r \0` | `tr a-z A-Z data.txt` |
-| `rev FILE` | balik tiap baris | `rev data.txt` |
-| `nl FILE` | nomori baris (`%6d`) | `nl /test/hello.c` |
-| `more FILE` | pager 23 baris/halaman — sembarang tombol = lanjut, `q` = keluar | `more /test/libc.c` |
-| `find [dir] [-name SUBSTR]` | cari rekursif (depth 8) | `find / -name mrp` |
-| `which NAME` | lokasi command di path sistem (`.` `/` `/bin` `/equinox/tools` `/equinox/games`) | `which grep` |
-| `diff FILE1 FILE2` | bandingkan baris (20 diff pertama, gaya `</>`) | `diff a.txt b.txt` |
-| `strings FILE [minlen]` | deret karakter printable | `strings doom.mrp 8` |
-| `cksum FILE...` | checksum 32-bit + ukuran | `cksum /equinox/tools/head.mrp` |
-| `basename PATH` | nama file dari path | `basename /mnt/doom1.wad` → `doom1.wad` |
-| `dirname PATH` | direktori dari path | `dirname /mnt/doom1.wad` → `/mnt` |
-| `fstest` | ✓ suite 24 uji syscall file | `fstest` |
-| `pipedemo` | ✓ demo pipe + wait (child menulis, parent membaca) | `pipedemo` |
-
-## 3. Multitasking & proses
-
-| Command | Fungsi |
-| --- | --- |
-| `ps` | tabel task: pid, nama, state (RUNNING/READY/SLEEP/BLOCKED/DEAD), CPU, memori |
-| `kill <pid>` | matikan task |
-| `switch <n>` | pindah console virtual (sama dengan tombol **F1**/**F2**) |
-| `wait [pid]` | block sampai child exit (`wait` = child mana pun) — status exit ikut tercetak |
-| `spawn <path.mrp> [args]` | buat task baru dengan args |
-| `yield` | beri CPU ke task berikutnya |
-| `sleep <ms>` | tidur task (sudah presisi per tick — 3000 ms = 300 tick) |
-| `meminfo` | pool user: total/free, halaman faulted per task, reserved vs faulted, zombie |
-
-## 4. Compiler & self-hosting
-
-| Command | Fungsi |
-| --- | --- |
-| `mtcc <file.c>` | compile **dan jalankan** source C di dalam OS — `mtcc /test/hello.c` |
-| `eqbuild` | **self-hosting**: compile semua `/equinox/tools/*.c` (29 tools) dengan mtcc in-OS, install `.mrp`, hapus source; log per file `i/29 OK nama` |
-| `run <x.mrp>` / `./x.mrp` / `./x.elf` | jalankan program MRP / ELF32 di ring 3 |
-| `elfdemo.elf` | demo loader ELF statis (exit status 42, coba `spawn` + `wait`) |
-
-## 5. Hardware & introspeksi
-
-| Command | Fungsi |
-| --- | --- |
-| `lspci` | tabel bus PCI hasil enumerasi boot: vendor/device, class, BAR, IRQ |
-| `cpu` | info CPU (CPUID: vendor, fitur) |
-| `info` | banner sistem: versi, RAM, uptime |
-| `memmap` | peta memori fisik / area kernel |
-| `malloc` / `alloc <n>` / `free <addr>` | status & uji heap kernel (total ±3.1 MB, 2-region) |
-| `syscalls` | daftar syscall #0–#54 dengan signature |
-| `sctest` | self-test jalur syscall |
-| `ring` / `ringstats` | uji & statistik ring buffer |
-| `tick` | nilai & laju timer (100 Hz) |
-| `random` / `math <expr>` / `calc <expr>` | RNG & kalkulator ekspresi |
-| `hex <n>` / `dec <n>` | konversi hex⇄desimal |
-| `testconv` `teststr` `testvector` | self-test konversi/string/vector libc |
-| `mouse` | uji driver mouse PS/2 |
-
-## 6. Jaringan
-
-| Command | Fungsi |
-| --- | --- |
-| `ifconfig` | status interface (IP dari DHCP, MAC, statistik) |
-| `ping <host>` | ICMP echo — di QEMU user-net ICMP tidak diteruskan, pakai `tcpping` |
-| `tcpping <host> [port]` | probe TCP + RTT |
-| `dns <hostname>` | resolusi nama via DNS (10.0.2.3) |
-| `mget <url> [-port <n>]` | unduh HTTP/**HTTPS** ke direktori sekarang; ikuti redirect (maks 3) — `mget https://github.com/octocat/Hello-World` |
-| `httpd` | web server :80 (status + file RAMFS) — dari host: `http://localhost:8080/` |
-| `nettask` | status kernel network task |
-| `netdbg` | statistik/diagnosa jaringan |
-
-## 7. Grafis, GUI, game & multimedia
-
-| Command | Fungsi |
-| --- | --- |
-| `gui` | buka desktop LVGL (settings, editor, file manager) |
-| `settings` | panel pengaturan GUI |
-| `color <n>` | set warna teks |
-| `clock` | jam/tanggal (RTC) |
-| `doom [args]` | DOOM (perlu `doom1.wad`, shareware) — `doom -iwad /mnt/doom1.wad` |
-| `snake` / `breakout` / `pong` | game `.mrp` Libgame (jalan dengan `run` atau langsung namanya) |
-| `beep` / `song` | uji audio PC speaker |
-
-## 8. Lain-lain
-
-| Command | Fungsi |
-| --- | --- |
-| `echo <teks>` | cetak teks |
-| `clear` | bersihkan layar |
-| `reboot` | reboot mesin |
-| `panic [teks]` | uji panic handler (sengaja) |
-| `help` | *(dihapus di v0.3)* — daftar command ada di dokumen ini & README |
-
-## Contoh sesi lengkap
+The shell supports **pipes** (`|`), **output/input redirection**
+(`>`, `<`), **globbing** (`*`) and history — the text toolset is
+pipe-ready out of the box:
 
 ```sh
-root::users / $ eqbuild                 # 1. build 29 tools in-OS
-root::users / $ mtcc /test/hello.c      # 2. compile & run C live
-root::users / $ grep -n printf /test/hello.c
-root::users / $ ls /mnt                 # 3. disk FAT32 ter-mount
-root::users / $ cd /mnt && save catatan.txt << "tes persisten"
-root::users / $ cat catatan.txt
-root::users / $ mget http://10.0.2.2:8022/data.json
-root::users / $ ps                      # 4. lihat task; F1/F2 ganti console
+grep -n printf /test/hello.c | tr a-z A-Z > /mnt/out.txt
+```
+
+> **Thin base ISO**: the classic coreutils (`ls cat cp mv rm mkdir
+> rmdir touch stat` as full tools) are **not bundled** — they arrive
+> with `eggkg install bash` ([PACKAGES.md](PACKAGES.md)). The shell
+> ships *eqbash builtins* (`lf`, `showf`, `cdir`, `cfile`, `copy`,
+> `del`, …) plus **bash-name aliases** (`mkdir`, `touch`, `rm`, `cp`,
+> …) so old reflexes keep working until the package lands; after the
+> install, the package tools take over via the system path.
+
+## 1. Filesystem — navigation & files
+
+| Command | Type | Function / example |
+| --- | --- | --- |
+| `ls [dir]`, `lf [dir]` | builtin | list directory (RAMFS and `/mnt` alike); `ls -l` for details |
+| `cd <dir>`, `pwd` | builtin | change / print working directory |
+| `tree [dir]` | builtin | recursive directory tree |
+| `cat <file>`, `showf <file>` | builtin | print file (absolute paths OK: `cat /eqshell.log`) |
+| `cfile <name>`, `ccfile <name> <text>` | builtin | create file / create with one line of content |
+| `touch <name>` | builtin | alias of `cfile` (empty file) |
+| `save <name> << "text"` | builtin | create/overwrite a file with multi-line text (ends on an empty line) |
+| `edit <file>` | builtin | full-screen editor (arrows/PgUp/PgDn/Home/End/Tab; **Ctrl+S** save, **Ctrl+Q** quit) |
+| `copy SRC [->] DST` | builtin | copy files **and trees**; glob (`*`); destination dirs auto-created |
+| `cp SRC DST` | builtin | alias of `copy` |
+| `move SRC DST` | builtin | move / rename |
+| `delfile <name>`, `rm <name>` | builtin | delete one file (not recursive) |
+| `deldir <name>`, `rmdir <name>` | builtin | delete an empty directory |
+| `del PATH` | builtin | delete a file **or tree** recursively |
+| `cdir <name>`, `mkdir <name>` | builtin | create a directory |
+| `pren <old> <new>` | builtin | rename |
+| `xxd <file> [n]` | builtin | hex dump of the first n bytes (default 64) |
+| `mount hdX` / `umount hdX` | builtin | attach / detach a FAT32 volume at `/mnt` |
+| `diskinfo` | builtin | drive + volume details |
+| `fm`, `eqgu` | builtin | GUI file manager / settings+editor (LVGL) |
+
+## 2. Text tools (✓ userland, after `equinoxinstall`)
+
+| Command | Function | Example |
+| --- | --- | --- |
+| `grep [-i] [-n] [-c] [-v] PAT FILE…` | search lines; mini-regex `.` `X*` `^` `$` | `grep -n printf /test/hello.c` |
+| `head [-n N] FILE` / `tail [-n N] FILE` | first/last N lines (default 10) | `tail -n 3 serial.log` |
+| `wc [-l -w -c] FILE` | count lines/words/bytes | `wc -l /test/hello.c` |
+| `sort [-r] FILE` | sort lines asc/desc | `sort -r names.txt` |
+| `uniq [-c] FILE` | drop adjacent duplicates | `sort x \| uniq -c x` |
+| `cut -d D -f LIST FILE` | extract fields (`N`, `N-M`, `N-`, commas) | `cut -d : -f 1 users.txt` |
+| `tr SET1 SET2 FILE` / `tr -d SET FILE` | translate / delete chars; ranges `a-z`; escapes `\n \t \r \0` | `tr a-z A-Z data.txt` |
+| `rev FILE` | reverse each line | `rev data.txt` |
+| `nl FILE` | number lines | `nl /test/hello.c` |
+| `more FILE` | pager, 23 lines/page, `q` quits | `more /test/libc.c` |
+| `find [dir] [-name SUB]` | recursive search (depth 8) | `find / -name mrp` |
+| `which NAME` | resolve through the system path | `which grep` |
+| `diff F1 F2` | line compare (first 20, `</>` style) | `diff a.txt b.txt` |
+| `strings FILE [minlen]` | printable runs | `strings doom.mrp 8` |
+| `cksum FILE…` | 32-bit checksum + size | `cksum cat.mrp` |
+| `basename PATH` / `dirname PATH` | path splitting | `dirname /mnt/doom1.wad` |
+| `fstest` | 24-check syscall/file suite | `fstest` |
+| `pipedemo` | pipe + wait demo (child writes, parent reads) | `pipedemo` |
+
+## 3. Processes
+
+| Command | Function |
+| --- | --- |
+| `ps` | task table: pid, name, state, CPU, memory |
+| `kill <pid>` | terminate a task |
+| `wait [pid]` | block until a child exits; prints its status |
+| `spawn <x.mrp> [args]` | start a new ring-3 task with args |
+| `run <x.mrp>` / `./x.mrp` / `./x.elf` | run an MRP / ELF32 program |
+| `yield` | give up the CPU slice |
+| `sleep <ms>` | tick-precise sleep |
+| `switch <n>` | switch virtual console (same as F1/F2) |
+| `meminfo` | user pool: total/free, per-task faulted/reserved, zombies |
+
+## 4. Compiler, self-hosting, packages
+
+| Command | Function |
+| --- | --- |
+| `equinoxinstall` | **the installer wizard** — disk → layout → NIC → build userland in-OS (see [INSTALL.md](INSTALL.md)) |
+| `equinoxinstall -compile <dir>` | compile userland from `<dir>/libc` + `<dir>/tools` only |
+| `equinoxinstall -build <ruf\|name\|*.ruf>` | build via ruf v3 recipe / one tool / glob |
+| `mtcc <file.c>` | compile **and run** C in the OS — `mtcc /test/hello.c` |
+| `mtcc -c <file.c>` / `mtcc -make <file.ruf>` | compile only / run a build recipe ([SELF_HOSTING.md](SELF_HOSTING.md)) |
+| `eggkg update\|install\|remove\|list\|search\|info\|sync` | package manager ([PACKAGES.md](PACKAGES.md)) — `eggkg install bash` brings the coreutils |
+| `set …` | configuration store + eqshell runner ([CONFIGURATION.md](CONFIGURATION.md)) |
+| `Qfs -list-disk\|-format\|-install-boot` | disk tool ([QFS.md](QFS.md)) |
+
+## 5. Hardware & introspection
+
+| Command | Function |
+| --- | --- |
+| `lspci` | PCI table (bus/dev/fn, vendor:device, class, IRQ, BARs) |
+| `cpu` | CPUID info (vendor, features) |
+| `info` | banner: version, RAM, uptime |
+| `memmap` | physical memory map / kernel regions |
+| `malloc` / `alloc <n>` / `free <addr>` | kernel heap status & probe |
+| `syscalls` | live syscall table #0–#54 |
+| `sctest` | syscall path self-test |
+| `ring` / `ringstats` | ring-buffer test & statistics |
+| `tick` | timer value & rate (100 Hz) |
+| `mouse` | PS/2 mouse test |
+| `random` / `math <expr>` / `calc <expr>` | RNG, expression evaluator |
+| `hex <n>` / `dec <n>` | hex⇄dec conversion |
+| `testconv` `teststr` `testvector` | libc self-tests |
+| `clock` | RTC time/date |
+
+## 6. Networking
+
+| Command | Function |
+| --- | --- |
+| `ifconfig` | driver, MAC, DHCP lease, counters |
+| `ping <host>` | ICMP — not forwarded by QEMU slirp; use `tcpping` |
+| `tcpping <host> [port]` | TCP probe + RTT |
+| `dns <host>` | resolve via DNS |
+| `mget <url> [-port n]` | HTTP/**HTTPS** download (redirects ≤3) |
+| `httpd` | web server :80 (status + RAMFS) — host: `http://localhost:8080/` |
+| `nettask` / `netdbg` | network task / stack diagnostics |
+
+## 7. Graphics, desktop, games & audio
+
+| Command | Function |
+| --- | --- |
+| `gui` | LVGL desktop (settings, editor, file manager) |
+| `desktop` | **EquiX** — the ThorVG vector desktop |
+| `tvgdemo` / `tvginfo` / `tvgbench` | ThorVG renderer demos/benchmark |
+| `settings` | settings panel |
+| `color <n>` | text color |
+| `doom [args]` | DOOM (`doom -iwad /mnt/doom1.wad`) |
+| `beep` / `song` | PC speaker tests |
+
+## 8. Misc
+
+| Command | Function |
+| --- | --- |
+| `echo <text>` | print |
+| `clear` | clear screen |
+| `reboot` | reboot the machine |
+| `panic [text]` | deliberate panic-handler test |
+
+## Example session
+
+```sh
+root::users / $ equinoxinstall                 # 1. build the userland in-OS
+root::users / $ eggkg update && eggkg install bash -y   # 2. coreutils
+root::users / $ mtcc /test/hello.c             # 3. compile & run C live
+root::users / $ grep -n printf /test/hello.c | tr a-z A-Z
+root::users / $ Qfs -list-disk                 # 4. disks (PATA + SATA)
+root::users / $ mount hde && ls /mnt           #    SATA disk via AHCI
+root::users / $ cd /mnt && save note.txt << "persisted across reboots"
+root::users / $ mget https://github.com/octocat/Hello-World
+root::users / $ ps                             # 5. tasks; F1/F2 consoles
+root::users / $ set net.driver e1000 && set -w /equinox/conf/system.ecf
 root::users / $ doom -iwad /mnt/doom1.wad
 ```
