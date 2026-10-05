@@ -92,6 +92,7 @@ nav:
     - RELEASE_NOTES.md
     - Historical Release: Release/0.1_beta.md
     - All Doc Links: nav.md
+    - MTCC_API.md
     - FAQ.md
   - Configuration:
     - CONFIGURATION.md
