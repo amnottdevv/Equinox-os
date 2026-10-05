@@ -8,18 +8,44 @@ edit_uri: edit/main/docs/
 theme:
   name: material
   language: en
+  logo: image/equinox_info.png
+  favicon: image/equinox_info.png
   palette:
-    scheme: slate
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: deep purple
+      accent: lime
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: deep purple
+      accent: lime
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+  font:
+    text: Roboto
+    code: JetBrains Mono
   features:
     - navigation.instant
+    - navigation.instant.progress
     - navigation.tracking
     - navigation.tabs
+    - navigation.tabs.sticky
     - navigation.sections
     - navigation.expand
     - navigation.path
+    - navigation.top
     - toc.follow
+    - toc.integrate
     - content.code.copy
     - content.code.select
+    - content.tabs.link
+    - content.tooltips
+    - search.suggest
+    - search.highlight
 
 plugins:
   - search:
@@ -33,22 +59,52 @@ markdown_extensions:
   - pymdownx.tabbed:
       alternate_style: true
   - pymdownx.details
-  - toc:
-      permalink: true
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+  - admonition
+  - footnotes
+  - attr_list
   - md_in_html
   - tables
+  - toc:
+      permalink: true
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/amnottdevv/Equinox-os
+  generator: false
 
 nav:
-  - Home: README.md
-  - Getting Started: GETTING_STARTED.md
-  - Installation: INSTALL.md
-  - Architecture: ARCHITECTURE.md
-  - Configuration: CONFIGURATION.md
-  - Commands: COMMANDS.md
-  - Drivers: DRIVERS.md
-  - Networking: NETWORKING.md
-  - Packages: PACKAGES.md
-  - QFS: QFS.md
-  - System Calls: SYSCALLS.md
-  - Self Hosting: SELF_HOSTING.md
-  - Release Notes: RELEASE_NOTES.md
+  - Home: index.md
+  - Overview:
+    - Doc Map: OVERVIEW.md
+    - Getting Started: GETTING_STARTED.md
+    - Installation: INSTALL.md
+    - Architecture: ARCHITECTURE.md
+    - Release Notes: RELEASE_NOTES.md
+    - Historical Release: Release/0.1_beta.md
+  - Configuration:
+    - Configuration: CONFIGURATION.md
+    - Set Builtin: SET.md
+    - system.ecf: SYSTEM_ECF.md
+    - .ecf Format: ECF.md
+    - eqshell Scripts: EQSHELL.md
+    - Commands: COMMANDS.md
+  - Storage & Boot:
+    - Booting: BOOTING.md
+    - QFS: QFS.md
+    - FAT32 Filesystem: FAT32.md
+    - Drivers: DRIVERS.md
+  - Networking:
+    - Networking: NETWORKING.md
+  - Kernel Internals:
+    - Memory: MEMORY.md
+    - Multitasking: MULTITASKING.md
+    - System Calls: SYSCALLS.md
+    - Graphics & Desktop: GUI.md
+  - Self-Hosting:
+    - Self Hosting: SELF_HOSTING.md
+    - MRP1 Format: MRP.md
+    - Packages: PACKAGES.md

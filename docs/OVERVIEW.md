@@ -23,6 +23,16 @@ dedicated suites for the installer, AHCI, E1000 and `.ecf`).
 | [PACKAGES.md](PACKAGES.md) | `eggkg` reference: `update / install / remove / list / search / info / sync`, the package repository format (package.list v0 + index.idx v1), the **bash package** (not bundled — installed via eggkg), writing your own package |
 | [QFS.md](QFS.md) | `Qfs` disk tool: `-list-disk`, `-format fat32`, `-install-boot`; disk naming (hda–hdh) and slot mapping |
 | [CONFIGURATION.md](CONFIGURATION.md) | The `.ecf` configuration system, the `set` builtin (all flags), `system.ecf` schema, eqshell scripts (`.es`) and `/eqshell.log` |
+| [SET.md](SET.md) | Full reference for the `set` builtin — flags, persistence flow, the C API behind it |
+| [SYSTEM_ECF.md](SYSTEM_ECF.md) | `system.ecf` schema: every known key, boot-time resolution order, failure modes |
+| [ECF.md](ECF.md) | The `.ecf` format and store model: grammar, parse/merge rules, API, validation, limits |
+| [EQSHELL.md](EQSHELL.md) | eqshell scripts (`.es`): the `[Eqshell]` contract, transcripts (`/eqshell.log`), provisioning workflows |
+| [BOOTING.md](BOOTING.md) | Boot flow — GRUB images, module staging, `kernel_main` order, installed-disk boot |
+| [FAT32.md](FAT32.md) | The FAT32 implementation: geometry Equinox writes, LFN/FSInfo/rollback, mount model |
+| [MEMORY.md](MEMORY.md) | Memory map, demand paging, kernel heap, DMA buffers, sizing guidance |
+| [MULTITASKING.md](MULTITASKING.md) | Tasks, the 100 Hz round-robin scheduler, virtual consoles, pipes, lifecycle |
+| [GUI.md](GUI.md) | Framebuffer model, per-task draw windows, LVGL apps, the EquiX/ThorVG desktop |
+| [MRP.md](MRP.md) | The MRP1 executable format: header layout, checksum, loader, validation |
 | [DRIVERS.md](DRIVERS.md) | Storage stack (block layer, **ATA PIO**, **AHCI SATA**) and network drivers (**NE2000**, **E1000**); PCI matching; how to add a new driver |
 | [NETWORKING.md](NETWORKING.md) | lwIP 2.1.3 stack, DHCP/DNS, `mget` (HTTP/HTTPS + TLS), `httpd`, QEMU user-mode networking, NE2000 vs E1000 |
 | [SELF_HOSTING.md](SELF_HOSTING.md) | `mtcc` (the in-OS C compiler), MRP1 executables, ruf v3 build recipes, `equinoxinstall -compile/-build`, the build pipeline |
