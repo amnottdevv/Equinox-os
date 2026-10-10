@@ -7,7 +7,7 @@ on:
     paths:
       - "docs/**"
       - "mkdocs.yml"
-      - ".github/workflows/mkdocs.yml"
+      - ".github/workflows/mkdocs_build.yaml"
   pull_request:
     branches:
       - main
@@ -44,7 +44,7 @@ jobs:
           pip install mkdocs mkdocs-material
 
       - name: Build docs
-        run: mkdocs build 
+        run: mkdocs build
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
