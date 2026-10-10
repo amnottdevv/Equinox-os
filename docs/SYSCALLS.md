@@ -62,13 +62,15 @@ negative `SYS_E*` errno on failure; the convention per call is noted.
 Per-task fd tables (cwd + args live in `struct Task`); writes go
 write-through to FAT32 on close.
 
-## Memory (#12, #48, #51)
+## Memory (#12, #48, #51, #55–#56)
 
 | # | Name | Signature | Returns |
 | --- | --- | --- | --- |
 | 12 | `SYS_MALLOC` | `(size)` | pointer / 0 (per-task MRP arena) |
 | 48 | `SYS_FREE` | `(ptr)` | 0 |
 | 51 | `SYS_MEMINFO` | `(u32 w[6])` | pool stats (total/free, faulted, reserved, zombies) |
+| 55 | `SYS_SBRK` | `(inc)` | old break — `inc = 0` queries; the break lives in the demand-backed window at `ELF_HEAP_VMA` (32 MB) |
+| 56 | `SYS_MMAP` | `(addr, len)` | page-aligned window from the same bump region (`addr = 0` = "kernel picks"), zeroed on first touch |
 
 ## Time, misc, introspection (#13–#15, #29, #34)
 
@@ -94,7 +96,7 @@ write-through to FAT32 on close.
 | 53 | `SYS_SETCLIP` | `(x\|w<<16, y\|h<<16)` | per-task draw window |
 | 54 | `SYS_DRAWLINE` | `(x0\|y0<<16, x1\|y1<<16, color)` | Bresenham, focus-gated |
 
-## Processes (#2, #3, #36–#39, #49, #52)
+## Processes (#2, #3, #36–#39, #49, #52, #57)
 
 | # | Name | Signature | Returns |
 | --- | --- | --- | --- |
@@ -106,17 +108,30 @@ write-through to FAT32 on close.
 | 39 | `SYS_KILL` | `(pid)` | 0 |
 | 49 | `SYS_WAIT` | `(pid, u32* status)` | child pid — blocks like waitpid |
 | 52 | `SYS_SPAWN2` | `(path, hint, args)` | pid — spawn with argv |
+| 57 | `SYS_FORK` | `()` | child pid in the parent, 0 in the child / errno |
 
 Lifecycle: spawn → run → exit → child becomes **zombie** (slot held for
 the parent) → `wait` reaps it; orphans are reaped when the parent dies.
 `MAX_TASKS` = 8.
 
-## Pipes & network (#35, #50)
+| 57 | `SYS_FORK` | `()` | child pid in the parent, 0 in the child / errno |
+
+`fork` is copy-on-write: every user page of the parent is mapped
+read-only with `PTE_COW` in **both** page tables and the physical page
+gets `phys_refcount++`. The first write clones the page (refcount ≤ 1
+just flips `PTE_RW` back), so the child and the parent can never see
+each other's writes; `phys_refcount[]` decides when a page is really
+returned to the pool. File fds are *not* inherited (same rule as
+spawn), pipe ends are (ref-counted), sockets are not.
+
+## Pipes & network (#35, #50, #58–#59)
 
 | # | Name | Signature | Returns |
 | --- | --- | --- | --- |
 | 35 | `SYS_NETPING` | `(ip)` | ICMP echo, 0–4 replies |
 | 50 | `SYS_PIPE` | `(int fds[2])` | 4 KB kernel ring, ref-counted, inherited across spawn; blocking read/write, EOF + broken-pipe detection |
+| 58 | `SYS_SOCKET` | `(domain, type, protocol)` | fd — only `AF_INET`/`SOCK_STREAM`; the fd carries `sock`, so `read`/`write`/`close` drive it |
+| 59 | `SYS_NET` | `(fd, host, port)` | 0 / errno — `host` is a numeric string (`"10.0.2.2"`); blocking connect, pumps lwIP while waiting |
 
 ## Errno values
 

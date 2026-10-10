@@ -10,14 +10,18 @@ mini-preprocessor. Three module families matter to contributors:
 | `#include <fileio.h>` | The full file descriptor API (`f_open`..`f_fstat`, `f_free`) with `F_*` flags |
 | `#include <multitasking.h>` | The task API (`task_spawn`, `task_yield`, `task_kill`, `task_list`, `task_wait`, pipes, `getargs`) |
 
-All three are* spliced into the compilation unit** (the mini preprocessor just
+All three are** spliced into the compilation unit** (the mini preprocessor just
 textually includes the matching built-in block), so they never ship as files
 on the volume. They are the single source of truth for the syscall ABI used by
 in-OS programs.
 
 > Not every C feature is available: global variables must be declared before
-> use (single pass), no structs, no varargs, no function pointers. See
-> [Self Hosting](SELF_HOSTING.md) and [TARGETS.md](../src/mrp_user/TARGETS.md).
+> use (single pass), no varargs, no function pointers, no `sizeof`, no casts,
+> and `struct`/`union` may not be passed or returned **by value** (pass a
+> pointer). `struct`/`union`/`enum`/`typedef`/`switch` and `{…}` initializers
+> *are* supported. The full subset is specified in
+> [mtcc language reference](MTCC_LANGUAGE.md); see also
+> [Self Hosting](SELF_HOSTING.md) (incl. the multi-file compile/link rules).
 
 ---
 
@@ -115,7 +119,11 @@ int st[4];  f_stat("/mnt/notes.txt", st);
 | `int f_fstat(int fd, int* st)` | same as `f_stat` but by fd |
 | `int f_free(char* p)` | release a `malloc`'d block |
 
-### Layout cheats (no structs in mtcc!)
+### Layout cheats (mtcc now has `struct`, these APIs still use arrays)
+
+mtcc gained `struct`/`union`/`enum`/`typedef` (Stage 2), but the file API
+keeps its historical `int[]`/`char[]` layouts so the *same source* also
+compiles against the host SDK — don't expect a `struct stat` here.
 
 `f_stat`: `int st[4]` — `st[0]=size`, `st[1]=is_dir`, `st[2]=backing`,
 `st[3]=mode`.
@@ -177,3 +185,6 @@ they do for shell builtins.
 | `src/test/libc.c` / `libcmini.c` | libc splice correctness |
 | `src/test/libcmini` runner (`regression_task2.py`) | parallel mtcc threads |
 | `src/test/primes.c`, `guess.c` | classic warm-up programs |
+| `src/test/struct.c`, `swenum.c` | `struct`/`union` + `enum`/`switch` (Stage 2) |
+| `src/test/sinit.c` | `struct`/`union` `{…}` initializers, global + local + nested |
+| `src/test/mf_main.c` + `mf_helper.c` + `mf_shared.h` | **multi-file** compile/link: cross-file call, `extern`, relative `#include "x.h"` |

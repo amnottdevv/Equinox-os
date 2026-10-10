@@ -12,7 +12,7 @@ Internet (user menyediakan akses internet, slirp NAT + DNS):
   dns example.com / mget http://example.com/
 
   B1  boot ke shell
-  B2  -build ls        -> mtcc -c ok ("wrote /equinox/tools/ls.mrp" +
+  B2  -build ls        -> mtcc -c ok ("[OUTPUT] /equinox/tools/ls.mrp" +
                           "[build] ls.c -> ls.mrp — ok")
   B3  -build mtcc      -> pesan status self-host
   B4  -build copy      -> tidak ada sumber + catatan builtin
@@ -73,11 +73,13 @@ def main():
     base = len(serial())
     rig.type_line("equinoxinstall -build wc", wait=2.0)
     t = window(base, "[build] wc.c -> wc.mrp", 120, rig)
+    # mtcc v0.3 prints "  [OUTPUT] <path> (N bytes) — run <path>" (the tag
+    # and the name are separated by an ANSI reset, so test them apart).
     check("B2 -build wc ok",
-          "wrote /equinox/tools/wc.mrp" in t and
+          "[OUTPUT]" in t and "/equinox/tools/wc.mrp" in t and
           "[build] wc.c -> wc.mrp — ok" in t,
           [l.strip() for l in t.splitlines()
-           if "wrote" in l or "[build]" in l][-2:])
+           if "[OUTPUT]" in l or "[build]" in l][-2:])
 
     # ---- B3: -build mtcc (status self-host) -------------------------
     base = len(serial())

@@ -307,6 +307,10 @@ MRP_FILES     = $(wildcard $(DIST_DIR)/*.mrp)
 MRP_TOOLS     = $(wildcard $(DIST_DIR)/equinox/tools/*.mrp)
 MRP_GAMES     = $(wildcard $(DIST_DIR)/equinox/games/*.mrp)
 C_FILES       = $(wildcard $(DIST_DIR)/*.c)
+# Stage-3: flat HEADERs next to the samples (RAMFS /test) so a multi-file
+# sample can `#include "x.h"` inside the OS — same flat routing as the .c
+# samples (mrp_bootloader: flat cmdline -> /test).
+H_FILES       = $(wildcard $(DIST_DIR)/*.h)
 WAD_FILES     = $(wildcard $(DIST_DIR)/*.wad)
 ELF_FILES     = $(wildcard $(DIST_DIR)/equinox/tools/*.elf)
 # v0.3: userland tool C SOURCES (self-hosting — the in-OS
@@ -328,7 +332,7 @@ RUF_FILES     = $(wildcard $(DIST_DIR)/equinox/*.ruf)
 # v0.9.2: $(MRP_GAMES) $(GAMES_C_FILES) $(WAD_FILES) keluar dari modul
 # ISO — games jadi paket eggkg (doom1.wad ikut keluar; data game
 # menyusul lewat paket). dist/equinox/games sudah dibersihkan.
-ALL_MODULES   = $(MRP_FILES) $(MRP_TOOLS) $(C_FILES) $(ELF_FILES) $(TOOLS_C_FILES) $(LIBC_C_FILES) $(LIBC_H_FILES) $(RUF_FILES)
+ALL_MODULES   = $(MRP_FILES) $(MRP_TOOLS) $(C_FILES) $(H_FILES) $(ELF_FILES) $(TOOLS_C_FILES) $(LIBC_C_FILES) $(LIBC_H_FILES) $(RUF_FILES)
 # v0.9.2/v0.4: NO bundled bash package. The base ISO ships without
 # the bash coreutils — the canonical package lives in the Eggkg-l
 # repository and is installed in-OS with:
@@ -384,7 +388,7 @@ $(DIST_DIR)/equinox.iso: $(DIST_DIR)/kernel.elf $(BOOT_DIR)/grub/grub.cfg $(BOOT
 	python3 $(ROOT_DIR)/scripts/gen_grubcfg.py $(BOOT_DIR)/grub/grub.cfg $(ISO_DIR)/boot/grub/grub.cfg $(DIST_DIR) $(ALL_MODULES) $(BOOTIMG_DIR)/boot.img $(BOOTIMG_DIR)/core.img
 	# Copy every module onto the ISO, KEEPING the dist/ folder structure
 	# (so the module path in grub.cfg = the file path on the ISO).
-	-cp $(MRP_FILES) $(C_FILES) $(ISO_DIR)/boot/ 2>/dev/null || true
+	-cp $(MRP_FILES) $(C_FILES) $(H_FILES) $(ISO_DIR)/boot/ 2>/dev/null || true
 	# tools dir: prebuilt .mrp (mtcc.mrp + parity demos) + the .c
 	# sources + ELF demos, all under boot/equinox/tools/.
 	@if [ -n "$(MRP_TOOLS)$(TOOLS_C_FILES)$(ELF_FILES)" ]; then \
@@ -600,7 +604,8 @@ pack: $(DIST_DIR)
 	fi
 	@if [ -d $(TEST_DIR) ]; then \
 		cp $(TEST_DIR)/*.c $(DIST_DIR)/ 2>/dev/null; \
-		echo "[pack] test/*.c -> $(DIST_DIR) (ISO module -> RAMFS /test)"; \
+		cp $(TEST_DIR)/*.h $(DIST_DIR)/ 2>/dev/null; \
+		echo "[pack] test/*.c + *.h -> $(DIST_DIR) (ISO module -> RAMFS /test)"; \
 	fi
 
 # FIX(mtcc.c): the compiler's canonical source now lives in the PROJECT ROOT

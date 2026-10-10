@@ -154,6 +154,7 @@ static int mrp_run_inner(struct fs_node* parent, const char* name,
         if (task_user_map_demand(t, ELF_HEAP_VMA, ELF_HEAP_BYTES) != 0)
             return MRP_RUN_ERR_NO_MEMORY;
         task_load_cr3(t->page_dir);          /* the VMA window goes live */
+        t->brk = ELF_HEAP_VMA;               /* SYS_SBRK/SYS_MMAP break */
         if (elf_load(t, file_data, total_len) != 0) {
             task_user_unmap(t);
             t->page_dir = paging_kernel_dir();
@@ -183,6 +184,11 @@ static int mrp_run_inner(struct fs_node* parent, const char* name,
                          + 0xFFFu) & ~0xFFFu;
         if (task_user_map_demand(t, USER_ARENA_START, need) != 0)
             return MRP_RUN_ERR_NO_MEMORY;
+        /* extended 0.5: SYS_SBRK/SYS_MMAP allocate from their own window
+         * (task_create_user does the same for spawned tasks) — the inline
+         * launch path has to reserve it too. */
+        task_demand_reserve(t, ELF_HEAP_VMA, ELF_HEAP_BYTES);
+        t->brk = ELF_HEAP_VMA;
         task_load_cr3(t->page_dir);          /* the VMA window goes live */
 
         // ----- 4. This task's arena allocator + alloc & copy code -----

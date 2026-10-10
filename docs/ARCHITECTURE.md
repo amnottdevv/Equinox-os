@@ -166,8 +166,11 @@ Details in [NETWORKING.md](NETWORKING.md) / [DRIVERS.md](DRIVERS.md).
   preprocessor splicing `<morph.h>` etc.; libc subset (printf ≤5 args,
   sscanf, ctype, qsort, rand); undefined references reported with the
   call-site line. See [SELF_HOSTING.md](SELF_HOSTING.md).
-- **ruf v3** recipes drive `mtcc -make` (variables `:=`, jobs,
-  `copy/move ? to`) — the eggkg install engine.
+- **ruf v3/v4** recipes drive `mtcc -make` (variables `:=`, walk jobs,
+  `copy/move ? to` install steps; v4 adds `multiple_file = True` to
+  link every source into ONE program, `job … from a.c & b.c to out.mrp
+  [format mrp|elf]`, and `set key = value` written to an `.ecf` after a
+  green build) — the eggkg install engine.
 
 ## 10. Configuration & packages
 

@@ -1525,3 +1525,155 @@ int net_cmd_tcpping(const char* args) {
     net_unlock(f);
     return ok;
 }
+
+/* ============================================================
+ *  extended 0.5: ring-3 TCP sockets (minimal blocking client).
+ *  Closely follows mget_https_transfer/mget_recv_cb: a pcb with
+ *  callbacks, and the caller pumps net_service() until the state
+ *  settles.  Used by SYS_SOCKET/SYS_NET (syscalls 58/59).
+ * ============================================================ */
+#define SOCK_BUF_SIZE   (60 * 1024)
+struct equinox_socket {
+    struct tcp_pcb* pcb;
+    volatile int    state;    /* 0=idle 1=connecting 2=connected -1=err 3=closed */
+    volatile int    closed;   /* FIN from the peer */
+    volatile uint32_t len;
+    uint32_t        pos;
+    uint8_t         buf[SOCK_BUF_SIZE];
+};
+
+static err_t sock_recv_cb(void* arg, struct tcp_pcb* pcb,
+                          struct pbuf* p, err_t err) {
+    struct equinox_socket* s = (struct equinox_socket*)arg;
+    if (p == NULL) {
+        s->closed = 1;
+        if (s->state == 2) s->state = 3;
+        return ERR_OK;
+    }
+    if (err == ERR_OK) {
+        uint32_t room = SOCK_BUF_SIZE - s->len;
+        uint32_t want = p->tot_len;
+        if (want > room) want = room;
+        if (want > 0) {
+            pbuf_copy_partial(p, s->buf + s->len, want, 0);
+            s->len += want;
+        }
+        tcp_recved(pcb, (u16_t)p->tot_len);
+    }
+    pbuf_free(p);
+    return ERR_OK;
+}
+
+static err_t sock_connected_cb(void* arg, struct tcp_pcb* pcb, err_t err) {
+    struct equinox_socket* s = (struct equinox_socket*)arg;
+    (void)pcb;
+    if (err != ERR_OK) { s->state = -1; return err; }
+    s->state = 2;
+    return ERR_OK;
+}
+
+static void sock_err_cb(void* arg, err_t err) {
+    struct equinox_socket* s = (struct equinox_socket*)arg;
+    (void)err;
+    s->state = -1;
+}
+
+void* net_socket_alloc(void) {
+    struct equinox_socket* s = (struct equinox_socket*)malloc(sizeof(*s));
+    if (!s) return NULL;
+    memset(s, 0, sizeof(*s));
+    s->state = 0;
+    return s;
+}
+
+int net_socket_connect(void* sock, const char* host, uint16_t port) {
+    struct equinox_socket* s = (struct equinox_socket*)sock;
+    if (!s) return -1;
+    if (s->state == 2) return -2;
+
+    ip4_addr_t dst;
+    char rip[16];
+    if (!ip4addr_aton(host, &dst)) {
+        if (!net_resolve(host, rip)) return -1;
+        ip4addr_aton(rip, &dst);
+    }
+
+    uint32_t f = net_lock();
+    s->pcb = tcp_new();
+    if (!s->pcb) { net_unlock(f); return -1; }
+    s->state = 1;
+    tcp_arg(s->pcb, s);
+    tcp_err(s->pcb, sock_err_cb);
+    tcp_recv(s->pcb, sock_recv_cb);
+    ip_addr_t d;
+    *(ip_2_ip4(&d)) = dst;
+    err_t e = tcp_connect(s->pcb, &d, port, sock_connected_cb);
+    net_unlock(f);
+
+    if (e != ERR_OK) {
+        f = net_lock();
+        tcp_close(s->pcb);
+        s->pcb = NULL;
+        s->state = -1;
+        net_unlock(f);
+        return -1;
+    }
+
+    uint32_t t0 = sys_now();
+    while (s->state == 1 && (sys_now() - t0) < 12000)
+        net_service();
+
+    if (s->state != 2) return -1;
+    return 0;
+}
+
+int net_socket_read(void* sock, char* buf, uint32_t len) {
+    struct equinox_socket* s = (struct equinox_socket*)sock;
+    if (!s) return -1;
+
+    /* wait for data or a half-close */
+    uint32_t t0 = sys_now();
+    while (s->pos >= s->len && !s->closed && s->state == 2 &&
+           (sys_now() - t0) < 30000)
+        net_service();
+
+    if (s->pos < s->len) {
+        uint32_t n = s->len - s->pos;
+        if (n > len) n = len;
+        memcpy(buf, s->buf + s->pos, n);
+        s->pos += n;
+        if (s->pos == s->len) s->pos = s->len = 0;
+        return (int)n;
+    }
+    if (s->closed) return 0;
+    if (s->state == -1) return -1;
+    return 0;
+}
+
+int net_socket_write(void* sock, const char* buf, uint32_t len) {
+    struct equinox_socket* s = (struct equinox_socket*)sock;
+    if (!s || s->state != 2 || !s->pcb) return -1;
+
+    uint32_t f = net_lock();
+    err_t e = tcp_write(s->pcb, buf, (u16_t)len, TCP_WRITE_FLAG_COPY);
+    if (e == ERR_OK) tcp_output(s->pcb);
+    net_unlock(f);
+    return e == ERR_OK ? (int)len : -1;
+}
+
+void net_socket_close(void* sock) {
+    struct equinox_socket* s = (struct equinox_socket*)sock;
+    if (!s) return;
+    uint32_t f = net_lock();
+    if (s->pcb) {
+        if (tcp_close(s->pcb) != ERR_OK) tcp_abort(s->pcb);
+        s->pcb = NULL;
+    }
+    net_unlock(f);
+    s->state = 3;
+}
+
+void net_socket_free(void* sock) {
+    if (sock) free(sock);
+}
+

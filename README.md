@@ -52,7 +52,7 @@ root::users / $ doom -iwad /mnt/doom1.wad      # DOOM straight off the disk
 9. [Build recipes: ruf v3 and `mtcc -make`](#build-recipes-ruf-v3-and-mtcc--make)
 10. [Self-hosting with `equinoxinstall`](#self-hosting-with-equinoxinstall)
 11. [Packages: `eggkg` and the Eggkg-l repository](#packages-eggkg-and-the-eggkg-l-repository)
-12. [Configuration: `.ecf`, `set` and eqshell scripts](#configuration-ecf-set-and-eqshell-scripts)
+12. [Configuration: `.ecf`, `set`, eqshell scripts & layered customization](#configuration-ecf-set-and-eqshell-scripts)
 13. [Disk management: `Qfs`](#disk-management-qfs)
 14. [System call interface (54 syscalls)](#system-call-interface-54-syscalls)
 15. [Storage & filesystems](#storage--filesystems)
@@ -81,6 +81,7 @@ root::users / $ doom -iwad /mnt/doom1.wad      # DOOM straight off the disk
 | **Self-hosting** | `equinoxinstall` compiles the shipped tool and game sources from C in-OS and installs the results. |
 | **Packages** | **eggkg**: update / install / remove / list / search / info / sync; downloads sources over HTTP or HTTPS, builds with `mtcc -make`, installs to `/bin`, tracks them in `installed.db`, verifies sha256 when `index.idx` is present. |
 | **Configuration** | **`.ecf`** (INI-lite) with schema validation, an overlay mechanism, and the `set` builtin; **`.es`** shell scripts with command logging. |
+| **Customization** | **Layered config**: per-tool `.config/<tool>.ecf` files read live, dispatched through the in-kernel **`ecf_caller`** action registry (`set.*`, `pkg.*`, `mtcc.*`) — edit a recipe and the next command picks it up, no reboot. |
 | **Syscalls** | 54 append-only syscalls (#1–#54): console, files, processes, pipes, memory, graphics, audio, input, networking. |
 | **Storage** | ATA PIO driver (LBA28/LBA48, ATAPI detection, MBR), full **FAT32 read/write** with long file names, write-through consistency, and a RAM filesystem populated from GRUB modules. |
 | **Networking** | lwIP 2.1.3: DHCP, DNS, ICMP, TCP. HTTP **and HTTPS** client (`mget`, BearSSL, fail-closed TLS), an in-process fetch transport for eggkg, and an HTTP server on port 80. |
@@ -95,6 +96,8 @@ root::users / $ doom -iwad /mnt/doom1.wad      # DOOM straight off the disk
 - **eqshell scripts (`.es`)** run with `set -x FILE`: `[Eqshell]` header, `Log=True` directive producing an 8 KB transcript at `/eqshell.log`, nesting up to 3 levels.
 - **ruf v3 recipes** with variables (`name := "value"`, case-insensitive `$name` expansion) and queued `copy A [& B] ? D` / `move A [& B] ? D` post-build actions; executed by `mtcc -make <file.ruf>`.
 - **`equinoxinstall` grew `-build`:** `-build <file.ruf>` (via `mtcc -make`), `-build <tool>` (single tool), `-build *.ruf` (single-star glob). The old `eqbuild` command is gone.
+- **Layered customization (`ecf_caller` + `.config/`):** per-tool config files under `/equinox/.config/` (`eggkg.ecf`, `mtcc.ecf`) are read **on every invocation**, so an edit is live on the next command. A recipe is validated in full before it runs, and the step list *is* the execution path — `pkg.*` / `mtcc.*` / `set.*` handlers are dispatched through an in-kernel, string-keyed action registry (`config callers`, `call <name>`). See [docs/CUSTOMIZATION.md](docs/CUSTOMIZATION.md).
+- **mtcc now supports `struct`/`union`:** nested definitions, `.` and `->` member access, pointers to structs, arrays of struct, whole-struct copy, and `{…}` initializers (global, local, nested) — plus `enum`, `typedef` and `switch`. Structs are passed and returned **by pointer**; see [docs/MTCC_LANGUAGE.md](docs/MTCC_LANGUAGE.md).
 - **`Qfs` disk tool:** `-list-disk`, `-t hdX -format fat32`, and `-install-boot [hdX]` (writes GRUB `boot.img` + `core.img`, generates `grub.cfg`, verifies the result).
 - **Shell upgrades:** line-level pipe `|`, output/input redirection `> >> <`, single-star glob `*`, arrow-key history; `eqbash` gained `cdir` / `cfile` / `ccfile` / `save` / `delfile` / `deldir` / `pren` plus `lf` / `showf` aliases; the nine bash-class tools (ls, cat, cp, mv, mkdir, rmdir, rm, touch, stat) moved out of the base ISO into the eggkg `bash` package.
 - **`eqgu`**: the built-in editor for `.c` files — re-compiles the file on save and shows compiler diagnostics in place.
@@ -266,7 +269,7 @@ mtcc --debug prog.c  verbose compiler info (file, code/data sizes)
 flags: -c compile-only   -q quiet   --lib no-main check   -make <file.ruf>
 ```
 
-**Language subset:** `int`, `char`, `void`, one- and two-level pointers, 1-D arrays; `if/else`, `while`, `do-while`, `for` (with a declaration in the initializer), `return`, `break`, `continue`; every assignment and arithmetic/bitwise/logical/relational operator, pre/post `++ --`, and the ternary operator; global scalars and arrays with constant, list and string initializers; recursion and forward prototypes (up to 8 parameters). Not supported: `struct` / `union`, floating point, `switch`, `sizeof`, `typedef`, 2-D arrays, variadic functions, `static` locals, unsigned semantics.
+**Language subset:** `int`, `char`, `void`, one- and two-level pointers, 1-D arrays; `struct`/`union` (nested, by pointer, with `{…}` initializers), `enum`, `typedef`, `switch`/`case`/`default`; `if/else`, `while`, `do-while`, `for` (with a declaration in the initializer), `return`, `break`, `continue`; every assignment and arithmetic/bitwise/logical/relational operator, pre/post `++ --`, and the ternary operator; global scalars and arrays with constant, list and string initializers; recursion and forward prototypes (up to 8 parameters). Not supported: `struct`/`union` **passed or returned by value** (pass a pointer), floating point, `sizeof`, casts, 2-D arrays, variadic functions, function-like macros, function pointers, `static` locals, unsigned semantics.
 
 **Preprocessor:** `#include <morph.h>` (aliases: `<stdio.h>`, `<stdlib.h>`, `<string.h>`; nesting depth max 8), `<multitasking.h>`, `<fileio.h>`, `"file.h"` from RAMFS, object-like `#define`, `#undef`, `#ifdef` / `#ifndef` / `#else` / `#endif` (function-like macros are rejected with a clear message).
 
@@ -451,6 +454,40 @@ Qfs -list-disk
 - Every remaining line is fed verbatim into the normal shell dispatch, so pipes, redirection, globbing, `sleep`, `wait` and all builtins work inside scripts.
 - `Log=True` records each command and its output into a transcript that is flushed to **`/eqshell.log`** (8 KB cap) when the script ends — a runnable audit trail, not just echo.
 - Limits: script ≤ 4 KB / 512 lines, nesting depth ≤ 3.
+
+### Layered customization (`.config/` + `ecf_caller`)
+
+On top of the system store, Equinox keeps **per-tool configuration** in `.config/` and turns it into behaviour through an in-kernel **action registry**:
+
+```text
+/equinox/conf/system.ecf          # layer 1 — machine identity (net, eggkg, …)
+/equinox/.config/eggkg.ecf        # layer 2 — the build/install recipe
+/equinox/.config/mtcc.ecf         # layer 2 — compiler defaults
+kernel: ecf_caller                # layer 3 — named actions (set.*, pkg.*, mtcc.*)
+```
+
+```ini
+# /equinox/.config/eggkg.ecf — what `eggkg install` actually runs
+[install]
+1 = mtcc.compile_ruf_eggkg $rufpath
+2 = pkg.install_bin $pkgdir
+3 = pkg.db_record $name $version
+```
+
+- **Read fully, then run.** A recipe is parsed and every action name checked against the registry *before* anything executes; an unknown action rejects the whole recipe, and execution stops at the first failing step.
+- **The recipe is the execution path.** `eggkg install` does not run a hard-coded sequence the config merely *influences* — the step list *is* the sequence, and the seeded defaults are read back from the file too.
+- **Live.** Each tool re-reads its `.ecf` on every invocation: edit the file and the next command picks it up, with no reboot and no recompile.
+- **Composable.** `config callers` lists every registered action, and `call <name> [args…]` invokes any of them by hand from the shell — the same dispatch a recipe uses.
+
+```sh
+eggkg init            # seed .config/eggkg.ecf with the default recipe
+config init mtcc      # seed .config/mtcc.ecf
+eggkg plan            # print the resolved steps without running them
+config callers        # list every registered action
+call set.path_local /equinox/.local/tp
+```
+
+See [docs/CUSTOMIZATION.md](docs/CUSTOMIZATION.md) for the full model.
 
 ---
 
@@ -777,7 +814,7 @@ The QEMU harness drives the system through the serial log and the QEMU monitor, 
 - The paging identity map tops out at 128 MB even when more RAM is installed; the remainder is only reachable through the GUI arena.
 - ELF segments must lie in `[0x800000, 0x2000000)`; ELF tasks get a fixed 2 MB heap.
 - One FAT32 volume at a time (`/mnt`), MBR primary partitions only, 512-byte sectors, no FAT12/16, file names over 63 characters fall back to 8.3.
-- mtcc is a C subset: no `struct`/`union`, floating point, `switch`, `sizeof`, `typedef`, 2-D arrays, variadic or function-like macros; `printf` takes at most 5 conversion arguments.
+- mtcc is a C subset: `struct`/`union` are passed and returned **by pointer** (not by value), and floating point, `sizeof`, casts, 2-D arrays, variadic or function-like macros, and function pointers are not supported; `printf` takes at most 5 conversion arguments.
 - The base ISO ships without the bash-class tools; install the `bash` package (`eggkg install bash`) or use the builtins/aliases.
 - eggkg `package.list` v0 carries no versions or hashes (sha256 verification requires an `index.idx`), and archive packages are capped at 384 KB.
 - FAT32 file caches in the disk arena are managed by a free-list, but heavy churn of very large files can fragment it.

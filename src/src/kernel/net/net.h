@@ -143,6 +143,18 @@ int  net_eggkg_fetch(const char* url, uint8_t* buf, uint32_t cap,
                      uint32_t* out_len, int* out_status,
                      void (*progress)(uint32_t got, void* ud), void* ud);
 
+/* ============================================================
+ *  extended 0.5: ring-3 TCP client (raw sockets over lwIP).
+ *  Model mirrors mget: pcb + callbacks registered, the shell task
+ *  pumps net_service() until the volatile state settles.
+ * ============================================================ */
+void* net_socket_alloc(void);
+int   net_socket_connect(void* sock, const char* host, uint16_t port);
+int   net_socket_read(void* sock, char* buf, uint32_t len);
+int   net_socket_write(void* sock, const char* buf, uint32_t len);
+void  net_socket_close(void* sock);
+void  net_socket_free(void* sock);
+
 // ============================================================
 //  0.4 Beta — DNS + testing tools that work under QEMU Windows
 // ============================================================

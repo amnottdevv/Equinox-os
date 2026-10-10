@@ -867,3 +867,85 @@ void ecf_target_clear(void) {
     ecf_tgtbuf[0] = '\0';
     ecf_store_invalidate();
 }
+
+/* ============================================================
+ *  0.5 — ecf_tool_path: resolver direktori .config/ per-tool
+ * ------------------------------------------------------------
+ *  Lokasi kanonik: /equinox/.config/<tool>.ecf  (volume /mnt
+ *  diprioritaskan supaya persisten; RAMFS = fallback sesi).
+ *  Dir .config dibuat bila belum ada (untuk tulis).
+ *
+ *  return: path absolut ke <tool>.ecf (buffer statis, valid sampai
+ *  panggilan berikutnya), atau NULL bila for_write == 0 dan berkas
+ *  tidak ditemukan / nama tool invalid.
+ * ============================================================ */
+static char ecf_toolpath_buf[ECF_PATH_MAX];
+
+const char* ecf_tool_path(const char* tool, int for_write) {
+    if (!tool || !tool[0]) return NULL;
+
+    /* validasi nama tool: huruf/angka/'_'/'-' saja (TANPA titik —
+     * ini nama berkas, bukan key). */
+    for (const char* p = tool; *p; p++) {
+        char c = *p;
+        int ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                 (c >= '0' && c <= '9') || c == '_' || c == '-';
+        if (!ok) return NULL;
+    }
+
+    struct fs_node* root = fs_get_root();
+    if (!root) return NULL;
+
+    /* kandidat dir .config: volume /mnt dulu, lalu RAMFS root */
+    static const char* const DIRPFX[2] = { "/mnt/equinox/.config",
+                                           "/equinox/.config" };
+
+    /* --- cek keberadaan berkas TANPA membuat apa pun (mode baca;
+     * mode tulis ikut ini supaya file yang sudah ada tetap dipakai
+     * di tempatnya, bukan dibuat ulang di volume lain) --- */
+    for (int i = 0; i < 2; i++) {
+        char cand_path[ECF_PATH_MAX];
+        int o = 0;
+        const char* pre = DIRPFX[i];
+        while (*pre && o < ECF_PATH_MAX - 1)
+            cand_path[o++] = *pre++;
+        cand_path[o++] = '/';
+        for (const char* t = tool; *t && o < ECF_PATH_MAX - 1; t++)
+            cand_path[o++] = *t;
+        const char* ext = ".ecf";
+        while (*ext && o < ECF_PATH_MAX - 1)
+            cand_path[o++] = *ext++;
+        cand_path[o] = '\0';
+        struct fs_node* n = fs_get_node_from_path(root, cand_path);
+        if (n && !n->is_dir) {
+            ecf_copy(ecf_toolpath_buf, ECF_PATH_MAX, cand_path);
+            return ecf_toolpath_buf;
+        }
+    }
+    if (!for_write) return NULL;
+
+    /* --- mode TULIS (file belum ada): buat dir .config --- */
+    struct fs_node* cand[2];
+    cand[0] = fs_get_node_from_path(root, "/mnt");
+    cand[1] = root;
+    struct fs_node* cfg = NULL;
+    int used = -1;
+    for (int i = 0; i < 2; i++) {
+        struct fs_node* eq = ecf_ensure_subdir(cand[i], "equinox");
+        cfg = ecf_ensure_subdir(eq, ".config");
+        if (cfg) { used = i; break; }
+    }
+    if (!cfg) return NULL;
+
+    /* susun <dir>/<tool>.ecf pada dir yang dipakai */
+    int o = 0;
+    const char* pre = DIRPFX[used];
+    while (*pre && o < ECF_PATH_MAX - 1) ecf_toolpath_buf[o++] = *pre++;
+    ecf_toolpath_buf[o++] = '/';
+    for (const char* t = tool; *t && o < ECF_PATH_MAX - 1; t++)
+        ecf_toolpath_buf[o++] = *t;
+    const char* ext = ".ecf";
+    while (*ext && o < ECF_PATH_MAX - 1) ecf_toolpath_buf[o++] = *ext++;
+    ecf_toolpath_buf[o] = '\0';
+    return ecf_toolpath_buf;
+}

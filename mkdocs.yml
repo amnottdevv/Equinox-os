@@ -92,9 +92,9 @@ nav:
     - RELEASE_NOTES.md
     - Historical Release: Release/0.1_beta.md
     - All Doc Links: nav.md
-    - MTCC_API.md
     - FAQ.md
   - Configuration:
+    - CUSTOMIZATION.md
     - CONFIGURATION.md
     - SET.md
     - SYSTEM_ECF.md
@@ -115,5 +115,7 @@ nav:
     - GUI.md
   - Self-Hosting:
     - SELF_HOSTING.md
+    - MTCC_LANGUAGE.md
+    - MTCC_API.md
     - MRP.md
     - PACKAGES.md

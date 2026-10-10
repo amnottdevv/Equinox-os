@@ -36,6 +36,7 @@
 #include "library/header/libstring.h"
 #include "library/header/fs_ram.h"
 #include "library/header/ecf.h"
+#include "library/header/ecf_caller.h"  /* 0.5: registry aksi bernama */
 #include "library/header/eggkg.h"
 #include "library/header/egg_sha256.h"
 #include "library/header/malloc.h"
@@ -1104,44 +1105,282 @@ static int egg_load_local_index(void) {
 }
 
 /* ============================================================
- *  eggkg update [sumber]
+ *  0.5 — Lapisan config eggkg (.config/eggkg.ecf)
+ * ------------------------------------------------------------
+ *  Resep = SATU-satunya jalur eksekusi. Tiap baris step
+ *      <n> = <nama-aksi> <args...>
+ *  di-resolve ($var -> nilai) lalu dijalankan lewat ecf_call().
+ *  `eggkg init` menulis resep default; run pertama (file absen)
+ *  auto-seed lalu baca-balik. Validasi-DULU-lalu-jalan (atomic):
+ *  seluruh daftar divalidasi sebelum eksekusi apa pun.
  * ============================================================ */
-static void egg_cmd_update(const char* src_arg) {
-    char src[EGG_URL_MAX];
-    if (src_arg && src_arg[0])
-        egg_copy_str(src_arg, src, EGG_URL_MAX);
-    else
-        egg_server_url(src, EGG_URL_MAX);
+#define EGG_STEP_MAX   16        /* step per section                    */
+#define EGG_SEC_MAX    2         /* [update] + [install]                */
+
+struct egg_step {
+    char action[ECF_CALL_NAME_MAX];
+    int  argc;
+    char argv[ECF_CALL_ARGC_MAX][64];
+};
+
+/* per-section: daftar step terurut */
+static struct egg_step g_egg_step[EGG_SEC_MAX][EGG_STEP_MAX];
+static int             g_egg_nstep[EGG_SEC_MAX];
+
+static int egg_sec_index(const char* sec) {
+    if (egg_ieq(sec, "update")) return 0;
+    if (egg_ieq(sec, "install")) return 1;
+    return -1;
+}
+
+/* Resep default (template seed) — MEREPRODUKSI perilaku hari ini.
+ * CATATAN staging: langkah [2/4] "unduh sumber" (fetch) tetap di jalur
+ * setup monolit (manajemen buffer rapat: di-free sebelum spawn mtcc).
+ * Step list config menggerakkan build -> install -> db (nyata, lewat
+ * handler). fetch/index di [update] juga monolit. Ini disebut jujur,
+ * bukan disembunyikan. */
+static const char* EGG_DEFAULT_RECIPE =
+    "# eggkg.ecf — resep build/paket (edit bebas; `call` aksi apa pun)\n"
+    "# angka = urutan eksekusi; $var di-resolve saat run\n"
+    "[update]\n"
+    "1 = pkg.read_list $server\n"
+    "2 = pkg.fetch_index $repobase\n"
+    "[install]\n"
+    "1 = mtcc.compile_ruf_eggkg $rufpath\n"
+    "2 = pkg.install_bin $pkgdir\n"
+    "3 = pkg.db_record $name $version\n";
+
+/* tulis resep default ke .config/eggkg.ecf (bila belum ada / force) */
+static int egg_write_config(int force) {
+    const char* path = ecf_tool_path("eggkg", 1);
+    if (!path) { printf("eggkg: tak bisa membuat .config/eggkg.ecf\n"); return -1; }
+    if (!force) {
+        struct fs_node* ex = fs_get_node_from_path(fs_get_root(), path);
+        if (ex && !ex->is_dir) { printf("eggkg: %s sudah ada\n", path); return 0; }
+    }
+    uint32_t len = (uint32_t)strlen(EGG_DEFAULT_RECIPE);
+    if (egg_write_file(path, (const uint8_t*)EGG_DEFAULT_RECIPE, len) != 0) {
+        printf("eggkg: gagal tulis %s\n", path);
+        return -1;
+    }
+    printf("[OK] eggkg: resep ditulis -> %s (%u B)\n", path, (unsigned)len);
+    return 0;
+}
+
+/* Load + parse resep dari .config/eggkg.ecf untuk section `sec`.
+ * Mengisi g_egg_step[sec] dengan step terurut. */
+static int egg_load_steps(int sec, const char* cfgpath) {
+    g_egg_nstep[sec] = 0;
+    struct fs_node* n = fs_get_node_from_path(fs_get_root(), cfgpath);
+    if (!n || n->is_dir) return -1;
+    if (fs_ensure_content(n) != 0 || !n->content) return -1;
+
+    const char* s = (const char*)n->content;
+    int in_sec = 0;
+    while (*s) {
+        char line[192];
+        int ll = 0;
+        while (*s && *s != '\n' && ll < 190) line[ll++] = *s++;
+        while (*s && *s != '\n') s++;
+        if (*s == '\n') s++;
+        line[ll] = 0;
+
+        char* t = line;
+        while (*t == ' ' || *t == '\t') t++;
+        if (*t == 0 || *t == '#' || *t == ';') continue;
+
+        if (*t == '[') {
+            char* e = t;
+            while (*e && *e != ']') e++;
+            *e = 0;
+            in_sec = (egg_sec_index(t + 1) == sec);
+            continue;
+        }
+        if (!in_sec) continue;
+        if (g_egg_nstep[sec] >= EGG_STEP_MAX) continue;   /* batas: lewati */
+
+        /* "N = aksi args..." — buang nomor urut di depan */
+        char* eq = t;
+        while (*eq && *eq != '=') eq++;
+        if (!*eq) continue;
+        *eq = 0;
+        char* body = eq + 1;
+        while (*body == ' ' || *body == '\t') body++;
+
+        struct egg_step* st = &g_egg_step[sec][g_egg_nstep[sec]];
+        /* token pertama = nama aksi */
+        int al = 0;
+        while (*body && *body != ' ' && al < ECF_CALL_NAME_MAX - 1)
+            st->action[al++] = *body++;
+        st->action[al] = 0;
+        st->argc = 0;
+        while (*body == ' ') body++;
+        while (*body && st->argc < ECF_CALL_ARGC_MAX) {
+            char* a = st->argv[st->argc];
+            int acl = 0;
+            while (*body && *body != ' ' && acl < 63) a[acl++] = *body++;
+            a[acl] = 0;
+            st->argc++;
+            while (*body == ' ') body++;
+        }
+        g_egg_nstep[sec]++;
+    }
+    return g_egg_nstep[sec];
+}
+
+/* Validasi SELURUH daftar step (atomic). return jumlah error. */
+static int egg_validate_steps(int sec) {
+    int errs = 0;
+    for (int i = 0; i < g_egg_nstep[sec]; i++) {
+        struct egg_step* st = &g_egg_step[sec][i];
+        if (!ecf_call_exists(st->action)) {
+            printf("[ERROR] step %d: aksi tak dikenal '%s'\n",
+                   i + 1, st->action);
+            errs++;
+        }
+    }
+    return errs;
+}
+
+static void egg_show_steps(int sec, const char* title) {
+    printf("eggkg: %s (%d step)\n", title, g_egg_nstep[sec]);
+    for (int i = 0; i < g_egg_nstep[sec]; i++) {
+        struct egg_step* st = &g_egg_step[sec][i];
+        printf("  %d = %s", i + 1, st->action);
+        for (int a = 0; a < st->argc; a++) printf(" %s", st->argv[a]);
+        printf("\n");
+    }
+}
+
+/* ============================================================
+ *  0.5 — Konteks paket + handler (dipakai step list [install])
+ * ------------------------------------------------------------
+ *  Konteks bersama diangkat ke scope modul supaya blok-blok
+ *  pipeline monolit bisa dibungkus handler TANPA menulis ulang
+ *  logika berisiko (sha256/arsip/mirror/free-buffer). Urutan
+ *  eksekusi datang dari config; handler melakukan pekerjaan.
+ * ============================================================ */
+static struct egg_entry* g_ctx_e;          /* paket aktif               */
+static char g_ctx_local[128];
+static char g_ctx_pkgdir[128];
+static char g_ctx_rufpath[192];
+static int  g_ctx_have_recipe;
+static char g_ctx_recipe[8192];
+static int  g_ctx_nbin;                    /* jumlah .mrp terpasang      */
+static struct egg_installed* g_ctx_inst;   /* entri db aktif             */
+static char g_ctx_src[EGG_URL_MAX];        /* override sumber update
+                                              (eggkg update <sumber>)    */
+
+/* [3/4] build via mtcc -make (reuse shell_eggkg_build_ruf). */
+static int egg_do_compile_ruf(const struct ecf_call_ctx* ctx) {
+    const char* ruf = (ctx->argc > 0) ? ctx->argv[0] : g_ctx_rufpath;
+    if (!ruf || !ruf[0]) { printf("eggkg: rufpath kosong\n"); return 1; }
+    int rc = shell_eggkg_build_ruf(ruf);
+    if (rc != 0) {
+        egg_fail(rc > 0 ? "mtcc melaporkan job gagal" : "spawn mtcc gagal");
+        return 1;
+    }
+    egg_ok("build selesai");
+    return 0;
+}
+
+/* [4/4] pasang .mrp -> /bin (pindahkan dari pkgdir). */
+static int egg_do_install_bin(const struct ecf_call_ctx* ctx) {
+    const char* pkgdir = (ctx->argc > 0) ? ctx->argv[0] : g_ctx_pkgdir;
+    egg_stage(4, 4, "pasang ke /bin + database");
+    struct fs_node* bindir = fs_get_node_from_path(fs_get_root(),
+                                                   EGG_BIN_DIR);
+    if (!bindir) {
+        if (egg_mkdir_p(EGG_BIN_DIR) != 0) { egg_fail("buat /bin gagal"); return 1; }
+        bindir = fs_get_node_from_path(fs_get_root(), EGG_BIN_DIR);
+        if (!bindir) { egg_fail("/bin tidak tersedia"); return 1; }
+    }
+    fs_find_child(bindir, ".");
+    struct egg_installed* inst = db_find(g_ctx_e->name);
+    if (!inst) inst = db_add(g_ctx_e->name);
+    if (!inst) { egg_fail("installed.db penuh"); return 1; }
+    inst->nfiles = 0;
+    egg_copy_str(g_ctx_e->version, inst->version, sizeof(inst->version));
+    egg_copy_str(g_ctx_e->deps, inst->deps, sizeof(inst->deps));
+
+    int nbin = 0;
+    struct fs_node* outdir = fs_get_node_from_path(fs_get_root(), pkgdir);
+    if (outdir) {
+        fs_find_child(outdir, "build.ruf");
+        for (struct fs_node* c = outdir->children; c; ) {
+            struct fs_node* nx = c->next;
+            if (!c->is_dir && egg_ends_with(c->name, ".mrp")) {
+                int rc;
+                struct fs_node* ex = fs_find_child(bindir, c->name);
+                if (ex) fs_delete_node(bindir, c->name);
+                if (!c->backing && !bindir->backing) {
+                    rc = fs_ram_relink_node(c, bindir, c->name);
+                } else if (fs_ensure_content(c) == 0 && c->content) {
+                    rc = fs_write_binary(bindir, c->name,
+                                         (const uint8_t*)c->content, c->size);
+                    if (rc == 0) fs_delete_node(outdir, c->name);
+                    else fs_delete_node(bindir, c->name);
+                } else rc = -3;
+                if (rc != 0) printf("      [gagal] pindah %s\n", c->name);
+                else {
+                    if (inst->nfiles < EGG_MAX_FILES)
+                        snprintf(inst->files[inst->nfiles++], 48, "%s/%s",
+                                 EGG_BIN_DIR, c->name);
+                    nbin++;
+                }
+            }
+            c = nx;
+        }
+    }
+    if (nbin == 0) { egg_fail("tidak ada .mrp dihasilkan"); return 1; }
+    printf("      [ok] %d perintah di " EGG_BIN_DIR "\n", nbin);
+    g_ctx_nbin = nbin;
+    g_ctx_inst = inst;
+    return 0;
+}
+
+/* [5] catat installed.db. */
+static int egg_do_db_record(const struct ecf_call_ctx* ctx) {
+    (void)ctx;   /* version sudah di-set di install_bin */
+    db_save();
+    return 0;
+}
+
+/* ---- handler [update] (dibungkus dari monolit egg_cmd_update) ---- */
+
+/* pkg.read_list <url> — unduh package.list, parse, derive repobase,
+ * simpan + komentar repobase ke <local>/package.list. */
+static int egg_do_read_list(const struct ecf_call_ctx* ctx) {
+    if (ctx->argc < 1 || !ctx->argv[0][0]) {
+        printf("eggkg: pkg.read_list butuh <url>\n");
+        return 1;
+    }
+    char local[128];
+    egg_local_dir(local, sizeof(local));
+    egg_mkdir_p(local);
 
     uint8_t* buf = (uint8_t*)malloc(EGG_NET_CAP);
     if (!buf) {
         printf("eggkg: heap kernel habis (butuh %d KB)\n",
                EGG_NET_CAP / 1024);
-        return;
+        return 1;
     }
-
-    char local[128];
-    egg_local_dir(local, sizeof(local));
-    egg_mkdir_p(local);
-
-    printf("eggkg: update (server: %s)\n", src);
     egg_stage(1, 2, "mengunduh package.list");
 
     uint32_t len = 0;
-    if (egg_fetch_one(src, buf, EGG_FETCH_CAP, &len) != 0) {
+    if (egg_fetch_one(ctx->argv[0], buf, EGG_FETCH_CAP, &len) != 0) {
         egg_fail("server tidak terjangkau / file tidak ada");
-        printf("      sumber: %s\n", src);
+        printf("      sumber: %s\n", ctx->argv[0]);
         printf("      cek: ifconfig (net up?), path benar, atau\n");
         printf("           eggkg update /equinox/repo/package.list\n");
         free(buf);
-        return;
+        return 1;
     }
     buf[len] = 0;
     if (len < 3 || buf[0] == '<') {
-        /* halaman HTML / kosong = format salah */
         egg_fail("isi bukan package.list (HTML/kosong?)");
         free(buf);
-        return;
+        return 1;
     }
     printf("      [ok] %u bytes\n", (unsigned)len);
 
@@ -1150,20 +1389,19 @@ static void egg_cmd_update(const char* src_arg) {
         egg_fail("format package.list tidak dikenali");
         printf("      format: nama = [\"url1\", \"url2\", ...]\n");
         free(buf);
-        return;
+        return 1;
     }
 
     /* derive repobase dari sumber LIST (bukan dari URL .c) */
-    egg_repo_base_from(src, g_repo_base, EGG_URL_MAX);
+    egg_repo_base_from(ctx->argv[0], g_repo_base, EGG_URL_MAX);
 
-    /* simpan + tulis komentar repobase utk eggkg install — ukuran
-     * PAS (len + komentar); heap live-ISO sempit, jangan boros */
+    /* simpan + tulis komentar repobase utk eggkg install — ukuran PAS */
     uint32_t ocap = len + 128;
     uint8_t* out = (uint8_t*)malloc(ocap);
     if (!out) {
         printf("eggkg: heap habis (save package.list)\n");
         free(buf);
-        return;
+        return 1;
     }
     uint32_t o = 0;
     o += (uint32_t)snprintf((char*)out, ocap - 1,
@@ -1176,11 +1414,28 @@ static void egg_cmd_update(const char* src_arg) {
     if (egg_write_file(plist, out, o) != 0)
         printf("      [gagal] tulis %s\n", plist);
     free(out);
+    free(buf);
+    return 0;
+}
 
+/* pkg.fetch_index <repobase> — unduh index.idx (opsional, v0 sah). */
+static int egg_do_fetch_index(const struct ecf_call_ctx* ctx) {
+    if (ctx->argc < 1) {
+        printf("eggkg: pkg.fetch_index butuh <repobase>\n");
+        return 1;
+    }
+    char local[128];
+    egg_local_dir(local, sizeof(local));
+
+    uint8_t* buf = (uint8_t*)malloc(EGG_NET_CAP);
+    if (!buf) {
+        printf("eggkg: heap kernel habis (index)\n");
+        return 1;
+    }
     egg_stage(2, 2, "index.idx (opsional)");
     char iurl[EGG_URL_MAX];
-    snprintf(iurl, sizeof(iurl), "%s%s", g_repo_base, EGG_INDEX_NAME);
-    len = 0;
+    snprintf(iurl, sizeof(iurl), "%s%s", ctx->argv[0], EGG_INDEX_NAME);
+    uint32_t len = 0;
     if (egg_fetch_one(iurl, buf, EGG_FETCH_CAP, &len) == 0) {
         buf[len] = 0;
         egg_parse_index((const char*)buf);
@@ -1195,14 +1450,111 @@ static void egg_cmd_update(const char* src_arg) {
         printf("      (tanpa index.idx — verifikasi sha256 "
                "dilewati, package.list v0 tetap sah)\n");
     }
+    free(buf);
+    return 0;   /* index opsional: gagal unduh = bukan kegagalan */
+}
+
+static int g_egg_handlers_inited;
+static void egg_register_handlers(void) {
+    if (g_egg_handlers_inited) return;
+    g_egg_handlers_inited = 1;
+    ecf_call_register("mtcc.compile_ruf_eggkg", egg_do_compile_ruf);
+    ecf_call_register("pkg.install_bin",        egg_do_install_bin);
+    ecf_call_register("pkg.db_record",          egg_do_db_record);
+    ecf_call_register("pkg.read_list",          egg_do_read_list);
+    ecf_call_register("pkg.fetch_index",        egg_do_fetch_index);
+}
+
+/* Resolve satu argumen: $var -> nilai konteks; selain itu apa adanya.
+ * return salinan ke out (bounded). */
+static void egg_resolve_arg(const char* in, char* out, int cap) {
+    out[0] = 0;
+    if (in[0] == '$') {
+        const char* v = in + 1;
+        if (egg_ieq(v, "rufpath")) egg_copy_str(g_ctx_rufpath, out, cap);
+        else if (egg_ieq(v, "pkgdir")) egg_copy_str(g_ctx_pkgdir, out, cap);
+        else if (egg_ieq(v, "name") && g_ctx_e)
+            egg_copy_str(g_ctx_e->name, out, cap);
+        else if (egg_ieq(v, "version") && g_ctx_e)
+            egg_copy_str(g_ctx_e->version, out, cap);
+        else if (egg_ieq(v, "server")) {
+            /* override eksplisit: `eggkg update <sumber>` menang */
+            if (g_ctx_src[0]) egg_copy_str(g_ctx_src, out, cap);
+            else egg_server_url(out, cap);
+        }
+        else if (egg_ieq(v, "repobase")) egg_copy_str(g_repo_base, out, cap);
+        else if (egg_ieq(v, "local")) egg_copy_str(g_ctx_local, out, cap);
+        else egg_copy_str(in, out, cap);   /* $var tak dikenal: literal */
+        return;
+    }
+    egg_copy_str(in, out, cap);
+}
+
+/* Jalankan section `sec` dari config: load -> validasi atomik -> eksekusi.
+ * return 0 = semua step ok; >0 = ada gagal; -1 = config invalid (tak
+ * jalan sama sekali). */
+static int egg_run_steps(int sec, const char* title) {
+    egg_register_handlers();
+    const char* cp = ecf_tool_path("eggkg", 0);
+    if (!cp) {
+        /* auto-seed lalu baca-balik: config = satu-satunya jalur */
+        if (egg_write_config(0) != 0) return -1;
+        cp = ecf_tool_path("eggkg", 0);
+        if (!cp) return -1;
+    }
+    if (egg_load_steps(sec, cp) <= 0) {
+        printf("eggkg: section %s kosong di %s\n",
+               (sec == 0) ? "[update]" : "[install]", cp);
+        return -1;
+    }
+    /* VALIDASI atomik: bila ada aksi tak dikenal, TIDAK jalan sama sekali */
+    if (egg_validate_steps(sec) != 0) {
+        printf("eggkg: resep %s INVALID — tidak ada yang dijalankan\n", title);
+        return -1;
+    }
+    int fails = 0;
+    for (int i = 0; i < g_egg_nstep[sec]; i++) {
+        struct egg_step* st = &g_egg_step[sec][i];
+        struct ecf_call_ctx ctx;
+        ctx.caller = "eggkg";
+        ctx.argc = 0;
+        for (int a = 0; a < st->argc && ctx.argc < ECF_CALL_ARGC_MAX; a++) {
+            static char res[ECF_CALL_ARGC_MAX][64];
+            egg_resolve_arg(st->argv[a], res[ctx.argc], 64);
+            ctx.argv[ctx.argc] = res[ctx.argc];
+            ctx.argc++;
+        }
+        if (ecf_call(st->action, &ctx) != 0) {
+            printf("[ERROR] step %d (%s) gagal\n", i + 1, st->action);
+            fails++;
+            break;   /* stop on first failure (install tak boleh setengah) */
+        }
+    }
+    return fails;
+}
+
+/* ============================================================
+ *  eggkg update [sumber]
+ *  0.5 — pembungkus tipis: set konteks, lalu jalankan resep
+ *  [update] dari .config/eggkg.ecf (validasi atomik dulu).
+ *  ============================================================ */
+static void egg_cmd_update(const char* src_arg) {
+    egg_register_handlers();
+    if (src_arg && src_arg[0]) egg_copy_str(src_arg, g_ctx_src, EGG_URL_MAX);
+    else                       g_ctx_src[0] = 0;
+
+    char shown[EGG_URL_MAX];
+    if (g_ctx_src[0]) egg_copy_str(g_ctx_src, shown, EGG_URL_MAX);
+    else              egg_server_url(shown, EGG_URL_MAX);
+    printf("eggkg: update (server: %s)\n", shown);
+
+    if (egg_run_steps(0, "[update]") != 0) return;
 
     int with_ver = 0;
     for (int i = 0; i < g_npkg; i++)
         if (g_pkg[i].version[0]) with_ver++;
     printf("eggkg: %d paket di index%s\n", g_npkg,
            with_ver ? "" : " (package.list v0 — tanpa versi/hash)");
-    free(out);
-    free(buf);
 }
 
 /* ============================================================
@@ -1452,94 +1804,24 @@ static void egg_cmd_install(const char* name, int assume_yes) {
     }
     printf("      resep: %s\n", rufpath);
 
-    rc = shell_eggkg_build_ruf(rufpath);
+    /* ---------- [3/4]+[4/4] build -> pasang -> db via STEP LIST ------
+     * Resep .config/eggkg.ecf (validasi atomik) menggerakkan build,
+     * pasang /bin, dan catat db lewat handler ecf_caller. Urutan &
+     * aksi datang dari config — bukan hardcode. */
+    g_ctx_e = e;
+    egg_copy_str(local, g_ctx_local, sizeof(g_ctx_local));
+    egg_copy_str(pkgdir, g_ctx_pkgdir, sizeof(g_ctx_pkgdir));
+    egg_copy_str(rufpath, g_ctx_rufpath, sizeof(g_ctx_rufpath));
+    g_ctx_nbin = 0;
+    g_ctx_inst = NULL;
+
+    egg_stage(3, 4, "build (resep config)");
+    rc = egg_run_steps(1, "[install]");
     if (rc != 0) {
-        egg_fail(rc > 0 ? "mtcc melaporkan job gagal"
-                        : "spawn mtcc gagal");
+        if (rc > 0) egg_fail("step install gagal (lihat [ERROR] di atas)");
         free(buf);
         return;
     }
-    egg_ok("build selesai");
-
-    /* ---------- [4/4] pasang ---------- */
-    egg_stage(4, 4, "pasang ke /bin + database");
-    struct fs_node* bindir = fs_get_node_from_path(fs_get_root(),
-                                                   EGG_BIN_DIR);
-    if (!bindir) {
-        if (egg_mkdir_p(EGG_BIN_DIR) != 0) {
-            egg_fail("buat /bin gagal");
-            free(buf);
-            return;
-        }
-        bindir = fs_get_node_from_path(fs_get_root(), EGG_BIN_DIR);
-        if (!bindir) {
-            egg_fail("/bin tidak tersedia");
-            free(buf);
-            return;
-        }
-    }
-
-    /* pemikat populate utk volume FAT32 (children lazily diisi) */
-    fs_find_child(bindir, ".");
-
-    struct egg_installed* inst = db_find(e->name);
-    if (!inst) inst = db_add(e->name);
-    if (!inst) {
-        egg_fail("installed.db penuh");
-        free(buf);
-        return;
-    }
-    inst->nfiles = 0;
-    egg_copy_str(e->version, inst->version, sizeof(inst->version));
-    egg_copy_str(e->deps, inst->deps, sizeof(inst->deps));
-
-    int nbin = 0;
-    /* hasil build ada di <pkgdir> (out) — PINDAHKAN ke /bin.
-     * RAMFS: fs_ram_relink_node = pindah node TANPA salin konten
-     * (zero-copy; lesson 0.4 Beta: 19 x 33 KB terduplikasi mengoyak heap
-     * ~1 MB -> "GAGAL tulis"/fragmentasi). FAT: salin + hapus —
-     * konten .mrp tinggal di fat arena, bukan kernel heap. */
-    struct fs_node* outdir = fs_get_node_from_path(fs_get_root(),
-                                                   pkgdir);
-    if (outdir) {
-        fs_find_child(outdir, "build.ruf");   /* pemicu populate FAT  */
-        for (struct fs_node* c = outdir->children; c; ) {
-            struct fs_node* nx = c->next;     /* aman utk relink/del  */
-            if (!c->is_dir && egg_ends_with(c->name, ".mrp")) {
-                int rc;
-                struct fs_node* ex = fs_find_child(bindir, c->name);
-                if (ex) fs_delete_node(bindir, c->name);
-                if (!c->backing && !bindir->backing) {
-                    rc = fs_ram_relink_node(c, bindir, c->name);
-                } else if (fs_ensure_content(c) == 0 && c->content) {
-                    rc = fs_write_binary(bindir, c->name,
-                                         (const uint8_t*)c->content,
-                                         c->size);
-                    if (rc == 0) fs_delete_node(outdir, c->name);
-                    else fs_delete_node(bindir, c->name);
-                } else {
-                    rc = -3;
-                }
-                if (rc != 0) {
-                    printf("      [gagal] pindah %s\n", c->name);
-                } else {
-                    if (inst->nfiles < EGG_MAX_FILES) {
-                        snprintf(inst->files[inst->nfiles++], 48,
-                                 "%s/%s", EGG_BIN_DIR, c->name);
-                    }
-                    nbin++;
-                }
-            }
-            c = nx;
-        }
-    }
-    if (nbin == 0) {
-        egg_fail("tidak ada .mrp dihasilkan");
-        free(buf);
-        return;
-    }
-    printf("      [ok] %d perintah di " EGG_BIN_DIR "\n", nbin);
-    db_save();
 
     /* ---------- post-hook [dependencies] (paket bash) ---------- */
     if (egg_ieq(e->name, "bash")) {
@@ -1558,7 +1840,8 @@ static void egg_cmd_install(const char* name, int assume_yes) {
     }
 
     printf("\n  %s%s terpasang — %d perintah aktif (system path "
-           "/bin).\n", e->name, e->version[0] ? e->version : "", nbin);
+           "/bin).\n", e->name, e->version[0] ? e->version : "",
+           g_ctx_nbin);
     printf("  coba langsung: ls, grep, wc  |  nonaktif: eggkg remove "
            "%s\n", e->name);
     free(buf);
@@ -1735,6 +2018,10 @@ static void egg_cmd_info(const char* name) {
 static void egg_boot_sync(int verbose);
 
 void eggkg_boot_check(void) {
+    /* 0.5: daftarkan aksi eggkg ke ecf_caller saat boot — supaya
+     * `config callers` dan `call pkg.*` tersedia tanpa pernah
+     * memanggil eggkg lebih dulu. */
+    egg_register_handlers();
     egg_boot_sync(0);
 }
 
@@ -1807,6 +2094,7 @@ static void egg_boot_sync(int verbose) {
     }
 }
 
+
 /* ============================================================
  *  Dispatch + help
  * ============================================================ */
@@ -1822,6 +2110,9 @@ static void egg_help(void) {
     printf("  sync                 auto-detect .local -> /bin (juga\n");
     printf("                       jalan saat boot bila [dependencies]\n");
     printf("                       bash=true di system.ecf)\n");
+    printf("  init                 tulis .config/eggkg.ecf (resep default)\n");
+    printf("  plan                 tunjukkan resep [install] hasil-resolve\n");
+    printf("                       (dry-run: baca + validasi, tanpa eksekusi)\n");
     printf("\n");
     printf("  server default (ecf [eggkg] server=...):\n");
     printf("    %s\n", EGG_SERVER_DEFAULT);
@@ -1829,6 +2120,10 @@ static void egg_help(void) {
 
 void eggkg_cmd(const char* args) {
     while (*args == ' ') args++;
+
+    /* 0.5: pastikan handler aksi eggkg terdaftar di ecf_caller
+     * sebelum dispatch (plan/init/install semuanya butuh ini). */
+    egg_register_handlers();
 
     char cmd[24];
     int i = 0;
@@ -1846,6 +2141,28 @@ void eggkg_cmd(const char* args) {
     if (egg_ieq(cmd, "search")) { egg_cmd_search(rest); return; }
     if (egg_ieq(cmd, "info"))   { egg_cmd_info(rest);   return; }
     if (egg_ieq(cmd, "sync"))   { egg_boot_sync(1);     return; }
+
+    if (egg_ieq(cmd, "init"))   { egg_write_config(1);  return; }
+
+    if (egg_ieq(cmd, "plan"))   {
+        /* dry-run: load + validasi section [install] tanpa eksekusi */
+        const char* cp = ecf_tool_path("eggkg", 0);
+        if (!cp) {
+            printf("eggkg: .config/eggkg.ecf belum ada — jalanin: "
+                   "eggkg init\n");
+            return;
+        }
+        if (egg_load_steps(1, cp) <= 0) {
+            printf("eggkg: section [install] kosong di %s\n", cp);
+            return;
+        }
+        egg_show_steps(1, "resep [install] (dry-run)");
+        if (egg_validate_steps(1) == 0)
+            printf("eggkg: resep valid — siap eksekusi\n");
+        else
+            printf("eggkg: resep INVALID — perbaiki dulu\n");
+        return;
+    }
 
     if (egg_ieq(cmd, "install") || egg_ieq(cmd, "remove")) {
         /* parse: <nama> [-y] */

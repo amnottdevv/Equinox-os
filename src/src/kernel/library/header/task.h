@@ -68,6 +68,7 @@ struct sys_fd_entry {
     struct fs_node* dcur;          /* 0.4 Beta: SYS_READDIR cursor (O_DIR fds) */
     struct kpipe* pipe;            /* 0.4 Beta: pipe object (node == NULL) */
     uint32_t pipe_end;             /* 0.4 Beta: 0 = read end, 1 = write end */
+    void*    sock;                 /* extended: ring-3 TCP socket (node/pipe == NULL) */
 };
 
 /* u3_save — written by the asm user3_launch4 (offsets 0 and 4 MUST stay). */
@@ -133,6 +134,10 @@ struct Task {
     uint32_t     u3_normal;                 /* normal exit? (0/1) */
     uint32_t     u3_status;                 /* exit status / fault code */
     struct task_mrp_arena mrp_arena;        /* per-task arena allocator */
+
+    /* extended 0.5: memory model + COW fork */
+    int          forked;                    /* 1 = forked child (exits via task_exit_final) */
+    uint32_t     brk;                       /* program break within the demand window */
 
     /* --- per-task syscall state --- */
     struct sys_fd_entry fds[TASK_MAX_FDS];
@@ -253,6 +258,10 @@ void     task_mem_dump(void);
  * *status_out (32-bit exit code, 0x80000000|vec = faulted), or a
  * negative errno (SYS_ECHILD = no matching child). */
 int  task_wait_pid(int pid, uint32_t* status_out);
+
+/* extended 0.5: COW fork. Called from syscall_dispatch with the full
+ * interrupt frame (regs as laid out by pushal+CPU iret frame). */
+struct Task* task_fork_user(uint32_t* regs);
 
 /* Wake tasks blocked in wait() whose request matches child_pid
  * (called when a task becomes a zombie). */

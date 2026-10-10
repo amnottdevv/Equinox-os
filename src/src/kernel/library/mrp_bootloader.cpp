@@ -276,10 +276,16 @@ extern "C" int mrp_bootloader_load_modules(const multiboot_info_t* mb_info) {
         while (name[namelen]) namelen++;
         int is_csrc = (namelen >= 2 && name[namelen-1] == 'c' &&
                        name[namelen-2] == '.');
+        /* Stage-3 multi-file sample: a flat .h sits NEXT TO its .c sample in
+         * /test so `#include "shared.h"` (source-relative fallback) resolves
+         * inside the OS exactly as it does on the host. */
+        int is_hsrc = (namelen >= 2 && name[namelen-1] == 'h' &&
+                       name[namelen-2] == '.');
+        int is_sample_src = is_csrc || is_hsrc;
 
         if (!dest) {
-            /* flat: legacy rule — .c -> /test, everything else -> root */
-            if (is_csrc) {
+            /* flat: legacy rule — .c/.h -> /test, everything else -> root */
+            if (is_sample_src) {
                 if (!testdir) {
                     testdir = fs_find_child(root, "test");
                     if (!testdir) {

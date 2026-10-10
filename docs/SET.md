@@ -128,3 +128,16 @@ The shell builtin is a thin wrapper over `ecf.c`:
 
 After any edit outside `set` itself, call `ecf_store_invalidate()` so
 the next `ecf_store()` reloads from disk.
+
+## Writing through `ecf_caller`
+
+`call set.key <key> <val> [-> <ecf>]` performs the same patch as
+`set k v` but names its target file explicitly and works from any
+caller (shell, a `.ecf` recipe step, another handler). When the target
+is the active store the handler also syncs the in-memory store, so a
+following `set KEY` reads back the fresh value — same coherence rule as
+the `set` builtin.
+
+`call set.path_local <path>` and `call set.active <file>` cover the
+`eggkg.local` and store-pivot cases. See [ECF.md](ECF.md) for the
+registry and the full action table.

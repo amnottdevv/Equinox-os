@@ -91,7 +91,15 @@ grep -n printf /test/hello.c | tr a-z A-Z > /mnt/out.txt
 | `equinoxinstall -compile <dir>` | compile userland from `<dir>/libc` + `<dir>/tools` only |
 | `equinoxinstall -build <ruf\|name\|*.ruf>` | build via ruf v3 recipe / one tool / glob |
 | `mtcc <file.c>` | compile **and run** C in the OS — `mtcc /test/hello.c` |
-| `mtcc -c <file.c>` / `mtcc -make <file.ruf>` | compile only / run a build recipe ([SELF_HOSTING.md](SELF_HOSTING.md)) |
+| `mtcc <a.c> <b.c> …` | **multi-file**: link every file into ONE program (`-o name` gives the output, else the first file's name; commas work too: `mtcc a.c,b.c`) |
+| `mtcc -c <file.c>` / `mtcc -make <file.ruf>` | compile only / run a build recipe — v3 walk jobs **plus v4**: `multiple_file = True` (every `src` source links into ONE program), `job <n> from a.c & b.c to out.mrp [format mrp\|elf]` (one line = N sources → one output), `set key = value` merged into an `.ecf` after a green build ([SELF_HOSTING.md](SELF_HOSTING.md)) |
+| `mtcc -c -format elf <file.c>` | write a **static ELF32** (`ET_EXEC` @ `0x01000000`) instead of `.mrp` — then `run <file>.elf` |
+| `mtcc -c -multiple-files <a.c> <b.c>` | explicit "link these files" marker (several files are detected automatically) |
+
+Status lines are English and colour-tagged: green `[COMPILE] a.c -> a.mrp`,
+cyan `[LINK]`/`[OUTPUT]`, red `[ERROR] file:line: message`, yellow
+`[WARNING]` (the console parses ANSI SGR natively); `-q` prints the
+program output only.
 | `eggkg update\|install\|remove\|list\|search\|info\|sync` | package manager ([PACKAGES.md](PACKAGES.md)) — `eggkg install bash` brings the coreutils |
 | `set …` | configuration store + eqshell runner ([CONFIGURATION.md](CONFIGURATION.md)) |
 | `Qfs -list-disk\|-format\|-install-boot` | disk tool ([QFS.md](QFS.md)) |

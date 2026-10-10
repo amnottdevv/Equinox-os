@@ -63,6 +63,7 @@ wizard or the `eggkg` package manager.
 
 | Document | What it covers |
 | --- | --- |
+| [Customization](CUSTOMIZATION.md) | The layered model: system store → `.config/` → `ecf_caller` → recipes |
 | [Configuration](CONFIGURATION.md) | `.ecf`, the `set` builtin, eqshell scripts |
 | [`set` builtin](SET.md) | Full reference for every `set` flag + the C API |
 | [`system.ecf`](SYSTEM_ECF.md) | Key-by-key schema and boot-time resolution |
@@ -99,6 +100,7 @@ wizard or the `eggkg` package manager.
 | Document | What it covers |
 | --- | --- |
 | [Self Hosting](SELF_HOSTING.md) | `mtcc`, MRP1 executables, ruf v3 recipes |
+| [mtcc language reference](MTCC_LANGUAGE.md) | The full C subset: types, `struct`/`union`, statements, limits |
 | [MRP1 format](MRP.md) | The `.mrp` header layout, checksum, loader |
 | [Packages](PACKAGES.md) | `eggkg` reference, package repo format, writing packages |
 

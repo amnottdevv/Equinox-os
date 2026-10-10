@@ -118,7 +118,7 @@ persistent.
 | --- | --- |
 | `equinoxinstall` | Full wizard (phases 1–4 + optional 5) |
 | `equinoxinstall -compile <dir>` | Only phase [4/4]: compile userland from `<dir>` (expects `<dir>/libc` + `<dir>/tools`) |
-| `equinoxinstall -build <file.ruf>` | Build one ruf v3 recipe via `mtcc -make` |
+| `equinoxinstall -build <file.ruf>` | Build one ruf v3/v4 recipe via `mtcc -make` |
 | `equinoxinstall -build <name>` | Build a single tool from `/equinox/tools` (`mtcc -c`) |
 | `equinoxinstall -build *.ruf` | Build every matching recipe (single-star glob) |
 

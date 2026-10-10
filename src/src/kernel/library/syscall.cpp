@@ -39,6 +39,7 @@
 #include "header/usermode.h"    // user3_terminate + region user (0.4 Beta)
 #include "header/task.h"        // Phase A: per-task fd/cwd/args + graphics focus gate
 #include "net/net.h"             // 0.4 Beta Phase C: net_get_info / net_ping_raw
+#include "header/elf.h"         // USER_ARENA + ELF heap window constants
 #include <stdint.h>
 #include <stddef.h>
 
@@ -385,10 +386,14 @@ static uint32_t sys_write(uint32_t fd, uint32_t buf_, uint32_t len) {
     if (syscall_from_user() && !user_range_ok((uint32_t)(uintptr_t)buf, len))
         return (uint32_t)SYS_EFAULT;
 
-    /* 0.4 Beta: stdout/stderr REDIRECTED ke pipe (shell `A | B`, `A > f`)
-     * — dicek SEBELUM jalur console. */
+    /* extended 0.5: socket fd — send/recv over the ring-3 TCP client. */
     if (fd <= SYS_FD_STDERR && fd_table[fd].pipe)
         return pipe_write(fd, buf, len);
+
+    if (!fd_table[fd].node && !fd_table[fd].pipe && fd_table[fd].sock) {
+        int n = net_socket_write(fd_table[fd].sock, buf, len);
+        return n < 0 ? (uint32_t)SYS_EIO : (uint32_t)n;
+    }
 
     if (fd == SYS_FD_STDOUT || fd == SYS_FD_STDERR) {
         /* Console: print exactly len bytes (binary-safe). */
@@ -453,6 +458,12 @@ static uint32_t sys_read(uint32_t fd, uint32_t buf_, uint32_t len) {
     /* 0.4 Beta (FR-02): a pipe read end — blocking ring read. */
     if (!fd_table[fd].node && fd_table[fd].pipe)
         return pipe_read(fd, buf, len);
+
+    /* extended 0.5: a socket fd reads received TCP bytes. */
+    if (!fd_table[fd].node && !fd_table[fd].pipe && fd_table[fd].sock) {
+        int n = net_socket_read(fd_table[fd].sock, buf, len);
+        return n < 0 ? (uint32_t)SYS_EIO : (uint32_t)n;
+    }
 
     if (!fd_table[fd].node)
         return (uint32_t)SYS_EBADF;
@@ -539,6 +550,15 @@ static uint32_t fd_close_index(uint32_t fd) {
 static uint32_t sys_close(uint32_t fd, uint32_t a2, uint32_t a3) {
     (void)a2; (void)a3;
     if (fd < 3 || fd >= SYS_MAX_FDS) return (uint32_t)SYS_EBADF;
+    /* extended 0.5: close a socket fd */
+    if (!fd_table[fd].node && !fd_table[fd].pipe && fd_table[fd].sock) {
+        net_socket_close(fd_table[fd].sock);
+        net_socket_free(fd_table[fd].sock);
+        fd_table[fd].sock = nullptr;
+        fd_table[fd].pos  = 0;
+        fd_table[fd].mode = 0;
+        return 0;
+    }
     /* 0.4 Beta (FR-02): a pipe end — refcount drop + wake + EOF. */
     if (!fd_table[fd].node && fd_table[fd].pipe) {
         struct kpipe* p = fd_table[fd].pipe;
@@ -2097,6 +2117,77 @@ static uint32_t sys_meminfo(uint32_t w_, uint32_t a2, uint32_t a3) {
     return 0;
 }
 
+/* ---- extended 0.5: program break (ELF heap window, demand-backed) ---- */
+static uint32_t sys_sbrk(uint32_t inc, uint32_t a2, uint32_t a3) {
+    (void)a2; (void)a3;
+    struct Task* t = task_current();
+    /* ring-3 caller, NOT `kind == TASK_KIND_USER`: the shell runs its
+     * programs INLINE in task 0 (kind SHELL), and the break belongs to
+     * the user address space either way. */
+    if (!t || !syscall_from_user()) return (uint32_t)SYS_ENOSYS;
+    if (t->brk < ELF_HEAP_VMA || t->brk > ELF_HEAP_VMA + ELF_HEAP_BYTES)
+        t->brk = ELF_HEAP_VMA;          /* a launch path that never set it */
+    if (inc == 0) return t->brk;
+    if ((int32_t)inc < 0) return (uint32_t)SYS_EINVAL;
+    uint32_t newbrk = t->brk + inc;
+    if (newbrk > ELF_HEAP_VMA + ELF_HEAP_BYTES) return (uint32_t)SYS_ENOMEM;
+    uint32_t old = t->brk;
+    t->brk = newbrk;
+    return old;
+}
+
+/* ---- extended 0.5: demand-backed mmap window ---- */
+static uint32_t sys_mmap(uint32_t addr_, uint32_t len, uint32_t prot) {
+    (void)prot;
+    struct Task* t = task_current();
+    if (!t || !syscall_from_user()) return (uint32_t)SYS_ENOSYS;
+    if (len == 0) return (uint32_t)SYS_EINVAL;
+    if (t->brk < ELF_HEAP_VMA || t->brk > ELF_HEAP_VMA + ELF_HEAP_BYTES)
+        t->brk = ELF_HEAP_VMA;          /* a launch path that never set it */
+    uint32_t addr = addr_;
+    if (addr == 0) addr = t->brk;
+    addr = (addr + 0xFFFu) & ~0xFFFu;
+    uint32_t newbrk = addr + ((len + 0xFFFu) & ~0xFFFu);
+    if (newbrk > ELF_HEAP_VMA + ELF_HEAP_BYTES) return (uint32_t)SYS_ENOMEM;
+    t->brk = newbrk;
+    return addr;
+}
+
+/* ---- extended 0.5: direct socket creation ---- */
+static uint32_t sys_socket(uint32_t domain, uint32_t type, uint32_t protocol) {
+    (void)protocol;
+    if (domain != 2 || type != 1) return (uint32_t)SYS_ENOSYS;  /* AF_INET, SOCK_STREAM */
+    int fd = -1;
+    for (int i = 3; i < SYS_MAX_FDS; i++) {
+        if (!fd_table[i].node && !fd_table[i].pipe && !fd_table[i].sock) {
+            fd = i; break;
+        }
+    }
+    if (fd < 0) return (uint32_t)SYS_EMFILE;
+    void* s = net_socket_alloc();
+    if (!s) return (uint32_t)SYS_ENOMEM;
+    fd_table[fd].sock = s;
+    fd_table[fd].node = nullptr;
+    fd_table[fd].pipe = nullptr;
+    fd_table[fd].pipe_end = 0;
+    fd_table[fd].pos = 0;
+    fd_table[fd].mode = 0;
+    fd_table[fd].dirty = 0;
+    fd_table[fd].dcur = nullptr;
+    return (uint32_t)fd;
+}
+
+/* ---- extended 0.5: net() — connect a socket ---- */
+static uint32_t sys_net(uint32_t fd_, uint32_t host_, uint32_t port) {
+    if (fd_ < 3 || fd_ >= SYS_MAX_FDS) return (uint32_t)SYS_EBADF;
+    struct sys_fd_entry* e = &fd_table[fd_];
+    if (!e->sock) return (uint32_t)SYS_EBADF;
+    const char* host = (const char*)(uintptr_t)host_;
+    if (syscall_from_user() && !user_str_ok(host)) return (uint32_t)SYS_EFAULT;
+    int r = net_socket_connect(e->sock, host, (uint16_t)port);
+    return r == 0 ? 0 : (uint32_t)SYS_EIO;
+}
+
 /* ---- 52: spawn2(path, hint, args) — spawn with explicit args ---- */
 static uint32_t sys_spawn_common(const char* path, uint32_t arena_hint,
                                  const char* args) {
@@ -2220,6 +2311,11 @@ static const sys_fn_t syscall_table[SYS_COUNT] = {
     sys_spawn2,        /* 52  spawn2(path,hint,args)  FR-02 */
     sys_setclip,       /* 53  setclip(x|w<<16,y|h<<16) FR-17 */
     sys_drawline,      /* 54  drawline(x0|y0<<16,x1|y1<<16,c) FR-18 */
+    sys_sbrk,          /* 55  sbrk(inc)       extended */
+    sys_mmap,          /* 56  mmap(addr,len)  extended */
+    NULL,              /* 57  fork — handled before dispatch (COW) */
+    sys_socket,        /* 58  socket(domain,type,protocol) */
+    sys_net,           /* 59  net(fd,host,port) — connect socket */
 };
 
 static_assert(sizeof(syscall_table) / sizeof(syscall_table[0]) == SYS_COUNT,
@@ -2238,6 +2334,16 @@ extern "C" void syscall_dispatch(uint32_t* regs) {
 
     uint32_t num = regs[7];               // EAX = syscall number
     g_syscall_from_user = ((regs[9] & 3u) == 3u);   // CS & 3 == 3 -> CPL 3
+
+    /* extended 0.5: COW fork. We need the full interrupt frame, not the
+     * 3-arg handler interface, so dispatch it here before the table. */
+    if (num == SYS_FORK) {
+        struct Task* child = task_fork_user(regs);
+        regs[7] = child ? (uint32_t)child->pid : (uint32_t)SYS_ENOMEM;
+        task_sched_force_unlock();
+        g_syscall_from_user = 0;
+        return;
+    }
 
     if (num == 0 || num >= SYS_COUNT || syscall_table[num] == NULL) {
         /* Unknown number: print one line so it is visible while debugging
@@ -2341,4 +2447,11 @@ void syscall_list(void) {
     printf("  50  pipe(fds[2])              create a pipe (4 KB ring)\n");
     printf("  51  meminfo(w[6])             pool stats + demand pages\n");
     printf("  52  spawn2(path,hint,args)    spawn with explicit args\n");
+    printf("  53  setclip(x|w<<16,y|h<<16) per-task graphics clip window\n");
+    printf("  54  drawline(x0|y0<<16,x1|y1<<16,c) Bresenham line (clipped)\n");
+    printf("  55  sbrk(inc)                program break (old/current break)\n");
+    printf("  56  mmap(addr,len)           demand-backed page window\n");
+    printf("  57  fork()                   COW fork — returns child pid\n");
+    printf("  58  socket(domain,type)      create a TCP socket -> fd\n");
+    printf("  59  net(fd,host,port)        connect a socket (blocking)\n");
 }

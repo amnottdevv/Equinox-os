@@ -105,7 +105,7 @@ deliberately unmapped.
 ## Known limitations
 
 - ATAPI (CD over AHCI) is detected and skipped, not mounted.
-- mtcc remains a C subset (no struct-by-value, no float, no switch).
+- mtcc remains a C subset (no struct/union **by value**, no float, no `sizeof`); `struct`/`union`, `enum`, `typedef` and `switch` are supported — see `docs/MTCC_LANGUAGE.md`.
 - ICMP `ping` does not traverse QEMU slirp; use `tcpping`.
 - `MAX_TASKS` = 8; fd table 16/task; single user (`root`).
 - The GUI arena assumes ≤128 MB mapped RAM (tables clamp); DMA

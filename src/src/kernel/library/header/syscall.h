@@ -128,8 +128,17 @@ extern "C" {
 #define SYS_SETCLIP   53 /* (x|w<<16, y|h<<16) task draw window -> 0 / errno  */
 #define SYS_DRAWLINE  54 /* (x0|y0<<16, x1|y1<<16, color) Bresenham -> 0/err  */
 
-/* Number of table entries (index 0 = NULL, 1..54 = syscalls above). */
-#define SYS_COUNT     55
+/* ==== extended build 0.5: memory model + COW fork ==== */
+#define SYS_SBRK      55 /* (inc)  change program break                -> old break or errno */
+#define SYS_MMAP      56 /* (addr,len) map a demand-backed page window -> addr or errno */
+#define SYS_FORK      57 /* ()      clone the current ring-3 task      -> child pid or errno */
+
+/* ==== extended build 0.5: ring-3 TCP client ==== */
+#define SYS_SOCKET    58 /* (domain,type,protocol)                    -> fd or errno */
+#define SYS_NET       59 /* (fd,host,port) connect socket             -> 0 / errno */
+
+/* Number of table entries (index 0 = NULL, 1..59 = syscalls above). */
+#define SYS_COUNT     60
 
 /* ---------------------------------------------------------------
  *  Syscall SYS_NETINFO #34 (0.4 Beta Fase C — ring 3 network access).

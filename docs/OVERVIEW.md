@@ -23,6 +23,7 @@ dedicated suites for the installer, AHCI, E1000 and `.ecf`).
 | [PACKAGES.md](PACKAGES.md) | `eggkg` reference: `update / install / remove / list / search / info / sync`, the package repository format (package.list v0 + index.idx v1), the **bash package** (not bundled — installed via eggkg), writing your own package |
 | [QFS.md](QFS.md) | `Qfs` disk tool: `-list-disk`, `-format fat32`, `-install-boot`; disk naming (hda–hdh) and slot mapping |
 | [CONFIGURATION.md](CONFIGURATION.md) | The `.ecf` configuration system, the `set` builtin (all flags), `system.ecf` schema, eqshell scripts (`.es`) and `/eqshell.log` |
+| [CUSTOMIZATION.md](CUSTOMIZATION.md) | The layered configuration model: system store → per-tool `.config/<tool>.ecf` → the `ecf_caller` action registry → recipes; live editing, validation, and the `config` / `call` builtins |
 | [SET.md](SET.md) | Full reference for the `set` builtin — flags, persistence flow, the C API behind it |
 | [SYSTEM_ECF.md](SYSTEM_ECF.md) | `system.ecf` schema: every known key, boot-time resolution order, failure modes |
 | [ECF.md](ECF.md) | The `.ecf` format and store model: grammar, parse/merge rules, API, validation, limits |
@@ -37,6 +38,7 @@ dedicated suites for the installer, AHCI, E1000 and `.ecf`).
 | [NETWORKING.md](NETWORKING.md) | lwIP 2.1.3 stack, DHCP/DNS, `mget` (HTTP/HTTPS + TLS), `httpd`, QEMU user-mode networking, NE2000 vs E1000 |
 | [SELF_HOSTING.md](SELF_HOSTING.md) | `mtcc` (the in-OS C compiler), MRP1 executables, ruf v3 build recipes, `equinoxinstall -compile/-build`, the build pipeline |
 | [MTCC_API.md](MTCC_API.md) | The mtcc prelude headers: `morph.h`, `fileio.h`, `multitasking.h` (+ the hosted `Morph.h` SDK) |
+| [MTCC_LANGUAGE.md](MTCC_LANGUAGE.md) | The mtcc C subset: types, full `struct`/`union` support (nested, initializers, by-pointer), `enum`/`typedef`/`switch`, statements, operators, preprocessor, compile flags, limits, and what is explicitly *not* supported |
 | [SYSCALLS.md](SYSCALLS.md) | The full `int 0x80` interface: syscalls #1–#54, calling convention, errno values |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Technical overview: boot flow, memory map, multitasking, filesystems, networking, graphics, executable formats, build & test harnesses |
 | [COMMANDS.md](COMMANDS.md) | Complete shell reference: builtins (incl. `eggkg`, `Qfs`, `set`, `equinoxinstall`), userland tools, pipes/glob/redirect, example session |

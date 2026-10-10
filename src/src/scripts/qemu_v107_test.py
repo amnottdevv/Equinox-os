@@ -315,8 +315,8 @@ def main():
         ok_compile = False
         while time.time() - t0 < 300:
             txt = q.screen("-mtcc")
-            # marker sukses: "wrote divzero.mrp (N bytes) — run divzero.mrp"
-            if ("wrote" in txt and "bytes" in txt):
+            # marker sukses: "  [OUTPUT] /test/divzero.mrp (N bytes) — run ..."
+            if ("[OUTPUT]" in txt and "bytes" in txt):
                 ok_compile = True
                 break
             if "Unknown command" in txt or "error" in txt.lower():

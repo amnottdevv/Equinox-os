@@ -140,6 +140,16 @@ void ecf_store_invalidate(void);
  * `active.conf` bila key tidak ada di berkas utama. Buffer statis. */
 const char* ecf_file_get(const char* path, const char* key);
 
+/* ============================================================
+ *  0.5 — resolver direktori .config/ per-tool
+ * ------------------------------------------------------------
+ *  Lokasi kanonik: /equinox/.config/<tool>.ecf (volume /mnt
+ *  diprioritaskan; RAMFS fallback). Dir .config dibuat bila
+ *  for_write dan belum ada. Nama tool: huruf/angka/'_'/'-' saja.
+ *  return path absolut (buffer statis) atau NULL (tak ada / invalid).
+ * ============================================================ */
+const char* ecf_tool_path(const char* tool, int for_write);
+
 #ifdef __cplusplus
 }
 #endif

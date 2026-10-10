@@ -14,6 +14,7 @@ All Equinox OS documentation, grouped by topic.
 
 ## Configuration & the shell
 
+- [Customization — the layered model](CUSTOMIZATION.md)
 - [Configuration](CONFIGURATION.md)
 - [`set` builtin](SET.md)
 - [`system.ecf`](SYSTEM_ECF.md)
@@ -44,4 +45,6 @@ All Equinox OS documentation, grouped by topic.
 
 - [Self Hosting](SELF_HOSTING.md)
 - [MRP1 format](MRP.md)
+- [mtcc language reference](MTCC_LANGUAGE.md)
+- [mtcc API (preludes)](MTCC_API.md)
 - [FAQ](FAQ.md)

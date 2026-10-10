@@ -87,7 +87,27 @@ eggkg install bash
 
 With `dependencies.bash = true` in `system.ecf`, every subsequent boot
 re-syncs `/equinox/.local` into `/bin` automatically before the shell
-starts — installed tools survive and re-appear after reboots.
+starts — installed tools survive and reappear after reboots.
+
+### The build/install/record steps are config-driven
+
+Since 0.5 the **build → install → db record** tail of an install runs
+from the step list in `.config/eggkg.ecf` (see
+[ECF.md](ECF.md#resep-eggkg-configeggkgecf)), not from hard-coded
+order. The whole list is parsed and validated *before* anything runs
+(atomic), then each step is dispatched through `ecf_caller`
+(`mtcc.compile_ruf_eggkg`, `pkg.install_bin`, `pkg.db_record`).
+
+The **fetch** sub-step stays in the monolithic setup path on purpose
+(careful buffer management — the download buffer is freed before the
+mtcc spawn); this is stated in the recipe comments, not hidden.
+
+Edit the recipe live — no reboot or recompile:
+
+```sh
+edit /equinox/.config/eggkg.ecf   # reorder, drop, or add steps
+eggkg plan                        # dry-run: show resolved [install]
+```
 
 ## Configuration keys
 

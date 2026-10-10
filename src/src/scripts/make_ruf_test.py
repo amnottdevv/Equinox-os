@@ -26,12 +26,12 @@ RUF = {
     "eq": {
         "file": "/equinox/eq.ruf",
         "jobs": 41,          # 12 libc + 29 tools (games di-exclude)
-        "summary": "[make] selesai: 41 ok, 0 gagal (41 job)",
+        "summary": "done: 41 ok, 0 failed (41 job(s))",
     },
     "eqfull": {
         "file": "/equinox/eqfull.ruf",
         "jobs": 44,          # 12 libc + 29 tools + 3 games
-        "summary": "[make] selesai: 44 ok, 0 gagal (44 job)",
+        "summary": "done: 44 ok, 0 failed (44 job(s))",
     },
 }
 
@@ -54,14 +54,14 @@ def main():
     # T2 — mtcc -make dari RAMFS
     n0 = len(serial())
     rig.type_line(f"mtcc -make {spec['file']}", wait=1.0)
-    ok = wait_serial("[make] selesai:", 600, rig, t0=time.time())
+    ok = wait_serial("done: " + str(spec["jobs"]) + " ok", 600, rig, t0=time.time())
     check("T2 mtcc -make selesai", ok)
     if ok:
         tail = serial()[n0:]
-        ok_sum = "0 gagal (" + str(spec["jobs"]) + " job)" in tail
+        ok_sum = "0 failed (" + str(spec["jobs"]) + " job(s))" in tail
         check(f"T2b summary {spec['jobs']} job 0 gagal", ok_sum,
-              [l for l in tail.splitlines() if "selesai" in l][-1:])
-        ok0 = wait_serial("[make] ok: /equinox/tools/ls.c", 5, rig)
+              [l for l in tail.splitlines() if "done:" in l][-1:])
+        ok0 = wait_serial("/equinox/tools/ls.c -> ", 5, rig)
         check("T2c log per-file ok (ls.c)", ok0 or ("/equinox/tools/ls.c" in tail))
 
     # T3 — produk .mrp terlihat di RAMFS

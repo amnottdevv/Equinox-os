@@ -25,7 +25,7 @@
     E19 `eqgu foo.txt`             -> ditolak (bukan .c)
     E20 `eqgu ok.c` -> ketik kode valid -> Ctrl+S -> "Cek: OK"
     E21 Ctrl+Q -> "Editor closed." (keluar bersih)
-    E22 `eqgu bad.c` -> kode rusak -> Ctrl+S -> "Cek: GAGAL" + "mtcc: error"
+    E22 `eqgu bad.c` -> kode rusak -> Ctrl+S -> "Cek: GAGAL" + "[ERROR]"
 
   PHASE 2 — citra FAT32 EQDISK milik tes ini, 3 checks
     E23 boot + `cd /mnt` / `pwd`  -> volume kepasang di /mnt
@@ -53,7 +53,7 @@ sys.path.insert(0, HERE)
 from boot_test_v032 import (Qemu, ISO, SERIAL, check, PASS, FAIL,   # noqa: E402
                             serial, wait_serial)
 
-DISK = "/tmp/opencode/ecf_disk.img"
+DISK = "/tmp/ecf_disk.img"
 MKFS = os.path.join(HERE, "make_fat32_img.py")
 
 
@@ -261,8 +261,8 @@ def phase1():
     time.sleep(1.0)
     rig.sendkey("ctrl-s", wait=3.0)
     ok, w = wait_for(s0, "Cek: GAGAL", 60)
-    err = "mtcc: error" in w
-    check("E22 eqgu + Ctrl+S -> Cek: GAGAL + mtcc: error",
+    err = "[ERROR]" in w or "mtcc: error" in w
+    check("E22 eqgu + Ctrl+S -> Cek: GAGAL + [ERROR]",
           ok and err, w[-460:])
     rig.sendkey("ctrl-q", wait=2.0)
 

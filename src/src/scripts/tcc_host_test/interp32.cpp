@@ -31,6 +31,10 @@ static const uint8_t* m_data;    static uint64_t m_data_base; static uint32_t m_
 static uint8_t  m_stack[0x40000]; static const uint64_t STACK_TOP = 0x880000;
 static uint8_t  m_arena[0x80000]; static const uint64_t ARENA_BASE = 0xA0000
     ;static uint32_t arena_used;
+// extended 0.5: virtual heap window — the SAME VMA the kernel hands out
+// for SYS_SBRK/SYS_MMAP (ELF_HEAP_VMA = 32 MB, demand-backed there).
+static uint8_t  m_heap[0x200000]; static const uint64_t HEAP_BASE = 0x2000000ull;
+static uint32_t g_brk;
 static const uint64_t SENTINEL = 0xFFFF0000ull;
 
 static uint64_t g_ninstr;
@@ -68,6 +72,8 @@ static uint8_t* mem_ptr(uint64_t addr, uint32_t len, int writable, const char* w
         return m_stack + (addr - (STACK_TOP - sizeof(m_stack)));
     if (addr >= ARENA_BASE && addr + len <= ARENA_BASE + sizeof(m_arena))
         return m_arena + (addr - ARENA_BASE);
+    if (addr >= HEAP_BASE && addr + len <= HEAP_BASE + sizeof(m_heap))
+        return m_heap + (addr - HEAP_BASE);
     if (host_fb && addr >= (uint64_t)(uintptr_t)host_fb
                 && addr + len <= (uint64_t)(uintptr_t)host_fb + HOST_FB_SIZE)
         return host_fb + (addr - (uint64_t)(uintptr_t)host_fb);
@@ -145,6 +151,7 @@ static int g_stdin_eof;
 // used verbatim ("/" prefix stripped like syscall_resolve does).
 #include <map>
 #include <string>
+#include <vector>
 static std::map<std::string, std::string> g_ramfs;
 
 // ---- host "VESA" framebuffer helpers (see the region decl above) ----
@@ -216,11 +223,59 @@ static uint32_t sys_readline(uint32_t buf, uint32_t maxlen) {
     return n;
 }
 
+// ---- extended 0.5: SYS_SBRK / SYS_MMAP / SYS_FORK / SYS_WAIT / socket ----
+// The interpreter is single-threaded, so a fork() runs DEPTH-FIRST: the
+// snapshot taken at fork() time is what the CHILD executes on, and the
+// child's exit() restores it (memory + registers + EIP) and returns the
+// child pid to the parent. That is exactly the observable contract the
+// unit test asserts: the child resumes with 0, the parent gets a pid, and
+// no write of the child ever reaches the parent (COW isolation — free
+// here, real in the kernel).
+#define FORK_MAX_DEPTH 4
+struct ForkSnap {
+    std::vector<uint8_t> data, stack, arena, heap;
+    uint32_t regs[8];
+    uint64_t eip;
+    int fz, fs, fo;
+    uint32_t arena_used;
+    uint32_t g_brk;
+    uint32_t parent_pid, child_pid;
+};
+static ForkSnap g_fork[FORK_MAX_DEPTH];
+static int      g_fork_depth;
+static uint32_t g_pid = 1;         // getpid: 1 = the launched program
+static uint32_t g_next_pid = 2;    // first forked child
+static uint32_t g_zombie_pid;      // last exited child, reaped by wait()
+static int      g_zombie_status;
+
+static void fork_restore(const ForkSnap& s) {
+    memcpy((void*)m_data, s.data.data(), m_data_len);
+    memcpy(m_stack, s.stack.data(), sizeof(m_stack));
+    memcpy(m_arena, s.arena.data(), sizeof(m_arena));
+    memcpy(m_heap,  s.heap.data(),  sizeof(m_heap));
+    memcpy(R, s.regs, sizeof(R));
+    arena_used = s.arena_used;
+    g_brk      = s.g_brk;
+    EIP = s.eip;
+    FZ = s.fz; FS = s.fs; FO = s.fo;
+    g_pid = s.parent_pid;
+}
+
 static uint32_t do_syscall(void) {
     uint32_t num = R[rEAX], a1 = R[rEBX], a2 = R[rECX], a3 = R[rEDX];
     switch (num) {
-        case 1:  g_exit_flag = 1; g_exit_code = (int)a1; return a1;        // exit
-        case 3:  return 1;                                                  // getpid
+        case 1: { // exit(status) — inside a fork the CHILD dies: restore
+                  // the parent's snapshot and hand back the child pid.
+            if (g_fork_depth > 0) {
+                ForkSnap& s = g_fork[--g_fork_depth];
+                g_zombie_pid    = s.child_pid;
+                g_zombie_status = (int)a1;
+                fork_restore(s);
+                return s.child_pid;
+            }
+            g_exit_flag = 1; g_exit_code = (int)a1; return a1;    // exit
+        }
+        case 3:  return g_pid;                                     // getpid
                 case 4: { // write(fd, buf, len) - console only
             if (a1 == 1 || a1 == 2) {
                 for (uint32_t i = 0; i < a3; i++) { int c = rd8(a2 + i); fputc(c, stdout); }
@@ -469,6 +524,61 @@ static uint32_t do_syscall(void) {
             return out;
         }
         case 29: return 3;                                                    // ringinfo: user program (CPL 3)
+
+        // ---- extended 0.5 (SYS_WAIT 49, SYS_SBRK 55 .. SYS_NET 59) ----
+        case 49: { // wait(pid, status*) — one reaped child at a time
+            if (!g_zombie_pid || (a1 && a1 != g_zombie_pid))
+                return (uint32_t)-13;                                // SYS_ECHILD
+            if (a2) wr32(a2, (uint32_t)g_zombie_status);
+            uint32_t pid = g_zombie_pid;
+            g_zombie_pid = 0;
+            return pid;
+        }
+        case 55: { // sbrk(inc) -> old break (inc 0 = query)
+            if (a1 == 0) return g_brk;
+            if ((int32_t)a1 < 0) return (uint32_t)-6;                // SYS_EINVAL
+            if ((uint64_t)g_brk + a1 > HEAP_BASE + sizeof(m_heap))
+                return (uint32_t)-5;                                 // SYS_ENOMEM
+            { uint32_t old = g_brk; g_brk += a1; return old; }
+        }
+        case 56: { // mmap(addr, len) — bump allocator on the same window
+            if (a2 == 0) return (uint32_t)-6;                        // SYS_EINVAL
+            uint32_t addr = a1 ? a1 : g_brk;
+            addr = (addr + 0xFFFu) & ~0xFFFu;
+            uint32_t len = (a2 + 0xFFFu) & ~0xFFFu;
+            if ((uint64_t)addr + len > HEAP_BASE + sizeof(m_heap))
+                return (uint32_t)-5;                                 // SYS_ENOMEM
+            g_brk = addr + len;
+            return addr;
+        }
+        case 57: { // fork() — snapshot: the CHILD continues on it
+            if (g_fork_depth >= FORK_MAX_DEPTH) return (uint32_t)-5; // SYS_ENOMEM
+            ForkSnap& s = g_fork[g_fork_depth++];
+            s.data.assign(m_data, m_data + m_data_len);
+            s.stack.assign(m_stack, m_stack + sizeof(m_stack));
+            s.arena.assign(m_arena, m_arena + sizeof(m_arena));
+            s.heap.assign(m_heap, m_heap + sizeof(m_heap));
+            memcpy(s.regs, R, sizeof(R));
+            s.eip = EIP; s.fz = FZ; s.fs = FS; s.fo = FO;
+            s.arena_used = arena_used; s.g_brk = g_brk;
+            s.parent_pid = g_pid;
+            s.child_pid  = g_next_pid++;
+            g_pid = s.child_pid;          // the child is the running task now
+            return 0;                      // fork() == 0 in the child
+        }
+        case 58: { // socket(AF_INET, SOCK_STREAM) -> fd 3..15
+            if (a1 != 2 || a2 != 1) return (uint32_t)-1;             // SYS_ENOSYS
+            for (int i = 3; i < 16; i++)
+                if (!g_fds[i].used) {
+                    g_fds[i].used = true;
+                    g_fds[i].pos  = 0;
+                    g_fds[i].path = "<socket>";
+                    return (uint32_t)i;
+                }
+            return (uint32_t)-8;                                    // SYS_EMFILE
+        }
+        case 59: return (uint32_t)-11; // net(fd,host,port): SYS_EIO — the host
+                                        // harness has no server (SKIP path)
         default: fprintf(stderr, "[interp32] syscall asing %u\n", num); return (uint32_t)-1;
     }
 }
@@ -508,7 +618,11 @@ extern "C" int interp32_run(const uint8_t* code, uint64_t code_base, uint32_t co
     memset(R, 0, sizeof(R));
     memset(m_stack, 0, sizeof(m_stack));
     memset(m_arena, 0, sizeof(m_arena));
+    memset(m_heap, 0, sizeof(m_heap));
     arena_used = 0;
+    g_brk = (uint32_t)HEAP_BASE;              // sbrk/mmap window (ELF_HEAP_VMA)
+    g_fork_depth = 0; g_zombie_pid = 0;
+    g_pid = 1; g_next_pid = 2;
     g_ninstr = 0; g_exit_flag = 0; g_exit_code = 0; g_stdin_eof = 0;
     g_fatal = 0;
     {
@@ -593,9 +707,14 @@ extern "C" int interp32_run(const uint8_t* code, uint64_t code_base, uint32_t co
                 case 0x31: { uint32_t r = a ^ b; set_zsf(r); if (d.mod==3) R[d.rm]=r; else wr32(rm_addr(d), r); break; }
                 case 0x29: { uint32_t r = a - b; flags_sub(a, b); if (d.mod==3) R[d.rm]=r; else wr32(rm_addr(d), r); break; }
                 case 0x39: flags_sub(a, b); break;   // cmp - result discarded
+                default: abort_interp("ALU r/m butuh muatan baru", EIP); break;
             }
             break;
         }
+
+        // ---- add eax, imm32 (0x05) / sub eax, imm32 (0x2D) ----
+        case 0x05: { uint32_t v = fetch32(); uint32_t r = R[rEAX] + v; flags_add(R[rEAX], v); R[rEAX] = r; break; }
+        case 0x2D: { uint32_t v = fetch32(); uint32_t r = R[rEAX] - v; flags_sub(R[rEAX], v); R[rEAX] = r; break; }
 
         // ---- test eax, eax (85 /r mod=11) ----
         case 0x85: {

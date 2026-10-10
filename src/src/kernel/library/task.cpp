@@ -84,6 +84,36 @@ asm(
 extern "C" void __task_switch(struct Task* old, struct Task* newt);
 extern "C" void task_entry_trampoline(void);
 
+/* fork(): resume a child directly in ring 3 (never returns).
+ *  arg = const struct fork_frame* (see below).
+ *
+ *  This lives in plain asm ON PURPOSE: the first version pushed the iret
+ *  frame from an extended `asm` block, and GCC does NOT track pushes done
+ *  inside an asm — it emits %esp-relative operand offsets as if esp had
+ *  not moved, so the 5 pushes read 4 and 8 bytes BELOW the frame. iret
+ *  then popped garbage EIP/CS -> #GP (error code 0x214) inside
+ *  child_fork_entry. Everything here is addressed off %eax instead. */
+extern "C" void child_fork_resume(const void* frame) __attribute__((noreturn));
+asm(
+    ".global child_fork_resume\n"
+    ".text\n"
+    "child_fork_resume:\n"
+    "    movl 4(%esp), %eax\n"      /* frame (arg) — read BEFORE the pushes */
+    "    pushl 16(%eax)\n"          /* SS    (popped last)  */
+    "    pushl 12(%eax)\n"          /* user ESP              */
+    "    pushl 8(%eax)\n"           /* EFLAGS                */
+    "    pushl 4(%eax)\n"           /* CS                    */
+    "    pushl (%eax)\n"            /* EIP (top of the frame)*/
+    "    movl 20(%eax), %ebx\n"     /* GPRs — %eax-relative, esp-independent */
+    "    movl 24(%eax), %ecx\n"
+    "    movl 28(%eax), %edx\n"
+    "    movl 32(%eax), %edi\n"
+    "    movl 36(%eax), %esi\n"
+    "    movl 40(%eax), %ebp\n"
+    "    movl 44(%eax), %eax\n"     /* EAX last: the base dies here */
+    "    iretl\n"
+);
+
 /* Offsets used by the asm — guarded by static_asserts. */
 static_assert(__builtin_offsetof(struct Task, ksp) == 0,
               "asm: ksp must be at offset 0");
@@ -109,6 +139,10 @@ uint32_t task_irq_lock(void)  { return irq_save(); }
 void     task_irq_unlock(uint32_t f) { irq_restore(f); }
 
 static inline int task_slot(const Task* t) { return (int)(t - tasks); }
+
+/* defined in the scheduler section; called by the first activation of
+ * EVERY task (shell/kernel/user trampoline + the fork child entry). */
+static void task_post_switch(void);
 
 /* 0.4 Beta FR-08: count how many fd-table entries across ALL tasks
  * reference `node` — the caller passes the fd of the CURRENT task it
@@ -144,6 +178,13 @@ static void task_fpu_init_state(Task* t) {
 #define POOL_PAGES   ((POOL_END - POOL_START) / 0x1000)
 static uint32_t pool_bitmap[(POOL_PAGES + 31) / 32];
 
+/* COW physical page reference counting: when a COW page is shared, refcount > 1.
+ * task_user_phys_free only clears the bitmap after the last release. */
+static uint8_t phys_refcount[POOL_PAGES];
+
+/* OS-available PTE COW marker (bit 10) on read-only pages shared after fork. */
+#define PTE_COW    0x400u
+
 uint32_t task_user_phys_alloc(uint32_t bytes) {
     if (bytes == 0) return 0;
     uint32_t pages = (bytes + 0xFFF) / 0x1000;
@@ -158,8 +199,10 @@ uint32_t task_user_phys_alloc(uint32_t bytes) {
             run++;
             if (run >= pages) {
                 uint32_t first = i - pages + 1;
-                for (uint32_t k = first; k <= i; k++)
+                for (uint32_t k = first; k <= i; k++) {
                     pool_bitmap[k >> 5] |= (1u << (k & 31));
+                    phys_refcount[k] = 1;
+                }
                 irq_restore(f);
                 return POOL_START + first * 0x1000;
             }
@@ -175,8 +218,11 @@ void task_user_phys_free(uint32_t phys, uint32_t bytes) {
     uint32_t pages = (bytes + 0xFFF) / 0x1000;
     if (first + pages > POOL_PAGES) return;
     uint32_t f = irq_save();
-    for (uint32_t k = first; k < first + pages; k++)
-        pool_bitmap[k >> 5] &= ~(1u << (k & 31));
+    for (uint32_t k = first; k < first + pages; k++) {
+        if (phys_refcount[k]) phys_refcount[k]--;
+        if (phys_refcount[k] == 0)
+            pool_bitmap[k >> 5] &= ~(1u << (k & 31));
+    }
     irq_restore(f);
 }
 
@@ -289,14 +335,45 @@ void task_demand_reserve(struct Task* t, uint32_t vma, uint32_t len) {
  * demand window (P=0 there) — a nested-fault loop that eats the
  * interrupt stack. */
 int task_demand_fault(uint32_t cr2, uint32_t err_code) {
-    (void)err_code;                       /* P=0 is implied by DEMAND */
     struct Task* t = g_cur_task;
     if (!t) return 0;
 
     uint32_t page = cr2 & ~0xFFFu;
     uint32_t* pte = task_pte_slot(t, page);
     if (!pte) return 0;
-    if (*pte & PTE_PRESENT) return 0;     /* present (guard page, ...) */
+    if (*pte & PTE_PRESENT) {
+        /* COW page: write to a shared read-only user page after fork(). */
+        if ((*pte & PTE_COW) && (*pte & PTE_USER) && ((err_code & 2u) != 0u)) {
+            uint32_t f = irq_save();
+            uint32_t phys = *pte & ~0xFFFu;
+            if (phys >= POOL_START && phys < POOL_END) {
+                uint32_t idx = (phys - POOL_START) / 0x1000;
+                if (phys_refcount[idx] <= 1) {
+                    *pte = (*pte & ~PTE_COW) | PTE_RW;
+                    asm volatile("invlpg (%0)" :: "r"(page) : "memory");
+                    irq_restore(f);
+                    return 1;
+                }
+                uint32_t newphys = task_user_phys_alloc(0x1000);
+                if (newphys) {
+                    uint32_t old_cr3 = task_read_cr3();
+                    task_load_cr3(paging_kernel_dir());
+                    uint32_t* dst = (uint32_t*)(uintptr_t)newphys;
+                    uint32_t* src = (uint32_t*)(uintptr_t)phys;
+                    for (uint32_t i = 0; i < 0x400; i++) dst[i] = src[i];
+                    task_load_cr3((uint32_t*)(uintptr_t)old_cr3);
+                    phys_refcount[idx]--;
+                    *pte = newphys | PTE_PRESENT | PTE_RW | PTE_USER;
+                    t->pages_user++;
+                    asm volatile("invlpg (%0)" :: "r"(page) : "memory");
+                    irq_restore(f);
+                    return 1;
+                }
+            }
+            irq_restore(f);
+        }
+        return 0;
+    }
     if (!(*pte & PTE_DEMAND)) return 0;   /* unmapped hole, not reserved */
 
     /* 2-THREAD INSTALLER RACE FIX: the zero loop writes through the
@@ -547,6 +624,151 @@ static void task_craft_stack(Task* t, void (*fn)(void*), void* arg) {
     t->ksp = (uint32_t)(uintptr_t)top;
 }
 
+struct fork_frame {
+    uint32_t eip, cs, eflags, uesp, uss;
+    uint32_t ebx, ecx, edx, edi, esi, ebp, eax;
+};
+
+/* the child_fork_resume asm hardcodes these — keep it honest */
+static_assert(__builtin_offsetof(struct fork_frame, uss) == 16,
+              "asm: uss must be at offset 16");
+static_assert(__builtin_offsetof(struct fork_frame, ebx) == 20,
+              "asm: ebx must be at offset 20");
+static_assert(__builtin_offsetof(struct fork_frame, eax) == 44,
+              "asm: eax must be at offset 44");
+static struct fork_frame fork_frames[MAX_TASKS];
+
+static void child_fork_entry(void* p) {
+    /* first activation: load THIS task's CR3 + TSS.ESP0 (the switch
+     * itself only swaps stacks — schedule() cannot do it for a task
+     * that never ran before, see task_entry_trampoline). */
+    task_post_switch();
+
+    /* the child resumes in ring 3 -> user data segments */
+    asm volatile("movw $0x23, %%ax\nmovw %%ax, %%ds\nmovw %%ax, %%es\nmovw %%ax, %%fs\nmovw %%ax, %%gs" : : : "ax", "memory");
+
+    /* builds the iret frame and irets into ring 3 (EAX = 0 = fork's
+     * child return value) — see the asm comment on why this is not
+     * an inline `asm` block. */
+    child_fork_resume(p);
+    __builtin_unreachable();
+}
+
+struct Task* task_fork_user(uint32_t* regs) {
+    Task* parent = g_cur_task;
+    /* The caller must be ring 3 — NOT `kind == TASK_KIND_USER`: the shell
+     * runs its programs INLINE in task 0 (kind SHELL), so the kind test
+     * would reject exactly the task a `mtcc file.c` test runs in. */
+    if (!parent || !regs || (regs[9] & 3u) != 3u) return NULL;
+
+    Task* child = task_alloc_slot();
+    if (!child) return NULL;
+
+    /* basic fields: inherit identity so the child descends from the caller */
+    child->pid      = g_next_pid++;
+    child->state    = TASK_BLOCKED;
+    child->kind     = TASK_KIND_USER;
+    strncpy(child->name, parent->name, TASK_NAME_MAX - 1);
+    child->kstack_top = (uint32_t)(uintptr_t)&child->kstack[TASK_KSTACK];
+    child->istack_top = (uint32_t)(uintptr_t)&child->istack[TASK_KSTACK];
+    child->console  = parent->console;
+    child->owns_console = 0;
+    child->cwd      = parent->cwd;
+    if (parent->args[0]) strncpy(child->args, parent->args, TASK_ARGS_MAX - 1);
+    child->parent_pid = parent->pid;
+    child->zombie   = 0;
+    child->exit_normal = 0;
+    child->exit_status = 0;
+    child->wait_pid = -1;
+    child->forked   = 1;
+    child->arena_reserve = parent->arena_reserve;
+    child->mrp_arena = parent->mrp_arena;
+    child->brk      = parent->brk;
+    child->pages_user = parent->pages_user;
+    child->quantum  = TASK_QUANTUM;
+    child->killed   = 0;
+    child->clip_on  = parent->clip_on;
+    child->clip_x   = parent->clip_x;
+    child->clip_y   = parent->clip_y;
+    child->clip_w   = parent->clip_w;
+    child->clip_h   = parent->clip_h;
+    child->user_entry = parent->user_entry;
+    child->user_running = 1;
+    child->mrp_arena.inited = parent->mrp_arena.inited;
+    task_fpu_init_state(child);   /* fxrstor of an all-zero state = #MF */
+
+    /* fds: pipe ends are inherited (spawn semantics); FILE fds are not
+     * (FR-01 "never inherit" — the flush-on-exit path would double-close
+     * a shared node) and sockets are process-scoped, not inherited. */
+    for (int fd = 0; fd < TASK_MAX_FDS; fd++) {
+        child->fds[fd] = parent->fds[fd];
+        child->fds[fd].node  = NULL;
+        child->fds[fd].dcur  = NULL;
+        child->fds[fd].pos   = 0;
+        child->fds[fd].mode  = 0;
+        child->fds[fd].dirty = 0;
+        child->fds[fd].sock  = NULL;
+        if (child->fds[fd].pipe)
+            kpipe_end_ref(child->fds[fd].pipe, child->fds[fd].pipe_end, +1);
+    }
+
+    /* ensure the child has its own page directory + tables */
+    if (child->page_dir != task_pds[task_slot(child)])
+        task_build_dir(child);
+
+    /* copy present user pages as COW shared pages into the child's tables */
+    for (int pde = 1; pde <= 9; pde++) {
+        uint32_t srcpde = task_slot(parent);
+        for (int j = 0; j < 1024; j++) {
+            uint32_t src = task_pts[srcpde][pde - 1][j];
+            uint32_t dst = src;
+            uint32_t phys = src & ~0xFFFu;
+            if ((src & PTE_USER) && (src & PTE_PRESENT) &&
+                phys >= POOL_START && phys < POOL_END) {
+                /* make the existing page read-only in the caller's tables too
+                 * and share it with the child. The demand-fault path will
+                 * clone on the first write. */
+                uint32_t idx = (phys - POOL_START) / 0x1000;
+                task_pts[srcpde][pde - 1][j] = (src & ~PTE_RW) | PTE_COW;
+                dst = task_pts[srcpde][pde - 1][j];
+                phys_refcount[idx]++;
+            }
+            task_pts[task_slot(child)][pde - 1][j] = dst;
+        }
+    }
+
+    /* flush the caller's TLB: the caller just wrote RO+COW flags into its
+     * page tables and must see them the next time it touches a shared page. */
+    asm volatile("movl %0, %%cr3" :: "r"(parent->page_dir) : "memory");
+
+    child->page_dir = task_pds[task_slot(child)];
+
+    /* capture the ring-3 resume state for the child */
+    uint32_t u_eip   = regs[8];   /* EIP after int0x80 */
+    uint32_t u_cs    = regs[9];
+    uint32_t u_eflags= regs[10];
+    uint32_t u_esp   = regs[11];  /* user ESP from the CPU frame */
+    uint32_t u_ss    = regs[12];
+
+    struct fork_frame* f = &fork_frames[task_slot(child)];
+    f->eip    = u_eip;
+    f->cs     = u_cs;
+    f->eflags = u_eflags;
+    f->uesp   = u_esp;
+    f->uss    = u_ss;
+    f->ebx    = regs[4];
+    f->ecx    = regs[6];
+    f->edx    = regs[5];
+    f->edi    = regs[0];
+    f->esi    = regs[1];
+    f->ebp    = regs[2];
+    f->eax    = 0;               /* fork() returns 0 in the child */
+
+    task_craft_stack(child, child_fork_entry, f);
+    child->state = TASK_READY;
+    return child;
+}
+
 struct Task* task_create_shell(void) {
     Task* t = task_alloc_slot();
     if (!t) return NULL;
@@ -578,7 +800,6 @@ struct Task* task_create_shell(void) {
  * a shell gets for free through task_first_entry/task_post_switch
  * (TSS.ESP0, CR3). When fn returns the task exits like any other.
  * NOTE: consumes one of the MAX_TASKS slots for its whole lifetime. */
-static void task_post_switch(void);   /* defined below (scheduler section) */
 
 extern "C" void task_kernel_start(void) {
     task_post_switch();
@@ -1414,7 +1635,12 @@ struct Task* task_create_user(const char* name, struct fs_node* parent,
             task_create_user_fail(t, NULL);
             return NULL;
         }
+        /* extended: reserve the ELF heap window as the demand-backed heap
+         * that SYS_SBRK/SYS_MMAP allocate from for .mrp tasks too. */
+        task_demand_reserve(t, ELF_HEAP_VMA, ELF_HEAP_BYTES);
     }
+
+    t->brk = ELF_HEAP_VMA;
 
     if (is_elf) {
         /* 4a. ELF image: reserve + fill every PT_LOAD (FR-07) */

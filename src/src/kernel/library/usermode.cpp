@@ -22,6 +22,7 @@
 #include "header/paging.h"      /* paging_is_active() for memmap */
 #include "header/serial.h"     /* Phase B: serial debug */
 #include "header/task.h"        /* Phase A: per-task u3 save + per-task TSS */
+#include "header/syscall.h"     /* extended 0.5: syscall_fd_flush_all (forked exit) */
 #include <stdint.h>
 #include <stddef.h>
 
@@ -281,6 +282,14 @@ void user3_terminate(int normal, uint32_t status, const char* msg) {
 
     /* The shell/mrp_run runs with IF=1; exception entry clears IF, so
      * re-enable it explicitly before the jump. */
+    /* forked child: no mrp_run launcher frame — flush its own fds, then
+     * fall back to the generic exit path (zombie + wake the parent). */
+    if (t && t->forked) {
+        asm volatile("sti");          /* flush may wait on IRQ-driven I/O */
+        syscall_fd_flush_all();
+        task_exit_final();
+    }
+
     asm volatile("sti");
 
     if (!t) {

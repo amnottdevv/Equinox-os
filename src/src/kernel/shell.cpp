@@ -37,6 +37,8 @@
 #include "library/header/blk.h"         // 0.4 Beta: slot table (PATA + AHCI)
 #include "library/header/ecf.h"         // 0.4 Beta: .ecf (builtin `set`)
 #include "library/header/eggkg.h"       // 0.4 Beta: eggkg package manager
+#include "library/header/ecf_caller.h"  // 0.5: registry aksi bernama
+#include "library/header/config_cmd.h"  // 0.5: builtin `config` + `call`
 #include "library/header/mrp_format.h"  // 0.4 Beta: pren (preview .mrp)
 #include "library/header/usermode.h"   // usermode_print_memmap
 #include "library/header/pci.h"        // 0.4 Beta: lspci (FR-12)
@@ -1785,13 +1787,42 @@ static void eqi_compile_only(struct fs_node* cwd, const char* dirarg) {
  *  task, wait, report the exit code.
  * ------------------------------------------------------------ */
 
-/* cari node mtcc.mrp: coba 'prefer' dulu, lalu /equinox/tools, lalu
- * 'alt' (semua boleh NULL/duplikat — di-dedup). Node yang valid:
- * file, size > 0. *out_dir = dir tempat mtcc.mrp ditemukan (dipakai
- * sebagai cwd task spawn). */
+/* ------------------------------------------------------------
+ *  0.5 — spawn.name / spawn.args dari .config/mtcc.ecf
+ *  Default: "mtcc.mrp" + tanpa argumen ekstra. Config bersifat
+ *  per-invocation (baca saat dipakai), jadi edit langsung hidup.
+ * ------------------------------------------------------------ */
+static void eqi_mtcc_spawn_cfg(char* name, int ncap, char* xargs, int acap) {
+    int n = 0;
+    const char* d = "mtcc.mrp";
+    while (d[n] && n < ncap - 1) { name[n] = d[n]; n++; }
+    name[n] = '\0';
+    xargs[0] = '\0';
+    const char* tp = ecf_tool_path("mtcc", 0);
+    if (!tp) return;
+    const char* v = ecf_file_get(tp, "spawn.name");
+    if (v && v[0]) {
+        int m = 0;
+        while (v[m] && m < ncap - 1) { name[m] = v[m]; m++; }
+        name[m] = '\0';
+    }
+    v = ecf_file_get(tp, "spawn.args");
+    if (v && v[0]) {
+        int m = 0;
+        while (v[m] && m < acap - 1) { xargs[m] = v[m]; m++; }
+        xargs[m] = '\0';
+    }
+}
+
+/* cari node compiler (spawn.name, default mtcc.mrp): coba 'prefer' dulu,
+ * lalu /equinox/tools, lalu 'alt' (semua boleh NULL/duplikat — di-dedup).
+ * Node yang valid: file, size > 0. *out_dir = dir tempat file ditemukan
+ * (dipakai sebagai cwd task spawn). */
 static struct fs_node* eqi_find_mtcc(struct fs_node* prefer,
                                      struct fs_node* alt,
                                      struct fs_node** out_dir) {
+    char tool[64], xargs[96];
+    eqi_mtcc_spawn_cfg(tool, sizeof(tool), xargs, sizeof(xargs));
     struct fs_node* tools =
         fs_get_node_from_path(fs_get_root(), "/equinox/tools");
     struct fs_node* order[3];
@@ -1800,7 +1831,7 @@ static struct fs_node* eqi_find_mtcc(struct fs_node* prefer,
     if (tools && tools != prefer) order[n++] = tools;
     if (alt && alt != prefer && alt != tools) order[n++] = alt;
     for (int i = 0; i < n; i++) {
-        struct fs_node* m = fs_find_child(order[i], "mtcc.mrp");
+        struct fs_node* m = fs_find_child(order[i], tool);
         if (m && !m->is_dir && m->size > 0) { *out_dir = order[i]; return m; }
     }
     return NULL;
@@ -1811,8 +1842,15 @@ static struct fs_node* eqi_find_mtcc(struct fs_node* prefer,
  * dicetak di sini). */
 static int eqi_spawn_mtcc(struct fs_node* mdir, const char* margs,
                           const char* tname) {
-    struct Task* t = task_create_user(tname, mdir, "mtcc.mrp",
-                                      margs, mrp_arena_hint_for("mtcc.mrp"));
+    char tool[64], xargs[96];
+    eqi_mtcc_spawn_cfg(tool, sizeof(tool), xargs, sizeof(xargs));
+    /* spawn.args disisipkan SEBELUM margs supaya flag config (-q dsb)
+     * diproses lebih dulu oleh parser mtcc. */
+    char full[288];
+    if (xargs[0]) snprintf(full, sizeof(full), "%s %s", xargs, margs);
+    else          snprintf(full, sizeof(full), "%s", margs);
+    struct Task* t = task_create_user(tname, mdir, tool,
+                                      full, mrp_arena_hint_for(tool));
     if (!t) {
         eqi_tag("fail");
         printf("spawn mtcc gagal (task table penuh / OOM)\n");
@@ -2890,7 +2928,11 @@ static int eqgu_check(const char* fullpath, char* msg, int msgsz) {
         return 0;
     }
 
-    /* Baris PERTAMA yang diawali "mtcc: error" -> pesan gagal. */
+    /* Baris PERTAMA yang memuat tag "[ERROR]" -> pesan gagal.
+     * mtcc v0.3 mencetak diagnostik bergaya CLI profesional
+     * ("  [ERROR] path:12: message") dan membungkus tag-nya dengan
+     * escape ANSI berwarna — jadi yang dicari tag-nya, lalu escape
+     * ikut dibuang saat menyalin (editor hanya mau teks polos). */
     const char* line = NULL;
     uint32_t k = 0;
     while (cap[k]) {
@@ -2898,21 +2940,29 @@ static int eqgu_check(const char* fullpath, char* msg, int msgsz) {
         while (cap[k] && cap[k] != '\n') k++;
         uint32_t e = k;
         if (cap[k] == '\n') k++;
-        if (e - s >= 11 &&
-            cap[s] == 'm' && cap[s + 1] == 't' && cap[s + 2] == 'c' &&
-            cap[s + 3] == 'c' && cap[s + 4] == ':' && cap[s + 5] == ' ' &&
-            cap[s + 6] == 'e' && cap[s + 7] == 'r' && cap[s + 8] == 'r') {
-            line = cap + s;
-            break;
+        for (uint32_t j = s; j + 7 < e; j++) {
+            if (cap[j] == '[' && cap[j + 1] == 'E' && cap[j + 2] == 'R' &&
+                cap[j + 3] == 'R' && cap[j + 4] == 'O' && cap[j + 5] == 'R' &&
+                cap[j + 6] == ']') {
+                line = cap + j;
+                break;
+            }
         }
+        if (line) break;
     }
 
     int n = 0;
     const char* pre = "Cek: GAGAL: ";
     for (int j = 0; pre[j] && n < msgsz - 1; j++) msg[n++] = pre[j];
     if (line) {
-        for (uint32_t j = 0; line[j] && line[j] != '\n' && n < msgsz - 1; j++)
+        for (uint32_t j = 0; line[j] && line[j] != '\n' && n < msgsz - 1; j++) {
+            if ((unsigned char)line[j] == 0x1B) {      /* ESC ... m : buang */
+                uint32_t q = j + 1;
+                while (line[q] && line[q] != 'm' && line[q] != '\n') q++;
+                if (line[q] == 'm') { j = q; continue; }
+            }
             msg[n++] = line[j];
+        }
     } else {
         char tmp[24];
         snprintf(tmp, sizeof(tmp), "exit %u", (unsigned)mrp_last_exit_status());
@@ -4147,6 +4197,10 @@ extern "C" void shell_entry(void* arg) {
      * status. Diam total bila tidak ada paket & flag off. */
     eggkg_boot_check();
 
+    /* 0.5: daftarkan handler bawaan ecf_caller (set.*) sekali saat
+     * shell siap — registry terbuka, modul lain boleh menambah. */
+    config_init();
+
     while (1) {
         /* 0.4 Beta: tutup capture baris skrip SEBELUM prompt supaya
          * prompt tidak ikut terekam ke /eqshell.log. */
@@ -4874,6 +4928,14 @@ extern "C" void shell_entry(void* arg) {
             /* 0.4 Beta: builtin .ecf — `set`, `set KEY [VAL]`,
              * `set -a file`, `set -w file`. */
             shell_cmd_set(cwd, input + 3);
+        }
+        else if (strcmp(input, "config") == 0 || starts_with(input, "config ")) {
+            /* 0.5: builtin config — inspeksi .config/ + store + registry. */
+            config_cmd(cwd, input + 6);
+        }
+        else if (strcmp(input, "call") == 0 || starts_with(input, "call ")) {
+            /* 0.5: dispatch ecf_caller dari prompt — invoke aksi bernama. */
+            config_call_cmd(cwd, input + 4);
         }
         else if (strcmp(input, "eqgu") == 0 || starts_with(input, "eqgu ")) {
             /* 0.4 Beta: editor + cek-kompilasi mtcc saat Ctrl+S save.
