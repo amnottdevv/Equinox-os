@@ -53,16 +53,17 @@ qemu-system-i386 -m 64 -kernel dist/kernel.elf \
     -initrd "dist/mtcc.mrp,dist/hello.c"
 ```
 
-## Supported language (a deliberate subset — v0.1)
+## Supported language (a deliberate subset)
 
 | Category | Supported | Not yet |
 |---|---|---|
-| Types | `int`, `char`, `void`, pointers 1–2 levels deep, 1D arrays | struct/union, float/double, unsigned (int is processed as **signed**), long/short, typedef |
-| Statements | if/else, while, do-while, for (+declaration in the C99 init), return, break, continue, blocks | switch, goto |
-| Operators | `= += -= *= /= %= <<= >>= &= \|= ^=`, `+ - * / %`, `<< >>`, `& \| ^ ~`, `&& \|\| !`, `== != < > <= >=`, unary `- + * &`, `++/--` (pre/post), `?:` | comma operator, sizeof |
-| Globals | scalars + arrays + constant init `{...}`/string (zero-init) | non-constant initializers |
+| Types | `int`, `char`, `void`, pointers 1–2 levels deep, 1D arrays, `struct`/`union` (nested, passed **by pointer**), `enum`, `typedef` | float/double, unsigned (int is processed as **signed**), long/short, 2D arrays, `T**`, `struct`/`union` **by value** |
+| Statements | if/else, while, do-while, for (+declaration in the C99 init), return, break, continue, blocks, `switch`/`case`/`default` | goto, `continue` inside a `switch`, `case` after `default` |
+| Operators | `= += -= *= /= %= <<= >>= &= \|= ^=`, `+ - * / %`, `<< >>`, `& \| ^ ~`, `&& \|\| !`, `== != < > <= >=`, unary `- + * &`, `++/--` (pre/post), `?:`, `.`, `->`, **`sizeof` (type name or variable)** | comma operator, casts |
+| Globals | scalars + arrays + constant/list/string init `{...}` (zero-init area) | non-constant initializers |
 | Functions | forward prototypes, recursion, max 8 params, max 12 args | variadic, function pointer |
-| Other | `//` and `/* */` comments, hex/decimal/char literals with escapes, **default parameter `= const` (v10.8)** | function pointer, struct/typedef, cast, array-of-pointer |
+| Storage | block-scope **`static` locals** (data area, initialized once, kept across calls), `extern` globals | file-scope `static` (one flat namespace — drop the keyword) |
+| Other | `//` and `/* */` comments, hex/decimal/char literals with escapes, **default parameter `= const` (v10.8)** | cast, array-of-pointer |
 
 Important semantic notes:
 - `>>` is an **arithmetic** shift (int is treated as signed, as in an

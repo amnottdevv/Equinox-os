@@ -36,12 +36,13 @@ is the [mtcc language reference](MTCC_LANGUAGE.md):
 - **supported:** `int`/`char`/`void`, pointers and pointer arithmetic
   (scaled by the element size), arrays, `struct`/`union`/`enum`,
   `typedef`, `switch`/`case`/`default`, `if/else/while/for/do/break/
-  continue/return`, `extern` globals, struct/union/enum initializers
-  `= {…}` (global **and** local, nested, arrays of struct, union takes
-  its first member);
+  continue/return`, `sizeof` (a constant — type name or variable),
+  block-scope `static` locals, `extern` globals, struct/union/enum
+  initializers `= {…}` (global **and** local, nested, arrays of struct,
+  union takes its first member);
 - **not supported:** `struct`/`union` **by value** as a parameter or
   return value (pass a pointer instead), no `float`, no `unsigned`
-  keyword, no `sizeof`, no cast `(int)x`, no `case` after `default`
+  keyword, no cast `(int)x`, no `case` after `default`
   (`default` must be **last**), `continue` inside a `switch` is rejected;
 - printf-family with 5 conversions, `%u` as true unsigned, `sscanf`,
   ctype, string extras, `qsort`, `rand` ship in the libc;

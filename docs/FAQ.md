@@ -77,9 +77,10 @@ mtcc -make build.ruf      # multi-file build from a recipe
 ```
 
 The subset has: `int`/`char`/`void`, 1–2 level pointers, 1D arrays,
-if/else, while/do/for, switch-free logic, and the mini libc/morph API
-(`print`, `readline`, `fb_info`, `put_pixel`, …). **No** structs,
-floats, 2D arrays, `sizeof`, `typedef`, or varargs — by design, so the
+if/else, while/do/for, `switch`, `struct`/`union`/`enum`/`typedef`,
+`sizeof`, block-scope `static` locals, and the mini libc/morph API
+(`print`, `readline`, `fb_info`, `put_pixel`, …). **No** floats, 2D
+arrays, casts, varargs or function pointers — by design, so the
 compiler stays small enough to self-host. Edit with the built-in
 editor (`edit <file>`), compile, run. The `equinoxinstall` wizard and
 `eggkg` use the exact same compiler, so anything that builds on the

@@ -31,6 +31,7 @@ import os
 import struct
 import subprocess
 import sys
+import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 # Layout: <repo>/scripts/tcc_host_test — the repo root is two levels up
@@ -272,6 +273,34 @@ CASES = [
      "g3=35\n"
      "g9=-1\n"
      "weekend=0\n"
+     "EXIT=0\n"),
+    # Stage 5: `sizeof` (type-name, variable, and constant contexts) and
+    # `static` locals (data-area storage: constant init once, zero otherwise,
+    # survives between calls). Every number is derivable from the mtcc type
+    # rules — see the header comment of lang05.c.
+    ("lang05.c", os.path.join(SAMPLES, "lang05.c"), None,
+     "sizeof(char)=1\n"
+     "sizeof(int)=4\n"
+     "sizeof(struct Point)=8\n"
+     "sizeof(struct Rec)=12\n"
+     "sizeof(union Mix)=4\n"
+     "sizeof(struct Small)=4\n"
+     "sizeof(Pt)=8\n"
+     "sizeof(struct Point*)=4\n"
+     "sizeof(Name)=4\n"
+     "sizeof(arr)=20\n"
+     "sizeof(buf)=10\n"
+     "sizeof(one)=8\n"
+     "probe=4 122\n"
+     "sizeof(gwords)=16\n"
+     "csz=8\n"
+     "sp=11,22\n"
+     "tbl=65,0,0\n"
+     "sizeof(sp)=8 sizeof(tbl)=4\n"
+     "tick=101,102\n"
+     "zeroed=7,14\n"
+     "deep=6\n"
+     "plain=7\n"
      "EXIT=0\n"),
     # Stage 3: struct/union INITIALIZER `{...}` — global, local, nested,
     # array-of-struct, union (first member), char fields, char* = "lit".
@@ -847,6 +876,27 @@ elif "error" not in r.stderr.lower():
     bad("negtest", f"stderr without an error message: {r.stderr[-200:]}")
 else:
     ok(f"negtest (rc={r.returncode}, message: {r.stderr.strip().splitlines()[0][:70]})")
+
+# v0.5 — misuse of the NEW keywords must fail loudly, never mis-compile.
+# The sources live in a temp dir so no stray files are left in the tree.
+NEG_CASES = [
+    ("sizeof(void)",     "int x = sizeof(void);",   "sizeof(void) has no size"),
+    ("sizeof expr",      "int x = sizeof(1 + 2);",  "sizeof expects ( type-name )"),
+    ("sizeof unknown",   "int x = sizeof(nope);",   "sizeof: unknown identifier"),
+    ("static no type",   "static = 1;",             "expected a type after static"),
+]
+with tempfile.TemporaryDirectory() as td:
+    for i, (nm, body, want) in enumerate(NEG_CASES):
+        p = os.path.join(td, f"neg{i}.c")
+        with open(p, "w") as fh:
+            fh.write(f"int main() {{\n    {body}\n    return 0;\n}}\n")
+        r = run_host("run", p)
+        if r.returncode == 0:
+            bad(f"neg:{nm}", "compiled, but it should have failed")
+        elif want not in r.stderr:
+            bad(f"neg:{nm}", f"expected {want!r} in stderr, got: {r.stderr[-200:]}")
+        else:
+            ok(f"neg:{nm} -> {r.stderr.strip().splitlines()[0].split(': ', 2)[-1][:60]}")
 
 print(f"\n== RESULT: {PASS} PASS, {FAIL} FAIL ==")
 sys.exit(1 if FAIL else 0)

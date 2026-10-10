@@ -85,13 +85,20 @@
 //               << >> &, |, ^, ~, &&, ||, !, ==, !=, <, >, <=, >=,
 //               unary - + * &, ++/-- (pre & post, elem-scaled on pointers),
 //               ternary ?:, '.' and '->' field access
+//    sizeof: ( type-name ) or a bare variable; a CONSTANT, so it is also
+//            legal as an array bound and in an initializer. The operand is
+//            never evaluated. An arbitrary expression is rejected by design.
+//    static: block-scope `static` locals — storage in the data area
+//            (initialized once from a constant, zero otherwise, kept across
+//            calls), no frame slot. NOT file-scope `static` (see below).
 //    globals: scalars + arrays + constant/list/string initializers (zero-init area)
 //    functions: forward prototypes, recursion, max 8 params, default values
 //  NOT supported: struct/union passed or returned BY VALUE (initializers
 //    ARE supported: global, local, nested, arrays of struct), float/double,
 //    unsigned semantics (int is processed as signed), 2D arrays, goto,
-//    variadic functions, sizeof, casts, static locals, long/short,
-//    function pointers, T** (pointer-to-pointer arrays).
+//    variadic functions, casts, long/short, function pointers,
+//    T** (pointer-to-pointer arrays), file-scope `static` (there is no
+//    linkage distinction in a single flat namespace — drop the keyword).
 //  switch note: default should be the LAST label; a matching case placed
 //    AFTER default in the source does not suppress the default body.
 //  ++/-- and +=/-= on pointers scale by the element size (fixed version bug).
@@ -361,6 +368,8 @@ struct LVar {
     char  name[MTCC_NAME_MAX];
     CType type;
     int32_t ebp_off;   // local: negative; parameter: positive ([ebp+8+..])
+    uint8_t is_static; // 1 = `static` local: storage lives in the DATA area
+    int32_t data_off;  // offset of that storage (is_static only)
 };
 
 struct GVar {
@@ -966,6 +975,7 @@ enum {
     TK_KW_WHILE, TK_KW_FOR, TK_KW_DO, TK_KW_RETURN, TK_KW_BREAK,
     TK_KW_CONTINUE, TK_KW_STRUCT, TK_KW_UNION, TK_KW_ENUM, TK_KW_TYPEDEF,
     TK_KW_SWITCH, TK_KW_CASE, TK_KW_DEFAULT, TK_KW_EXTERN,
+    TK_KW_SIZEOF, TK_KW_STATIC,
     TK_LE, TK_GE, TK_EQ, TK_NE, TK_AND, TK_OR, TK_SHL, TK_SHR,
     TK_ADDEQ, TK_SUBEQ, TK_MULEQ, TK_DIVEQ, TK_MODEQ,
     TK_ANDEQ, TK_OREQ, TK_XOREQ, TK_SHLEQ, TK_SHREQ,
@@ -1095,6 +1105,8 @@ static void lex_next(void) {
         else if (m_streq(S.ident, "case"))     S.tok = TK_KW_CASE;
         else if (m_streq(S.ident, "default"))  S.tok = TK_KW_DEFAULT;
         else if (m_streq(S.ident, "extern"))   S.tok = TK_KW_EXTERN;
+        else if (m_streq(S.ident, "sizeof"))   S.tok = TK_KW_SIZEOF;
+        else if (m_streq(S.ident, "static"))   S.tok = TK_KW_STATIC;
         else S.tok = TK_IDENT;
         return;
     }
@@ -2312,7 +2324,9 @@ static void expect_tok(int tok, const char* what) {
 static void parse_stmt(void);
 static void gen_expr(CType* t);
 static int32_t parse_const(void);
+static int parse_sizeof(uint32_t* out);                               // `sizeof ...`
 static void init_object(const CType* t, int32_t base, int is_local);   // struct/union {...}
+static int32_t data_alloc(uint32_t size);                              // data-area slot
 
 // ============================================================================
 //  TYPE DECLARATION (used at top level & locally)
@@ -2336,6 +2350,7 @@ static int is_typedef_name(const char* name) {
 // accept a numeric literal OR an enum constant as an array size
 static int parse_array_size(uint32_t* out) {
     if (S.tok == TK_NUM) { *out = S.num; advance(); return 1; }
+    if (S.tok == TK_KW_SIZEOF) return parse_sizeof(out);   // `char b[sizeof(int)]`
     if (S.tok == TK_IDENT) {
         for (uint32_t i = 0; i < g_const_count; i++)
             if (m_streq(g_consts[i].name, S.ident)) { *out = (uint32_t)g_consts[i].val; advance(); return 1; }
@@ -2534,6 +2549,7 @@ static void decl_local(CType t) {
         LVar* lv = &S.locals[S.local_count++];
         for (i = 0; i < MTCC_NAME_MAX; i++) lv->name[i] = name[i];
         lv->type = vt;
+        lv->is_static = 0;
         lv->ebp_off = frame_alloc(ctype_alloc_size(&vt));
         return;
     }
@@ -2549,6 +2565,7 @@ static void decl_local(CType t) {
             LVar* lv = &S.locals[S.local_count++];
             for (i = 0; i < MTCC_NAME_MAX; i++) lv->name[i] = name[i];
             lv->type = vt;
+            lv->is_static = 0;
             lv->ebp_off = frame_alloc(ctype_alloc_size(&vt));
             advance();                              // '='
             init_object(&vt, lv->ebp_off, 1);
@@ -2562,6 +2579,7 @@ static void decl_local(CType t) {
         LVar* lv = &S.locals[S.local_count++];
         for (i = 0; i < MTCC_NAME_MAX; i++) lv->name[i] = name[i];
         lv->type = vt;
+        lv->is_static = 0;
         lv->ebp_off = frame_alloc(MTCC_INT_SIZE);
         // store: mov [ebp+off], eax
         e_mov_rm_ebp_store(lv->ebp_off);
@@ -2572,7 +2590,66 @@ static void decl_local(CType t) {
     LVar* lv = &S.locals[S.local_count++];
     for (i = 0; i < MTCC_NAME_MAX; i++) lv->name[i] = name[i];
     lv->type = vt;
+    lv->is_static = 0;
     lv->ebp_off = frame_alloc(ctype_alloc_size(&vt));
+}
+
+// ----------------------------------------------------------------------------
+//  `static` local   (v0.5)
+// ----------------------------------------------------------------------------
+// The NAME behaves like any block-scoped local (it disappears at scope_pop),
+// but the STORAGE lives in the DATA area: zeroed at load, initialized once
+// from a constant, and it survives across calls. No frame slot is used, so a
+// static array never counts toward the frame limit.
+// No backing GVar is registered — the LVar itself carries data_off, which
+// keeps the global table free of hidden entries.
+static void decl_local_static(CType t) {
+    if (t.base == TY_VOID && t.ptr == 0) {
+        mtcc_error("static void variable has no storage");
+        return;
+    }
+    if (S.tok != TK_IDENT) { mtcc_error("expected a variable name"); return; }
+    char name[MTCC_NAME_MAX];
+    uint32_t i = 0;
+    while (S.ident[i]) { name[i] = S.ident[i]; i++; }
+    name[i] = '\0';
+    advance();
+
+    CType vt = t;
+    if (S.tok == '[') {
+        advance();
+        uint32_t al = 0;
+        if (!parse_array_size(&al)) { mtcc_error("array size must be a number/constant"); return; }
+        if (al == 0 || al > 4096) { mtcc_error("unreasonable array size"); return; }
+        vt.is_array = 1;
+        vt.arr_len = al;
+        if (vt.ptr != 0) { mtcc_error("array of pointers not yet supported"); return; }
+        EXPECT(']');
+    }
+
+    int32_t off = data_alloc(ctype_alloc_size(&vt));
+    if (off < 0) return;
+
+    // Optional CONSTANT initializer — written straight into the data area
+    // (the data area was zeroed first, so this really is "once, at load").
+    if (S.tok == '=') {
+        advance();
+        if ((vt.base == TY_STRUCT || vt.base == TY_UNION) && vt.ptr == 0) {
+            init_object(&vt, (uint32_t)off, 0);      // 0 = write to data area
+        } else {
+            int32_t v = parse_const();
+            if (S.err) return;
+            w32(S.data, (uint32_t)off, (uint32_t)v);
+        }
+    }
+
+    if (S.local_count >= MTCC_MAX_LOCALS) { mtcc_error("too many local variables"); return; }
+    LVar* lv = &S.locals[S.local_count++];
+    for (i = 0; i < MTCC_NAME_MAX; i++) lv->name[i] = name[i];
+    lv->type = vt;
+    lv->is_static = 1;
+    lv->data_off = off;
+    lv->ebp_off = 0;
 }
 // ============================================================================
 //  EXPRESSIONS — recursive descent parser + accumulator codegen model.
@@ -2987,11 +3064,100 @@ static void gen_term(CType* t) {
 }
 
 // ----------------------------------------------------------------------------
-//  unary: - + ! ~ * & ++ --
+//  sizeof   (v0.5)
+// ----------------------------------------------------------------------------
+// Two accepted forms, both of which emit NO code for the operand (C rules:
+// sizeof never evaluates its argument):
+//     sizeof ( type-name )     sizeof(int) sizeof(struct S) sizeof(char*)
+//     sizeof  variable         sizeof buf  sizeof(x)   sizeof g
+// Anything else (an arbitrary expression) is rejected with a clear message —
+// stating the limit honestly beats silently evaluating a side effect.
+// ----------------------------------------------------------------------------
+
+// Size of a DECLARED type, keeping arrays intact: an array's size is its
+// element count times the element size. ctype_alloc_size() would be wrong
+// here — it deliberately rounds to 4 for the stack frame.
+static uint32_t ctype_sizeof_declared(const CType* t) {
+    if (t->is_array) return t->arr_len * ctype_elem_size(t);
+    return ctype_sizeof(t);
+}
+
+// Can the current token begin a TYPE NAME? Decides sizeof(int) from sizeof(x).
+static int tok_starts_type(void) {
+    if (S.tok == TK_KW_INT || S.tok == TK_KW_CHAR || S.tok == TK_KW_VOID ||
+        S.tok == TK_KW_STRUCT || S.tok == TK_KW_UNION || S.tok == TK_KW_ENUM)
+        return 1;
+    if (S.tok == TK_IDENT && is_typedef_name(S.ident)) return 1;
+    return 0;
+}
+
+// Resolve a bare identifier to its declared size. Emits nothing.
+static int sizeof_ident_size(const char* nm, uint32_t* out) {
+    LVar* lv = find_local(nm);
+    if (lv) { *out = ctype_sizeof_declared(&lv->type); return 1; }
+    GVar* gv = find_gvar(nm);
+    if (gv) { *out = ctype_sizeof_declared(&gv->type); return 1; }
+    for (uint32_t k = 0; k < g_const_count; k++)
+        if (m_streq(g_consts[k].name, nm)) { *out = MTCC_INT_SIZE; return 1; }
+    return 0;
+}
+
+// Consume `<sizeof ...>` starting AT the `sizeof` token and store the size
+// in *out. Emits NO code for the operand. Shared by gen_unary (value context)
+// and parse_const (constant context: array sizes, initializers, case labels).
+// Returns 1 on success, 0 after reporting an error.
+static int parse_sizeof(uint32_t* out) {
+    advance();                                  // 'sizeof'
+    uint32_t sz = 0;
+    int paren = 0;
+    if (S.tok == '(') { advance(); paren = 1; }
+
+    if (paren && tok_starts_type()) {
+        CType tt = parse_base_type();
+        if (S.err) return 0;
+        if (tt.base == TY_VOID && tt.ptr == 0) {
+            mtcc_error("sizeof(void) has no size");
+            return 0;
+        }
+        if (S.tok == '[') {
+            mtcc_error("sizeof of an array TYPE is not supported (use sizeof a variable)");
+            return 0;
+        }
+        sz = ctype_sizeof(&tt);
+    } else {
+        // sizeof <identifier> — the operand is never evaluated.
+        if (S.tok != TK_IDENT) {
+            mtcc_error("sizeof expects ( type-name ) or a variable name");
+            return 0;
+        }
+        char nm[MTCC_NAME_MAX];
+        uint32_t i = 0;
+        while (S.ident[i] && i < MTCC_NAME_MAX - 1) { nm[i] = S.ident[i]; i++; }
+        nm[i] = '\0';
+        advance();
+        if (!sizeof_ident_size(nm, &sz)) {
+            mtcc_error_ident("sizeof: unknown identifier: ", nm);
+            return 0;
+        }
+    }
+    if (paren) EXPECT(')');
+    *out = sz;
+    return !S.err;
+}
+
+// ----------------------------------------------------------------------------
+//  unary: - + ! ~ * & ++ -- sizeof
 // ----------------------------------------------------------------------------
 static void gen_unary(CType* t) {
     if (S.err) return;
     switch (S.tok) {
+        case TK_KW_SIZEOF: {
+            uint32_t sz = 0;
+            if (!parse_sizeof(&sz)) return;
+            e_mov_ri(R_EAX, sz);
+            *t = ctype_make(TY_INT, 0);
+            return;
+        }
         case '-':
             advance(); gen_unary(t);
             e_neg_eax();
@@ -3310,16 +3476,21 @@ static void gen_primary(CType* t) {
             LVar* lv = find_local(name);
             if (lv) {
                 CType vt = lv->type;
+                int st = lv->is_static;             // 1 = storage in data area
                 if (vt.is_array) {
                     vt.is_array = 0; vt.ptr = 1;        // decay: a == &a[0]
-                    e_lea_ebp(R_EAX, lv->ebp_off);
+                    if (st) e_mov_eax_data_addr(lv->data_off);
+                    else    e_lea_ebp(R_EAX, lv->ebp_off);
                 } else if (vt.ptr == 0 && (vt.base == TY_STRUCT || vt.base == TY_UNION)) {
-                    e_lea_ebp(R_EAX, lv->ebp_off);      // address, not value
+                    if (st) e_mov_eax_data_addr(lv->data_off);   // address, not value
+                    else    e_lea_ebp(R_EAX, lv->ebp_off);
                     vt.is_ref = 1;
                 } else if (ctype_sizeof(&vt) == 1) {
-                    e_movzx_eax_ebp8(lv->ebp_off);      // movzx eax, byte [ebp+d]
+                    if (st) e_movzx_eax_moffs8(lv->data_off);    // movzx eax, byte [addr]
+                    else    e_movzx_eax_ebp8(lv->ebp_off);       // movzx eax, byte [ebp+d]
                 } else {
-                    e_mov_r_ebp(R_EAX, lv->ebp_off);    // mov eax, [ebp+d]
+                    if (st) e_mov_eax_moffs(lv->data_off);       // mov eax, [addr]
+                    else    e_mov_r_ebp(R_EAX, lv->ebp_off);     // mov eax, [ebp+d]
                 }
                 *t = vt;
                 return;
@@ -3410,7 +3581,8 @@ static void gen_lvalue(CType* t) {
             if (!was_array && vt.base != TY_STRUCT && vt.base != TY_UNION)
                 base_needs_load = 1;   // pointer: load the value
             if (vt.base == TY_STRUCT || vt.base == TY_UNION) vt.is_ref = 1;
-            e_lea_ebp(R_EAX, lv->ebp_off);
+            if (lv->is_static) e_mov_eax_data_addr(lv->data_off);   // data area
+            else               e_lea_ebp(R_EAX, lv->ebp_off);
             *t = vt;
         } else {
             GVar* gv = find_gvar(name);
@@ -3773,6 +3945,7 @@ static void parse_stmt(void) {
                         if (S.tok != TK_KW_INT && S.tok != TK_KW_CHAR &&
                             S.tok != TK_KW_VOID && S.tok != TK_KW_STRUCT &&
                             S.tok != TK_KW_UNION && S.tok != TK_KW_ENUM &&
+                            S.tok != TK_KW_STATIC &&
                             !(S.tok == TK_IDENT && is_typedef_name(S.ident))) {
                             mtcc_error("statement before the first case label in switch");
                             return;
@@ -3785,6 +3958,23 @@ static void parse_stmt(void) {
             EXPECT('}');
             scope_pop();
             loop_pop((uint32_t)S.code_len);   // break targets = after switch
+            return;
+        }
+
+        case TK_KW_STATIC: {
+            // `static` local — storage in the data area, name block-scoped
+            advance();
+            if (S.tok != TK_KW_INT && S.tok != TK_KW_CHAR && S.tok != TK_KW_VOID &&
+                S.tok != TK_KW_STRUCT && S.tok != TK_KW_UNION && S.tok != TK_KW_ENUM &&
+                !(S.tok == TK_IDENT && is_typedef_name(S.ident))) {
+                mtcc_error("expected a type after static");
+                return;
+            }
+            CType bt = parse_base_type();
+            if (S.tok == ';') { advance(); return; }   // bare `static struct S;`
+            decl_local_static(bt);
+            while (S.tok == ',') { advance(); decl_local_static(bt); }
+            EXPECT(';');
             return;
         }
 
@@ -3837,6 +4027,11 @@ static int32_t parse_const(void) {
         int32_t v = (int32_t)S.num;
         advance();
         return neg ? -v : v;
+    }
+    if (S.tok == TK_KW_SIZEOF) {
+        uint32_t sz = 0;
+        if (!parse_sizeof(&sz)) return 0;
+        return neg ? -(int32_t)sz : (int32_t)sz;
     }
     if (S.tok == TK_IDENT) {
         for (uint32_t i = 0; i < g_const_count; i++) {
@@ -4184,6 +4379,7 @@ static void parse_function(CType ret, const char* name) {
         LVar* lv = &S.locals[S.local_count++];
         for (uint32_t k = 0; k < MTCC_NAME_MAX; k++) lv->name[k] = f->pnames[i][k];
         lv->type = f->ptypes[i];
+        lv->is_static = 0;
         lv->ebp_off = 8 + 4 * ((int32_t)f->nparams - 1 - (int32_t)i);
     }
 

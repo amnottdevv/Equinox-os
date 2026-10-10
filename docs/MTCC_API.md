@@ -16,10 +16,10 @@ on the volume. They are the single source of truth for the syscall ABI used by
 in-OS programs.
 
 > Not every C feature is available: global variables must be declared before
-> use (single pass), no varargs, no function pointers, no `sizeof`, no casts,
+> use (single pass), no varargs, no function pointers, no casts,
 > and `struct`/`union` may not be passed or returned **by value** (pass a
-> pointer). `struct`/`union`/`enum`/`typedef`/`switch` and `{…}` initializers
-> *are* supported. The full subset is specified in
+> pointer). `struct`/`union`/`enum`/`typedef`/`switch`, `{…}` initializers
+> and `sizeof` *are* supported. The full subset is specified in
 > [mtcc language reference](MTCC_LANGUAGE.md); see also
 > [Self Hosting](SELF_HOSTING.md) (incl. the multi-file compile/link rules).
 

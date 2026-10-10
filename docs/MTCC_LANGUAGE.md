@@ -231,6 +231,22 @@ tags, which is what makes the `Pt`-style shorthand possible.
 
 **Member access:** `.` and `->`
 
+**`sizeof`:** `sizeof(type-name)` or `sizeof variable`. It yields an
+`int` **constant**, so it is legal wherever a constant is — an array
+bound, a `static` initializer, a `case` label. The operand is never
+evaluated, and an array keeps its true size (`char buf[10]` is 10, not
+4). Deliberately narrow: only a type name or a bare variable is
+accepted, so `sizeof(a + b)` is rejected instead of silently running
+side effects.
+
+```c
+sizeof(char)              /* 1  */
+sizeof(int)               /* 4  */
+sizeof(struct Point*)     /* 4  — every pointer is 4 */
+sizeof buf                /* 10 — char buf[10], NOT a pointer */
+char probe[sizeof(int)];  /* usable as an array bound */
+```
+
 Precedence and short-circuit evaluation follow C. Pointer `++`/`--`
 and `+=`/`-=` scale by the element size.
 
@@ -260,8 +276,8 @@ int fact(int n) { return n <= 1 ? 1 : n * fact(n - 1); }  /* recursion */
 Function pointers are not supported — a function's address cannot be
 taken and stored. Indirection through a function table must be
 replaced by an explicit `switch` over an integer selector. `T**`
-(pointer-to-pointer) in array contexts, `goto`, `static` locals, and
-variadic functions are likewise rejected.
+(pointer-to-pointer) in array contexts, `goto`, file-scope `static`,
+and variadic functions are likewise rejected.
 
 ---
 
@@ -282,7 +298,34 @@ one-dimensional arrays take constant, list and string initializers.
 is the mechanism behind multi-file builds.
 
 Local variables are frame-allocated and must be declared before use
-(the compiler is single-pass). There are no `static` locals.
+(the compiler is single-pass).
+
+### `static` locals
+
+A **block-scope** `static` local keeps its name (block-scoped, gone at
+the closing brace) but moves its storage into the zero-initialized
+data area:
+
+```c
+int tick(void) {
+    static int n = 100;   /* written once, at load */
+    n = n + 1;
+    return n;             /* 101, 102, 103, … */
+}
+```
+
+- the initializer must be a **constant** and is applied **once**;
+- without an initializer the storage is **zero**;
+- the value **survives between calls** and takes **no frame space**
+  (so a large `static` array does not count against the frame limit);
+- `static` on an array or a struct works the same way, including
+  `static struct Point p = { 11, 22 };`;
+- declaring it in a nested block is fine — the name is block-scoped,
+  the storage is permanent.
+
+Not supported: `static` at **file scope**. mtcc compiles one flat
+namespace with no linkage distinction, so two same-named helpers in
+different files would collide anyway — drop the keyword instead.
 
 ---
 
@@ -369,16 +412,19 @@ Stated plainly so there are no false expectations:
 - **`struct` / `union` passed or returned by value** — use a pointer.
 - Floating point of any kind (`float`, `double`).
 - The `unsigned`, `long`, `short` keywords — `int` is signed.
-- `sizeof` (there is no `sizeof` operator).
 - Casts such as `(int)x`.
 - 2-D arrays.
 - `goto`.
 - Variadic functions and function-like macros.
-- `static` locals.
+- File-scope `static` (there is no linkage distinction — every
+  translation unit shares one flat namespace, so drop the keyword).
+  **Block-scope `static` locals ARE supported.**
 - Function pointers.
 - `T**` (pointer-to-pointer) in array contexts.
 - `continue` inside a `switch`.
 - `case` labels placed after `default`.
+- An arbitrary expression as a `sizeof` operand (`sizeof(a + b)` is
+  rejected on purpose — see §5).
 
 Everything else in the tables above is supported.
 
@@ -392,6 +438,7 @@ Everything else in the tables above is supported.
 | `src/test/struct.c` | `struct`/`union`, pointers, arrays of struct, nesting, copy |
 | `src/test/sinit.c` | `struct`/`union` `{…}` initializers — global, local, nested |
 | `src/test/swenum.c` | `enum` constants and `switch`/`case`/`default` |
+| `src/test/lang05.c` | `sizeof` (type, variable, constant contexts) and `static` locals |
 | `src/test/mf_main.c` + `mf_helper.c` + `mf_shared.h` | multi-file compile/link, `extern`, relative `#include "x.h"` |
 | `src/test/morphio.c` | the full v1 file API |
 | `src/test/multitask.c` | the task API |
