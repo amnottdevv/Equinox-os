@@ -99,7 +99,7 @@ wizard or the `eggkg` package manager.
 
 | Document | What it covers |
 | --- | --- |
-| [Self Hosting](SELF_HOSTING.md) | `mtcc`, MRP1 executables, ruf v3 recipes |
+| [Self Hosting](SELF_HOSTING.md) | `mtcc`, MRP1 executables, ruf v3/v4 recipes |
 | [mtcc language reference](MTCC_LANGUAGE.md) | The full C subset: types, `struct`/`union`, statements, limits |
 | [MRP1 format](MRP.md) | The `.mrp` header layout, checksum, loader |
 | [Packages](PACKAGES.md) | `eggkg` reference, package repo format, writing packages |

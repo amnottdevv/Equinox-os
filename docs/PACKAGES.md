@@ -64,7 +64,7 @@ sources = [
 - Absolute local paths (`"/equinox/repo/bash/cat.c"`) read from the
   filesystem — that is how offline repos work.
 - A `build.ruf` listed among the sources is used as the **build recipe**
-  (see [SELF_HOSTING.md](SELF_HOSTING.md) for ruf v3).
+  (see [SELF_HOSTING.md](SELF_HOSTING.md) for ruf v3/v4).
 
 **`index.idx` (v1)** — per-file metadata: version, SHA-256, size,
 mirror. `egg_sha256.c` (pure C, in-kernel) verifies downloads against
@@ -93,7 +93,7 @@ starts — installed tools survive and reappear after reboots.
 
 Since 0.5 the **build → install → db record** tail of an install runs
 from the step list in `.config/eggkg.ecf` (see
-[ECF.md](ECF.md#resep-eggkg-configeggkgecf)), not from hard-coded
+[ECF.md](ECF.md#the-eggkg-recipe-configeggkgecf)), not from hard-coded
 order. The whole list is parsed and validated *before* anything runs
 (atomic), then each step is dispatched through `ecf_caller`
 (`mtcc.compile_ruf_eggkg`, `pkg.install_bin`, `pkg.db_record`).
@@ -139,7 +139,7 @@ set -w /equinox/conf/system.ecf     # persist
 
 ## Writing your own package
 
-1. Put the sources + a `build.ruf` (ruf v3) in a Git repo (or a folder).
+1. Put the sources + a `build.ruf` (ruf v3/v4) in a Git repo (or a folder).
 2. Add a section to your `package.list` with the URLs/paths.
 3. Point `eggkg.server` at it (or pass the path to `eggkg update`).
 4. `eggkg install <name>` — if it compiles with mtcc, it installs.

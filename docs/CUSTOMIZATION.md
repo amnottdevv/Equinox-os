@@ -362,7 +362,216 @@ dispatch registry all re-read what they need at the point of use.
 
 ---
 
-## 8. The layers in one view
+## 8. Tricks & recipes
+
+Everything in this section is configuration only: no kernel rebuild, no
+recompile, no service restart. Each one is a text edit plus the command
+that proves it took effect.
+
+### Make ELF the default output
+
+```ini
+# /equinox/.config/mtcc.ecf
+[format]
+default = elf
+```
+
+`mtcc -c prog.c` now writes a static ELF32 by default, and `mtcc -make`
+produces ELF products, so you can stop passing `-format elf` on every
+build. A recipe's `format` directive and the CLI `-format` still
+override it, so this is a site-wide default rather than a hard lock.
+
+One caveat worth knowing: `-format` only applies to `-c` and `-make`.
+In run mode (`mtcc prog.c`, which executes in memory and never writes a
+file) the setting is ignored and mtcc prints
+`-o / -format only apply to -c (run mode never writes a file)`. Leave
+`format.default = mrp` if run mode is the common case.
+
+### Build quietly by default
+
+```ini
+[flags]
+default = -q
+```
+
+`-q` is read at process start, so it applies to **every** subsequent
+compile, including the `mtcc -make` spawned by an eggkg install. Only
+`-q`, `-d`/`--debug` and `--lib` are recognised here, and the flags are
+additive: mtcc has no negative flags, so a command line can add to this
+default but never subtract from it.
+
+### Inject flags into every spawned compile
+
+```ini
+[spawn]
+args = -q --lib
+```
+
+The shell prepends `spawn.args` to the command line when it spawns the
+compiler, deliberately *before* the arguments you typed, so config flags
+are parsed first. It reaches every spawn path — the shell's `mtcc`,
+`equinoxinstall -build`, and the `mtcc -make` that an eggkg install
+performs, since all three funnel through the same spawn helper. Use it
+for flags you never want to retype.
+
+### Swap the compiler binary
+
+```ini
+[spawn]
+name = mtcc_dbg.mrp
+```
+
+Every `mtcc` and `mtcc -make` now looks for `mtcc_dbg.mrp` instead of
+`mtcc.mrp`. The search order is the request's own directory, then
+`/equinox/tools`, then the alternative directory — so dropping a second
+binary alongside the first is enough to A/B two compiler builds without
+renaming either.
+
+### Decide where a recipe's `set` writes
+
+```ini
+[set]
+store = /equinox/conf/experiment.ecf
+```
+
+Recipe `set key = value` lines go to this file instead of the system
+store. A recipe can override the same thing inline:
+
+```text
+ecf /equinox/conf/experiment.ecf
+set eggkg.local = $buildir
+```
+
+Both are inert until the recipe builds cleanly: `set` lines are queued
+alongside `copy`/`move` and flushed only after **every** job succeeded,
+so a broken build cannot half-update a config.
+
+### Default the build output folder
+
+```ini
+[buildir]
+default = /equinox/.local/staging
+```
+
+Provides `$buildir` when a recipe does not set `out`. This is a
+fallback, not an override — a recipe's own `out <dir>` always wins, and
+so does an explicit `out =` line. (`rufdir.default` follows the same
+rule for `$rufdir`, but the recipe's own folder is normally derived
+automatically, so it is rarely reached.)
+
+### Reorder, trim, or extend an install
+
+```ini
+# /equinox/.config/eggkg.ecf
+[install]
+1 = mtcc.compile_ruf_eggkg $rufpath
+2 = pkg.install_bin $pkgdir
+3 = pkg.db_record $name $version
+4 = set.key last.built $name
+```
+
+Lines run in **file order** — the leading number is decoration, so
+reordering means moving lines, not renumbering them. You can delete a
+step entirely (dropping `pkg.db_record` gives a build with no database
+entry), duplicate one, or append a new action from any module that has
+registered a handler. Then confirm before running it:
+
+```sh
+eggkg plan          # resolved [install] steps, in order, nothing executed
+```
+
+Validation still applies to the edited file as a whole: one unknown
+action name rejects the section before a single step runs.
+
+### Run against an offline or local repository
+
+```sh
+eggkg update /equinox/repo           # overrides $server for this run
+call set.path_local /equinox/.local  # or persist eggkg.local
+eggkg update
+```
+
+`$server` resolves to the explicit argument when one is given, otherwise
+to `eggkg.server` from the system store — so the same recipe works
+against a network mirror, a local folder, or nothing at all, without a
+single line changing in `eggkg.ecf`.
+
+### Drive one action at a time
+
+```sh
+config callers                                   # what may be invoked
+call set.key net.driver e1000
+call set.path_local /equinox/.local/tp
+call pkg.db_record mytool 1.0
+```
+
+A recipe is only a list of these calls with the order supplied by
+configuration. Invoking one by hand is the same dispatch path with
+`caller = "shell"`, which makes a handler registered by one module
+usable by another module's recipe — or by a person at a prompt.
+
+### Retarget the entire store
+
+```sh
+call set.active /equinox/conf/other.ecf    # pivot now
+set -d /equinox/conf/other.ecf             # pivot and persist to boot
+set -a /equinox/conf/other.ecf             # merge it over the store
+set -w /equinox/conf/other.ecf             # save the result back
+```
+
+`call set.active` pivots the **session** immediately (it sets the
+`set -d` target override and invalidates the store cache); `set -d`
+writes the `active.conf = <path>` pointer into the active `.ecf`, so the
+next boot sees it too. Because that pointer is also followed by
+`ecf_file_get`, per-tool config files inherit the redirection when they
+look up a key the main file does not carry.
+
+### Provision a session with a script
+
+```text
+# /equinox/profile.es
+[Eqshell]
+Log=True
+call set.key net.driver e1000
+call set.path_local /equinox/.local
+config init mtcc
+eggkg plan
+```
+
+```sh
+set -x profile.es
+```
+
+Every line runs through the ordinary shell dispatch, so a script is just
+a recorded sequence of the same commands — and `Log=True` captures the
+output to `/eqshell.log`. Note the honest limit: there is **no boot
+autostart**; a `.es` file runs when you ask for it, not when the system
+comes up.
+
+A detail worth knowing when scripting: the shell's `set KEY VAL` edits
+the **in-memory** store and is permanent only after `set -w FILE`,
+whereas `call set.key KEY VAL [-> FILE]` writes the file immediately.
+Pick the former when you want to stage several edits and save once,
+the latter when a single call has to be durable on its own.
+
+### Discover what is possible
+
+| Command | Answers |
+| --- | --- |
+| `config callers` | every action a config file may invoke |
+| `config list` | the active store and which `.config/*.ecf` files exist |
+| `config show <tool>` | the full text of one tool's config |
+| `config get <tool> <key>` | one value from one tool's config |
+| `eggkg plan` | what `[install]` will do, in order, before it does it |
+| `set` | every key in the active system store |
+
+Nothing in the configuration layer is undocumented-by-omission: the
+introspection commands are the discovery mechanism, and the error
+messages point at them.
+
+---
+
+## 9. The layers in one view
 
 ```text
   ┌──────────────────────────────────────────────────────────┐

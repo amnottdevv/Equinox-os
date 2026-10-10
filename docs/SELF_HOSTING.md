@@ -298,7 +298,7 @@ args =                   # extra args prepended at spawn
 `mtcc -make` additionally honours `buildir.default` / `rufdir.default`
 as the fallback `$buildir` / `$rufdir` when the recipe sets neither
 `out` nor sits in a subfolder. Full key table:
-[ECF.md](ECF.md#configmtccecf-default-mtcc).
+[ECF.md](ECF.md#configmtccecf-compiler-defaults).
 
 ## Testing the pipeline
 

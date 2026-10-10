@@ -36,7 +36,7 @@ dedicated suites for the installer, AHCI, E1000 and `.ecf`).
 | [MRP.md](MRP.md) | The MRP1 executable format: header layout, checksum, loader, validation |
 | [DRIVERS.md](DRIVERS.md) | Storage stack (block layer, **ATA PIO**, **AHCI SATA**) and network drivers (**NE2000**, **E1000**); PCI matching; how to add a new driver |
 | [NETWORKING.md](NETWORKING.md) | lwIP 2.1.3 stack, DHCP/DNS, `mget` (HTTP/HTTPS + TLS), `httpd`, QEMU user-mode networking, NE2000 vs E1000 |
-| [SELF_HOSTING.md](SELF_HOSTING.md) | `mtcc` (the in-OS C compiler), MRP1 executables, ruf v3 build recipes, `equinoxinstall -compile/-build`, the build pipeline |
+| [SELF_HOSTING.md](SELF_HOSTING.md) | `mtcc` (the in-OS C compiler), MRP1 executables, ruf v3/v4 build recipes, `equinoxinstall -compile/-build`, the build pipeline |
 | [MTCC_API.md](MTCC_API.md) | The mtcc prelude headers: `morph.h`, `fileio.h`, `multitasking.h` (+ the hosted `Morph.h` SDK) |
 | [MTCC_LANGUAGE.md](MTCC_LANGUAGE.md) | The mtcc C subset: types, full `struct`/`union` support (nested, initializers, by-pointer), `enum`/`typedef`/`switch`, statements, operators, preprocessor, compile flags, limits, and what is explicitly *not* supported |
 | [SYSCALLS.md](SYSCALLS.md) | The full `int 0x80` interface: syscalls #1–#54, calling convention, errno values |

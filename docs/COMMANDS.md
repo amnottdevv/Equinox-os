@@ -89,7 +89,7 @@ grep -n printf /test/hello.c | tr a-z A-Z > /mnt/out.txt
 | --- | --- |
 | `equinoxinstall` | **the installer wizard** — disk → layout → NIC → build userland in-OS (see [INSTALL.md](INSTALL.md)) |
 | `equinoxinstall -compile <dir>` | compile userland from `<dir>/libc` + `<dir>/tools` only |
-| `equinoxinstall -build <ruf\|name\|*.ruf>` | build via ruf v3 recipe / one tool / glob |
+| `equinoxinstall -build <ruf\|name\|*.ruf>` | build via ruf v3/v4 recipe / one tool / glob |
 | `mtcc <file.c>` | compile **and run** C in the OS — `mtcc /test/hello.c` |
 | `mtcc <a.c> <b.c> …` | **multi-file**: link every file into ONE program (`-o name` gives the output, else the first file's name; commas work too: `mtcc a.c,b.c`) |
 | `mtcc -c <file.c>` / `mtcc -make <file.ruf>` | compile only / run a build recipe — v3 walk jobs **plus v4**: `multiple_file = True` (every `src` source links into ONE program), `job <n> from a.c & b.c to out.mrp [format mrp\|elf]` (one line = N sources → one output), `set key = value` merged into an `.ecf` after a green build ([SELF_HOSTING.md](SELF_HOSTING.md)) |

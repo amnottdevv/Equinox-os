@@ -100,7 +100,7 @@ RAMFS paths do not.
 ## Can I write my own package for `eggkg`?
 
 Yes — everything is documented in [PACKAGES.md](PACKAGES.md): put your
-C sources plus a `build.ruf` (ruf v3) in a repo, and
+C sources plus a `build.ruf` (ruf v3/v4) in a repo, and
 `eggkg install <name>` fetches, compiles with `mtcc -make`, and
 installs the `.mrp` products into `/bin`. If it compiles with `mtcc`,
 it installs.

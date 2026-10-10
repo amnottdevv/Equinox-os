@@ -49,7 +49,7 @@ root::users / $ doom -iwad /mnt/doom1.wad      # DOOM straight off the disk
 6. [Memory management](#memory-management)
 7. [Executable formats: MRP and ELF32](#executable-formats-mrp-and-elf32)
 8. [mtcc — the in-OS C compiler](#mtcc--the-in-os-c-compiler)
-9. [Build recipes: ruf v3 and `mtcc -make`](#build-recipes-ruf-v3-and-mtcc--make)
+9. [Build recipes: ruf v3/v4 and `mtcc -make`](#build-recipes-ruf-v34-and-mtcc--make)
 10. [Self-hosting with `equinoxinstall`](#self-hosting-with-equinoxinstall)
 11. [Packages: `eggkg` and the Eggkg-l repository](#packages-eggkg-and-the-eggkg-l-repository)
 12. [Configuration: `.ecf`, `set`, eqshell scripts & layered customization](#configuration-ecf-set-and-eqshell-scripts)
@@ -77,7 +77,7 @@ root::users / $ doom -iwad /mnt/doom1.wad      # DOOM straight off the disk
 | **Demand paging** | Task windows are *reserved*, not allocated. A page fault hands out one zero-filled page on first touch: a 24 MB DOOM arena costs only what DOOM actually uses. |
 | **Executables** | **MRP1** (18-byte header, checksummed flat binary) and **static ELF32/i386**, both loaded into the demand-paged window. |
 | **Compiler** | **mtcc**: a single-pass C compiler with direct x86-32 code generation that runs inside the OS, with a 13-module libc spliced through `<morph.h>`. |
-| **Build recipes** | **ruf v3** `.ruf` files: variables with `:=`, `$name` expansion, `copy` / `move ? to` post-build actions — driven by `mtcc -make`. |
+| **Build recipes** | **ruf v3/v4** `.ruf` files: variables with `:=`, `$name` expansion, `copy` / `move ? to` post-build actions, plus v4 multi-file linking, per-job format/flags and gated `.ecf` writes — driven by `mtcc -make`. |
 | **Self-hosting** | `equinoxinstall` compiles the shipped tool and game sources from C in-OS and installs the results. |
 | **Packages** | **eggkg**: update / install / remove / list / search / info / sync; downloads sources over HTTP or HTTPS, builds with `mtcc -make`, installs to `/bin`, tracks them in `installed.db`, verifies sha256 when `index.idx` is present. |
 | **Configuration** | **`.ecf`** (INI-lite) with schema validation, an overlay mechanism, and the `set` builtin; **`.es`** shell scripts with command logging. |
@@ -95,6 +95,7 @@ root::users / $ doom -iwad /mnt/doom1.wad      # DOOM straight off the disk
 - **`.ecf` configuration + `set` builtin:** schema-validated keys (`net.driver`, `base.path`, `dependencies.bash`, `eggkg.server`, …), write-through patching of the active config file, `active.conf` overlay with `.base.ecf` templates.
 - **eqshell scripts (`.es`)** run with `set -x FILE`: `[Eqshell]` header, `Log=True` directive producing an 8 KB transcript at `/eqshell.log`, nesting up to 3 levels.
 - **ruf v3 recipes** with variables (`name := "value"`, case-insensitive `$name` expansion) and queued `copy A [& B] ? D` / `move A [& B] ? D` post-build actions; executed by `mtcc -make <file.ruf>`.
+- **ruf v4 recipes (0.5 Beta):** `multiple_file = True` to link many sources into one program, `job … from a.c & b.c to out.mrp [format] [flags] [lib]`, an explicit `src` file list, a global `format mrp|elf`, and `ecf <path>` + `set <key> = <value>` writes that are queued and only applied once every job succeeded.
 - **`equinoxinstall` grew `-build`:** `-build <file.ruf>` (via `mtcc -make`), `-build <tool>` (single tool), `-build *.ruf` (single-star glob). The old `eqbuild` command is gone.
 - **Layered customization (`ecf_caller` + `.config/`):** per-tool config files under `/equinox/.config/` (`eggkg.ecf`, `mtcc.ecf`) are read **on every invocation**, so an edit is live on the next command. A recipe is validated in full before it runs, and the step list *is* the execution path — `pkg.*` / `mtcc.*` / `set.*` handlers are dispatched through an in-kernel, string-keyed action registry (`config callers`, `call <name>`). See [docs/CUSTOMIZATION.md](docs/CUSTOMIZATION.md).
 - **mtcc now supports `struct`/`union`:** nested definitions, `.` and `->` member access, pointers to structs, arrays of struct, whole-struct copy, and `{…}` initializers (global, local, nested) — plus `enum`, `typedef` and `switch`. Structs are passed and returned **by pointer**; see [docs/MTCC_LANGUAGE.md](docs/MTCC_LANGUAGE.md).
@@ -298,7 +299,7 @@ The libc lives in `/equinox/libc` as **13 modules** spliced together by the `<mo
 
 ---
 
-## Build recipes: ruf v3 and `mtcc -make`
+## Build recipes: ruf v3/v4 and `mtcc -make`
 
 A `.ruf` file is a small build recipe read by `mtcc -make`. One line per directive, `#` starts a comment, and `key value`, `key = value` and `key := value` are all accepted:
 
@@ -327,6 +328,38 @@ out    $Target
 - `copy` / `move` take multiple sources separated by `&` (up to 4) and use `?` as the "to" keyword. They are queued and executed in order **after** every compile job succeeds, so broken artifacts never spread.
 - The walker recurses to depth 6 and turns only `.c` files into jobs. Limits: 128 jobs, 8 source dirs, 16 excludes, 16 variables, 16 copy/move actions.
 - Recipe versions: **v1** is the flat `echo/src/exclude/out/lib` form; **v2** wraps it in INI sections (`[package]`, `[build]`, `[install]`, optional `[src:file.c]` heredocs) and is understood by eggkg, which strips it back to v1 before invoking mtcc; **v3** adds the variables and `copy`/`move ?` actions shown above. v3 recipes require OS 0.4 Beta (mtcc v0.9.3) or newer.
+
+**v4 additions (0.5 Beta):** multi-file linking, per-job format and flags, and `.ecf` writes. Every v4 directive is optional, so existing v3 recipes run unchanged.
+
+```text
+multiple_file = True         all `src` sources link into ONE program
+src a.c, b.c & d.c           explicit file list (a token ending in .c = a file)
+format mrp|elf               global output format (default mrp)
+job <n> from <a> [& <b> …] to <out> [format mrp|elf] [flags "-q --lib"] [lib]
+set <key> = <value>          merge a key into an .ecf — only after a green build
+ecf <path>                   target file for the following `set` lines
+$buildir / $rufdir           built-ins: the `out` folder / the recipe's folder
+```
+
+- **Mode A vs Mode B.** `multiple_file = True` collapses every source gathered by `src` into **one** program (name from `name`, folder from `out`, extension from `format`). A `job … from … to …` line instead maps N sources → **one** output explicitly, and can override the format and flags per job. The two can coexist in one recipe.
+- **`set` is gated on a green build.** `set key = value` is queued alongside `copy`/`move` and only written once **every** job succeeded — a broken build never leaves a half-updated config. It is a read-modify-write: other keys, sections and comments in the target `.ecf` are left untouched, and a missing file or key is created. Section keys resolve (`eggkg.local` → `[eggkg] local = …`).
+- `$buildir`/`$rufdir` are resolved **when used**, so declaration order in the recipe does not matter.
+
+```ruf
+name    := mytool
+out     := /equinox/.local/mytool
+format  := mrp
+
+multiple_file = True
+src /equinox/.local/mytool/src
+
+job boot from boot.c & io.c to $out/boot.elf format elf
+
+ecf /equinox/conf/system.ecf
+set eggkg.local = $buildir
+```
+
+Limits: 128 walk jobs, 8 explicit jobs, 16 files per `src` list, 8 `set` lines, 512-char lines. Full v4 reference: [SELF_HOSTING.md](docs/SELF_HOSTING.md).
 
 ---
 
@@ -388,7 +421,7 @@ eggkg sync                re-sync .local -> /bin (also runs at boot when
 | `bfc` | Brainfuck-to-C transpiler (`mtcc -c` it into a `.mrp`) |
 | `sysmon` | interactive system-monitor TUI (`-list-task`, `-kill`, `-spawn`, `-h`) |
 
-The `bash` package's recipes are ruf v3, so Eggkg-l requires **Equinox 0.4 Beta (v0.9.3) or newer**. `package.list` v0 carries no versions or hashes; when the repository publishes an `index.idx`, eggkg verifies sha256 automatically.
+The `bash` package's recipes are ruf v3 — and v3 recipes still run unchanged under v4 — so Eggkg-l requires **Equinox 0.4 Beta (v0.9.3) or newer**. `package.list` v0 carries no versions or hashes; when the repository publishes an `index.idx`, eggkg verifies sha256 automatically.
 
 ---
 
@@ -842,7 +875,7 @@ mrp_user/        Morph.h SDK, MRP packer, linker scripts, DOOM shim, TCC.md, TAR
 tools_user/      userland tools in C (compiled in-OS by equinoxinstall) and elfdemo
 games/ Libgame/  snake/breakout/pong sources and the game framework
 test/            C sample programs for mtcc
-mtcc.c           the in-OS C compiler (canonical source, incl. -make/ruf v3)
+mtcc.c           the in-OS C compiler (canonical source, incl. -make/ruf v3/v4)
 scripts/         image builder, QEMU regression harnesses, bump_version.py, host mtcc tests
 third_party/     lwIP 2.1.3, BearSSL (with root-CA anchors)
 docs/            user documentation (Indonesian): getting started, commands,

@@ -337,7 +337,7 @@ recipes, the `set` config hook and the multi-file link model are
 documented in [SELF_HOSTING.md](SELF_HOSTING.md).
 
 The default output format, flags and the tool used for spawning can
-be changed live through [`.config/mtcc.ecf`](ECF.md#configmtccecf-default-mtcc)
+be changed live through [`.config/mtcc.ecf`](ECF.md#configmtccecf-compiler-defaults)
 — the compiler reads its defaults on every invocation, so an edit
 takes effect on the next build without a reboot or a recompile.
 

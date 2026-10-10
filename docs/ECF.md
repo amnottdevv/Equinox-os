@@ -60,71 +60,88 @@ int          ecf_check(struct ecf_store* st);  // schema validate
 
 ## Per-tool config — `.config/<tool>.ecf`
 
-`.ecf` tidak hanya untuk store sistem; tiap tool punya berkas
-konfigurasi sendiri di `.config/`:
+`.ecf` is not only the system store; every configurable tool owns a
+configuration file of its own under `.config/`:
 
 ```text
-/equinox/conf/system.ecf      # store global (set/get shell, wizard)
-/equinox/.config/eggkg.ecf    # perilaku eggkg (resep build/paket)
-/equinox/.config/mtcc.ecf     # default mtcc (format/flags/set/spawn)
+/equinox/conf/system.ecf      # global store (shell set/get, wizard)
+/equinox/.config/eggkg.ecf    # package manager: the build/install recipe
+/equinox/.config/mtcc.ecf     # compiler: format, flags, set, spawn
 ```
 
-Resolver `ecf_tool_path(tool, for_write)` (`kernel/library/ecf.c`)
-mengembalikan path absolut ke `<tool>.ecf`:
+The resolver `ecf_tool_path(tool, for_write)` (`kernel/library/ecf.c`)
+returns the absolute path to `<tool>.ecf`, and is deliberately
+asymmetric:
 
-- **Baca** (`for_write = 0`): cek keberadaan berkas di kandidat
-  `/mnt/equinox/.config/<tool>.ecf` lalu `/equinox/.config/<tool>.ecf`
-  — **tidak membuat apa pun**. `NULL` bila tidak ada.
-- **Tulis** (`for_write = 1`): kalau berkas sudah ada, pakai lokasinya;
-  kalau belum, buat dir `.config` di kandidat pertama yang bisa
-  (`/mnt/equinox` bila volume terpasang, selainnya RAMFS).
+- **Reading** (`for_write = 0`) checks for the file's existence at
+  `/mnt/equinox/.config/<tool>.ecf` and then
+  `/equinox/.config/<tool>.ecf`, creating nothing. It returns `NULL`
+  if the file is absent — a read never mutates the filesystem.
+- **Writing** (`for_write = 1`) reuses an existing file's location;
+  otherwise it creates the `.config` directory at the first candidate
+  that works (`/mnt/equinox` when the volume is mounted, RAMFS
+  otherwise).
 
-Karena config dibaca **tiap invocation** (tanpa cache boot), edit
-langsung hidup — tidak perlu reboot atau recompile.
+Tool names are restricted to letters, digits, `_` and `-` — a tool
+name is a file name, never a dotted key.
 
-## Dispatch — `ecf_caller` (aksi berbasis string)
+Because a tool's configuration is read **on every invocation** and
+never cached at boot, an edit is live on the next command: no reboot,
+no daemon restart, no recompile.
 
-`ecf_caller.c` adalah analog string dari `syscall_table[]`: registry
-statis (tanpa heap) yang memetakan nama aksi berdotted ke handler.
-Dipakai oleh lapisan config eggkg supaya urutan build/paket datang dari
-teks `.ecf`, bukan hardcode.
+## Dispatch — `ecf_caller` (string-keyed actions)
+
+`kernel/library/ecf_caller.c` is the string analogue of
+`syscall_table[]`: a fixed, heap-free registry that maps a dotted
+action name to a handler. The eggkg recipe layer uses it so that build
+and package ordering comes from `.ecf` text rather than from compiled
+code.
 
 ```c
 typedef int (*ecf_call_fn)(const struct ecf_call_ctx* ctx);
-int  ecf_call_register(const char* name, ecf_call_fn fn); // dup: last-wins
+int  ecf_call_register(const char* name, ecf_call_fn fn); // duplicate: last wins
 int  ecf_call(const char* name, struct ecf_call_ctx* ctx); // -1 = unknown
 int  ecf_call_exists(const char* name);
 int  ecf_call_count(void);
 const char* ecf_call_name_at(int idx);
 ```
 
-`ecf_call` mengembalikan `-1` + `[ERROR] ecf_call: unknown action
-'<nama>'` untuk aksi tak dikenal. Registry terbuka: modul lain boleh
-mendaftarkan handler sendiri via `ecf_call_register` (ring-0 only).
+`ecf_call` returns `-1` and prints
+`[ERROR] ecf_call: unknown action '<name>' (try: config callers)` for
+an unregistered name. The registry is open: any other module may
+register its own handlers through `ecf_call_register` (ring-0 only).
 
-Interactive entry: shell `call <nama> [args...]` memanggil `ecf_call`
-dengan `caller = "shell"`.
+The interactive entry point is the shell's `call <name> [args...]`
+builtin, which invokes `ecf_call` with `caller = "shell"`.
 
-### Aksi terdaftar
+### Registered actions
 
-| Aksi | Sumber | Pekerjaan |
+| Action | Source | Effect |
 | --- | --- | --- |
-| `set.key <key> <val> [-> <ecf>]` | `config_cmd.cpp` | tulis key=val ke `.ecf` |
-| `set.path_local <path>` | `config_cmd.cpp` | `eggkg.local = <path>` |
-| `set.active <file>` | `config_cmd.cpp` | pivot store aktif |
-| `mtcc.compile_ruf_eggkg <ruf>` | `eggkg.cpp` | spawn mtcc `-make` |
-| `pkg.install_bin <pkgdir>` | `eggkg.cpp` | pindah `.mrp` ke `/bin` |
-| `pkg.db_record <nama> <ver>` | `eggkg.cpp` | catat `installed.db` |
-| `pkg.read_list <url>` | `eggkg.cpp` | unduh + parse `package.list` |
-| `pkg.fetch_index <repobase>` | `eggkg.cpp` | unduh + parse `index.idx` (opsional) |
+| `set.key <key> <val> [-> <ecf>]` | `config_cmd.cpp` | write `key = val` into an `.ecf` (defaults to the active store) |
+| `set.path_local <path>` | `config_cmd.cpp` | set `eggkg.local = <path>` in the active store |
+| `set.active <file>` | `config_cmd.cpp` | pivot the active store to `<file>` |
+| `mtcc.compile_ruf_eggkg <ruf>` | `eggkg.cpp` | spawn `mtcc -make` on the given recipe |
+| `pkg.install_bin <pkgdir>` | `eggkg.cpp` | move the built `.mrp` products into `/bin` |
+| `pkg.db_record <name> <ver>` | `eggkg.cpp` | record the package in `installed.db` |
+| `pkg.read_list <url>` | `eggkg.cpp` | fetch and parse `package.list` |
+| `pkg.fetch_index <repobase>` | `eggkg.cpp` | fetch and parse `index.idx` (optional) |
 
-## Resep eggkg — `.config/eggkg.ecf`
+`config callers` prints this list at runtime — you never have to guess
+which names a config file may invoke.
 
-Format = daftar langkah berurut per section; `$var` di-resolve saat
-step dieksekusi (`$rufpath $pkgdir $name $version $server $repobase
-$local`):
+## The eggkg recipe — `.config/eggkg.ecf`
+
+The recipe is an ordered step list held per section. It **is** the
+execution path: `eggkg install` contains no hard-coded build-and-install
+sequence that the config merely influences, and `eggkg update` runs
+`[update]` the same way.
+
+### File layout
 
 ```ini
+# eggkg.ecf — build/package recipe (edit freely; every line is a `call`)
+# the number is cosmetic ordering; $var is resolved when the step runs
 [update]
 1 = pkg.read_list $server
 2 = pkg.fetch_index $repobase
@@ -134,31 +151,122 @@ $local`):
 3 = pkg.db_record $name $version
 ```
 
-- `eggkg init` menulis resep default (tak menimpa yang sudah ada).
-- `eggkg plan` menampilkan resolved `[install]` tanpa eksekusi.
-- Resep adalah **satu-satunya jalur eksekusi**: run pertama auto-seed
-  lalu baca-balik; validasi **atomik** (seluruh daftar divalidasi
-  sebelum eksekusi apa pun, berhenti di step gagal pertama).
-- Stage yang masih monolit (disebut jujur di komentar & resep):
-  langkah unduh sumber `[2/4]` di setup install.
+### Grammar and parsing rules
 
-## `.config/mtcc.ecf` — default mtcc
+- Line form is `<order> = <action> <args…>` — an `=` must be present;
+  a line without one is skipped. Both `1 = pkg…` and `1 := pkg…` parse,
+  because everything up to the first `=` is discarded.
+- **The leading number is cosmetic.** It is stripped and *not* used for
+  ordering: steps execute in **file order**. Renumbering the file does
+  not reorder execution; moving a line does.
+- `#` or `;` at the start of a line (after indentation) is a comment;
+  blank lines are skipped. CRLF is tolerated.
+- Only two sections are recognised, `[update]` and `[install]`. Any
+  other section header is parsed and ignored.
+- The first whitespace-delimited token is the action name (≤ 47
+  characters); the rest are its arguments.
+
+### Limits
+
+| Constant | Value |
+| --- | --- |
+| Steps per section (`EGG_STEP_MAX`) | 16 |
+| Arguments per step (`ECF_CALL_ARGC_MAX`) | 8 |
+| Argument length | 63 characters |
+| Action name (`ECF_CALL_NAME_MAX`) | 48 (47 usable characters) |
+
+Lines beyond the per-section limit are silently skipped during load,
+so an oversized recipe is truncated rather than rejected. The recipe
+loader reads the file node directly, so it is not bound by the 8 KB
+`ECF_FILE_MAX` that the single-key readers (`ecf_file_get`, used by
+`config show`/`config get`) enforce.
+
+### Variables
+
+Arguments beginning with `$` are substituted **at the moment that step
+runs**, not pre-expanded for the whole file. The names are
+case-insensitive; an unknown `$name` is passed through literally.
+
+| Variable | Resolves to | Source |
+| --- | --- | --- |
+| `$rufpath` | the build recipe for the package being installed | install context |
+| `$pkgdir` | the staging directory the sources were fetched into | install context |
+| `$name` | the package name | `package.list` entry |
+| `$version` | the package version | `package.list` entry |
+| `$server` | the package server | explicit `eggkg update <source>`, else `eggkg.server` |
+| `$repobase` | the repository base, derived during `update` | derived by step 1 |
+| `$local` | the local staging root | `eggkg.local` |
+
+Per-step substitution is what lets `[update]` step 2 use `$repobase`
+even though step 1 is what computes it.
+
+### Validation and execution
+
+- **Atomic validation.** The whole step list is parsed and every action
+  name is checked against the registry *before* any step runs. One
+  unknown action rejects the entire section:
+  `eggkg: resep [install] INVALID — tidak ada yang dijalankan`.
+- **Stop on first failure.** Execution halts at the first step that
+  returns non-zero; a partial install is never left behind.
+- **Self-seeding.** If the file does not exist, the default recipe is
+  written and then read back, so even default behaviour travels through
+  the config interpreter.
+- **Honest residuals.** The source-download stage of `install` and the
+  `index.idx` hash verification remain inline: both manage their buffers
+  tightly (freed before the `mtcc` spawn to avoid heap fragmentation in
+  the 256 MB kernel) and this is stated in the recipe's own comments
+  rather than hidden.
+
+### Commands
+
+| Command | Behaviour |
+| --- | --- |
+| `eggkg init` | write the default recipe; never overwrites an existing file |
+| `eggkg plan` | print the resolved `[install]` steps, in order, without executing them |
+| `eggkg update [source]` | run `[update]`; `<source>` overrides `$server` for that run |
+| `eggkg install <name> [-y]` | run `[install]` for a package |
+| `config show eggkg` / `config get eggkg <key>` | inspect the file from the shell |
+
+## `.config/mtcc.ecf` — compiler defaults
+
+Seeded by `config init mtcc`:
 
 ```ini
+# mtcc.ecf — defaults for mtcc (a recipe or the CLI always wins)
 [format]
-default = mrp            # mrp|elf  (CLI `-format` menang)
+default = mrp
 [flags]
-default =                # -q, -d/--debug, --lib (CLI menambah)
+default =
 [set]
-store =                  # tujuan `set` pada .ruf ("" = system.ecf)
+store =
 [spawn]
-name = mtcc.mrp          # tool yang di-spawn shell untuk build
-args =                   # argumen ekstra saat spawn
+name = mtcc.mrp
+args =
 ```
 
-`config init mtcc` me-seed template ini. `mtcc -make` juga membaca
-`buildir.default` / `rufdir.default` sebagai nilai default `$buildir`
-/ `$rufdir` bila resep tidak menyetelnya sendiri.
+Keys are read case-insensitively after section flattening, so
+`[format] default` is looked up as `format.default`.
+
+| Key | Default | Effect | Precedence |
+| --- | --- | --- | --- |
+| `format.default` | `mrp` | Only the exact value `elf` switches the default output to ELF; any other value means `mrp`. Applies to `-c` and `-make` — run mode never writes a file, ignores it, and warns | Seed only — a recipe's `format` directive and the CLI `-format` both win |
+| `flags.default` | *(empty)* | Space-separated default flags; only `-q`, `-d`/`--debug` and `--lib` are recognised | **Additive** — mtcc has no negative flags, so the CLI adds on top of it |
+| `set.store` | *(empty → `/equinox/conf/system.ecf`)* | Where a recipe's `set key = value` lines write | A recipe's `ecf <path>` wins |
+| `rufdir.default` | *(empty)* | Fallback value for `$rufdir` | Rarely reached — `$rufdir` is derived from the recipe's own path first, so this applies only when the recipe path contains no directory |
+| `buildir.default` | *(empty → falls back to `$rufdir`)* | Default for `$buildir` / the `out` folder | A recipe's `out <dir>` wins |
+| `spawn.name` | `mtcc.mrp` | The binary the shell looks for when compiling or building | Searched in the request's directory, `/equinox/tools`, then the alternative |
+| `spawn.args` | *(empty)* | Extra arguments inserted **before** the command line, so config flags such as `-q` are parsed first | Always combined with the command's own arguments |
+
+Two readers consume the same file: mtcc itself calls `mtcc_cfg_get()`
+for `format.default`, `flags.default`, `set.store`, `rufdir.default`
+and `buildir.default`; the shell calls `ecf_file_get()` for
+`spawn.name` and `spawn.args` when it spawns the compiler. Because
+`flags.default` is applied at process start, setting it once changes
+every subsequent compile.
+
+`mtcc -make` derives `$rufdir` from the recipe's own path and `$buildir`
+from `out`, so the two `*.default` keys are genuine fallbacks: they fill
+in what the recipe left empty and never override what it declared.
 
 ## Path resolution — `ecf_active_path()`
 
