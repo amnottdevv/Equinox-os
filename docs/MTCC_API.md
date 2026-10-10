@@ -188,3 +188,4 @@ they do for shell builtins.
 | `src/test/struct.c`, `swenum.c` | `struct`/`union` + `enum`/`switch` (Stage 2) |
 | `src/test/sinit.c` | `struct`/`union` `{…}` initializers, global + local + nested |
 | `src/test/mf_main.c` + `mf_helper.c` + `mf_shared.h` | **multi-file** compile/link: cross-file call, `extern`, relative `#include "x.h"` |
+| MRP targets and roadmap | [Roadmap & Targets](../TARGETS.md) |
